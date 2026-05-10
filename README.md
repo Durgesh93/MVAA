@@ -2,6 +2,20 @@
 
 This folder contains baseline code for all three MVAA tasks.
 
+## Task Visualizations
+
+### Task 1. Cardiac CT Analysis
+
+![Task 1 Visualization](assets/task1_ct_visualization.png)
+
+### Task 2. 3D TEE Segmentation
+
+![Task 2 Visualization](assets/task2_tee_visualization.png)
+
+### Task 3. Surgical Frame Detection
+
+![Task 3 Visualization](assets/task3_frame_visualization.jpg)
+
 ## 1. Folder Layout
 
 ```text
