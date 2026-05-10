@@ -1,0 +1,37 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Training / inference outputs
+runs/
+**/runs/
+**/checkpoints/
+**/pred_labels_task1/
+**/pred_labels_task2/
+**/pred_labels_task3/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+
+# Logs and temp
+*.log
+*.tmp
+*.swp
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Task3 prepared data (usually regenerated locally)
+task3/data/

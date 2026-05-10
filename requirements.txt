@@ -1,0 +1,7 @@
+torch
+monai
+numpy
+pillow
+nibabel
+segmentation-models-pytorch
+timm
