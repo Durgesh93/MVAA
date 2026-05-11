@@ -27,6 +27,7 @@ runs/
 *.tmp
 *.swp
 
+
 # OS / editor
 .DS_Store
 Thumbs.db
@@ -35,3 +36,5 @@ Thumbs.db
 
 # Task3 prepared data (usually regenerated locally)
 task3/data/
+
+dirs/
