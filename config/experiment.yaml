@@ -1,0 +1,103 @@
+# =============================================================================
+# MVAA SSL nnU-Net experiment config
+# =============================================================================
+
+seed: 12345
+
+experiment_name: ssl_nnunet
+
+# =============================================================================
+# Dataset / nnU-Net setup
+# =============================================================================
+
+dataset_id: Dataset001_MVAA_CT_SSL
+configuration: 2d
+fold: 0
+
+plans_identifier: nnUNetPlans
+
+# =============================================================================
+# Paths
+# =============================================================================
+
+paths:
+  project_root: ${oc.env:PROJECT_ROOT,${hydra:runtime.cwd}}
+  nnunet_data_root: ${paths.project_root}/dirs/data_storage/processed/MVAA_nnunet
+  nnunet_raw: ${paths.nnunet_data_root}/nnUNet_raw
+  nnunet_preprocessed: ${paths.nnunet_data_root}/nnUNet_preprocessed
+  nnunet_results: ${paths.nnunet_data_root}/nnUNet_results
+  output_root: ${paths.project_root}/outputs
+
+# =============================================================================
+# DataModule config
+# =============================================================================
+
+datamodule:
+  paths:
+    nnunet_raw: ${paths.nnunet_raw}
+    nnunet_preprocessed: ${paths.nnunet_preprocessed}
+    nnunet_results: ${paths.nnunet_results}
+  dataset_id: ${dataset_id}
+  configuration: ${configuration}
+  fold: ${fold}
+  seed: ${seed}
+  plans_identifier: ${plans_identifier}
+  batch_size: null
+  oversample_foreground_percent: 0.33
+  enable_deep_supervision: true
+  deep_supervision_scales: null
+  num_processes: null
+
+# =============================================================================
+# LightningModule config
+# =============================================================================
+
+litmodule:
+  paths:
+    nnunet_raw: ${paths.nnunet_raw}
+    nnunet_preprocessed: ${paths.nnunet_preprocessed}
+    nnunet_results: ${paths.nnunet_results}
+
+  dataset_id: ${dataset_id}
+  configuration: ${configuration}
+  seed: ${seed}
+
+  plans_identifier: ${plans_identifier}
+
+  initial_lr: 0.01
+  weight_decay: 0.00003
+  num_epochs: ${trainer.max_epochs}
+
+  enable_deep_supervision: ${datamodule.enable_deep_supervision}
+
+  lambda_pseudo: 0.0
+  pseudo_threshold: 0.95
+
+  compile_network: false
+
+# =============================================================================
+# Trainer config
+# =============================================================================
+trainer:
+  max_epochs: 25
+  accelerator: gpu
+  devices: 1
+  precision: 16-mixed
+  log_every_n_steps: 1
+  num_train_iters_per_epoch: 250
+  num_val_iters_per_epoch: 50
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: 0
+  enable_checkpointing: true
+  enable_progress_bar: true
+  gradient_clip_val: null
+  accumulate_grad_batches: 1
+  deterministic: false
+  default_root_dir: ${paths.output_root}/${experiment_name}/${dataset_id}/${configuration}/fold_${fold}
+
+
+logger:
+  use_wandb: false
+  project: MVAA
+  name: ${experiment_name}_${dataset_id}_${configuration}_fold${fold}
+  save_dir: ${paths.output_root}/logs
