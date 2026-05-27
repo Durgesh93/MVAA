@@ -1,4 +1,8 @@
 from pathlib import Path
+import os
+import shutil
+import subprocess
+import sys
 import tarfile
 import random
 import io
@@ -10,7 +14,7 @@ import pandas as pd
 from PIL import Image
 import typer
 
-from utils import (
+from data_preparation.utils import (
     log_section,
     log_info,
     log_ok,
@@ -20,34 +24,105 @@ from utils import (
     find_task_dirs,
     build_sample_dataframe,
     write_dataset,
-    write_dummy_mask_from_image,
+    set_nnunet_env,
+    reassign_training_case_names_sequentially,
 )
 
 
 app = typer.Typer(help="Prepare MVAA Task 3 VIDEO dataset in nnU-Net format.")
 
 
-DATA_TYPE = "video"
+
 DATASET_ID = "Dataset003_MVAA_VIDEO_SSL"
-PREFIX = "video"
 PATTERNS = ["t3_vid", "*vid*", "*video*"]
 CASE_SUFFIXES = [".png", ".jpg", ".jpeg", "_png_Label.tar"]
-
-VIDEO_UNLABELED_TRAIN_RATIO = 0.70
-
-# Original LV class in the video semantic labels
 VIDEO_LV_LABEL = 10
 
-# Output labels for nnU-Net
 VIDEO_BINARY_LV_LABELS = {
     "background": 0,
     "LV": 1,
 }
 
 
-def collect_extra_unlabeled_video(data_root):
-    rows = []
+def get_dataset_number(dataset_id):
+    return int(dataset_id.replace("Dataset", "")[:3])
 
+def write_dummy_mask_from_image(image_path, mask_path):
+    img   = nib.load(str(image_path))
+    dummy = np.zeros(img.shape, dtype=np.uint8)
+
+    dummy_nii = nib.Nifti1Image(
+        dummy,
+        affine=img.affine,
+        header=img.header,
+    )
+
+    dummy_nii.set_data_dtype(np.uint8)
+
+    mask_path.parent.mkdir(parents=True, exist_ok=True)
+    nib.save(dummy_nii, str(mask_path))
+
+
+def run_nnunet_plan_and_preprocess(dataset_id, num_processes):
+    dataset_number = get_dataset_number(dataset_id)
+
+    exe = shutil.which("nnUNetv2_plan_and_preprocess")
+
+    if exe is not None:
+        cmd = [
+            exe,
+            "-d",
+            str(dataset_number),
+            "-np",
+            str(num_processes),
+            "-npfp",
+            str(num_processes),
+        ]
+    else:
+        cmd = [
+            sys.executable,
+            "-m",
+            "nnunetv2.experiment_planning.plan_and_preprocess_entrypoints",
+            "-d",
+            str(dataset_number),
+            "-np",
+            str(num_processes),
+            "-npfp",
+            str(num_processes),
+        ]
+
+    cmd.append("--verify_dataset_integrity")
+
+    log_info("Running nnU-Net plan and preprocess:")
+    typer.echo(" ".join(cmd))
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+
+    assert process.stdout is not None
+
+    for line in process.stdout:
+        typer.echo(line.rstrip())
+
+    return_code = process.wait()
+
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, cmd)
+
+    log_ok(f"Finished nnU-Net preprocessing for {dataset_id}")
+
+
+def collect_extra_unlabeled_video(data_root):
+    rows      = []
     data_root = Path(data_root)
     image_dir = data_root / "images"
 
@@ -56,206 +131,197 @@ def collect_extra_unlabeled_video(data_root):
         return rows
 
     image_paths = [
-        p for p in sorted(image_dir.rglob("*"))
+        p
+        for p in sorted(image_dir.rglob("*"))
         if p.is_file() and p.name.lower().endswith((".png", ".jpg", ".jpeg"))
     ]
 
-    rng = random.Random(42)
-    rng.shuffle(image_paths)
+    for p in image_paths:
+        rows.append(
+            {
+                "split": "TrU",
+                "file_type": "image",
+                "case_name": make_case_name(p, CASE_SUFFIXES),
+                "file_path": str(p),
+            }
+        )
 
-    n_train = int(len(image_paths) * VIDEO_UNLABELED_TRAIN_RATIO)
-
-    train_paths = image_paths[:n_train]
-    test_paths = image_paths[n_train:]
-
-    for p in train_paths:
-        rows.append({
-            "data_type": DATA_TYPE,
-            "task_id": "t3_vid",
-            "split": "TrU",
-            "file_type": "image",
-            "case_name": make_case_name(p, PREFIX, CASE_SUFFIXES),
-            "file_path": str(p),
-        })
-
-    for p in test_paths:
-        rows.append({
-            "data_type": DATA_TYPE,
-            "task_id": "t3_vid",
-            "split": "Ts",
-            "file_type": "image",
-            "case_name": make_case_name(p, PREFIX, CASE_SUFFIXES),
-            "file_path": str(p),
-        })
-
-    log_ok(f"Extra video images: {len(image_paths)}")
-    typer.echo(f"  TrU: {len(train_paths)}")
-    typer.echo(f"  Ts : {len(test_paths)}")
-
+    log_ok(
+        f"Extra unlabeled video images: total={len(image_paths)}"
+    )
     return rows
 
-
 def collect_video_files(data_root):
-    data_root = Path(data_root)
-    reference_dir = data_root / "reference_data"
-    task_dirs = find_task_dirs(reference_dir, PATTERNS)
+    reference_dir = Path(data_root) / "reference_data"
+    task_dirs     = find_task_dirs(reference_dir, PATTERNS)
 
     rows = []
 
     if len(task_dirs) == 0:
-        log_warn(f"No reference video folders found under {reference_dir}")
+        log_warn(f"No VIDEO folders found under {reference_dir}")
 
     for task_dir in task_dirs:
-        for p in sorted((task_dir / "train").glob("*/*.png")):
-            rows.append({
-                "data_type": DATA_TYPE,
-                "task_id": task_dir.name,
-                "split": "TrL",
-                "file_type": "image",
-                "case_name": make_case_name(p, PREFIX, CASE_SUFFIXES),
-                "file_path": str(p),
-            })
+        train_dir = task_dir / "train"
+        test_dir  = task_dir / "val" / "images"
 
-        for p in sorted((task_dir / "train").glob("*/*_png_Label.tar")):
-            rows.append({
-                "data_type": DATA_TYPE,
-                "task_id": task_dir.name,
-                "split": "TrL",
-                "file_type": "mask",
-                "case_name": make_case_name(p, PREFIX, CASE_SUFFIXES),
-                "file_path": str(p),
-            })
+        for p in sorted(train_dir.glob("*/*.png")):
+            parent_name = p.parent.name
 
-        for p in sorted((task_dir / "val" / "images").glob("*/*.png")):
-            rows.append({
-                "data_type": DATA_TYPE,
-                "task_id": task_dir.name,
-                "split": "Ts",
-                "file_type": "image",
-                "case_name": make_case_name(p, PREFIX, CASE_SUFFIXES),
-                "file_path": str(p),
-            })
+            rows.append(
+                {
+                    "split":       "TrL",
+                    "file_type":   "image",
+                    "case_name":   f"{make_case_name(p, CASE_SUFFIXES)}",
+                    "file_path":   str(p),
+                }
+            )
+
+        for p in sorted(train_dir.glob("*/*_png_Label.tar")):
+            parent_name = p.parent.name
+
+            rows.append(
+                {
+                    "split":       "TrL",
+                    "file_type":   "mask",
+                    "case_name":   f"{make_case_name(p, CASE_SUFFIXES)}",
+                    "file_path":   str(p),
+                }
+            )
+
+        for p in sorted(test_dir.glob("*/*.png")):
+            rows.append(
+                {
+                    "split":       "Ts",
+                    "file_type":   "image",
+                    "case_name":   f"{make_case_name(p, CASE_SUFFIXES)}",
+                    "file_path":   str(p),
+                }
+            )
+
+            rows.append(
+                {
+                    "split":       "TrU",
+                    "file_type":   "image",
+                    "case_name":   f"{make_case_name(p, CASE_SUFFIXES)}",
+                    "file_path":   str(p),
+                }
+            )
+
 
     rows.extend(collect_extra_unlabeled_video(data_root))
 
     return rows
 
 
+
 def write_video_rgb_image_as_nnunet_channels(src_path, dst_path):
-    img = Image.open(src_path).convert("RGB")
-    arr = np.asarray(img).astype(np.float32)
+    src_path = Path(src_path)
+    dst_path = Path(dst_path)
 
     dst_path.parent.mkdir(parents=True, exist_ok=True)
 
-    primary_channel_path = None
+    image = Image.open(src_path).convert("RGB")
+    arr = np.asarray(image)
 
-    for channel_idx in range(3):
-        channel_arr = arr[:, :, channel_idx]
+    if arr.ndim != 3 or arr.shape[-1] != 3:
+        raise ValueError(f"Expected RGB image, got shape {arr.shape}: {src_path}")
 
-        channel_nii = nib.Nifti1Image(
-            channel_arr,
-            affine=np.eye(4),
-        )
+    affine = np.eye(4)
 
-        channel_path = dst_path.parent / f"{dst_path.name}_{channel_idx:04d}.nii.gz"
-        nib.save(channel_nii, str(channel_path))
+    written_paths = []
 
-        if channel_idx == 0:
-            primary_channel_path = channel_path
+    for c in range(3):
+        channel = arr[:, :, c].astype(np.uint8)
 
-    return primary_channel_path
+        nii = nib.Nifti1Image(channel, affine=affine)
+        nii.set_data_dtype(np.uint8)
+
+        channel_path = dst_path.parent / f"{dst_path.name}_{c:04d}.nii.gz"
+        nib.save(nii, str(channel_path))
+
+        written_paths.append(channel_path)
+
+    return written_paths[0]
+
+
+def _read_first_nifti_from_tar(tar_path):
+    tar_path = Path(tar_path)
+
+    with tarfile.open(tar_path, "r:*") as tar:
+        members = [
+            m
+            for m in tar.getmembers()
+            if m.isfile() and m.name.lower().endswith(".nii.gz")
+        ]
+
+        if len(members) == 0:
+            raise ValueError(f"No .nii.gz found inside tar mask: {tar_path}")
+
+        file_obj = tar.extractfile(members[0])
+
+        if file_obj is None:
+            raise ValueError(f"Could not read .nii.gz inside tar mask: {tar_path}")
+
+        nii_gz_bytes = file_obj.read()
+
+    with gzip.GzipFile(fileobj=io.BytesIO(nii_gz_bytes), mode="rb") as gz:
+        nii_bytes = gz.read()
+
+    img = nib.Nifti1Image.from_bytes(nii_bytes)
+
+    return img
 
 
 def write_video_lv_binary_mask_from_tar(src_path, dst_path):
-    """
-    Read original multi-class video mask from *_png_Label.tar
-    and convert it to binary LV mask.
+    src_path = Path(src_path)
+    dst_path = Path(dst_path)
 
-    Original:
-        0  = background
-        10 = LV
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
 
-    Output:
-        0 = background
-        1 = LV
-    """
+    img = _read_first_nifti_from_tar(src_path)
+    mask = np.asanyarray(img.dataobj)
 
-    try:
-        with tarfile.open(src_path, "r:*") as tar:
-            members = [
-                m for m in tar.getmembers()
-                if m.isfile() and m.name.lower().endswith(".nii.gz")
-            ]
+    binary = (mask == VIDEO_LV_LABEL).astype(np.uint8)
 
-            if len(members) == 0:
-                log_warn(f"No .nii.gz mask found in {src_path}")
-                return False
+    out = nib.Nifti1Image(binary, affine=img.affine, header=img.header)
+    out.set_data_dtype(np.uint8)
 
-            file_obj = tar.extractfile(members[0])
+    nib.save(out, str(dst_path))
 
-            if file_obj is None:
-                log_warn(f"Could not read mask from {src_path}")
-                return False
-
-            nii_gz_bytes = file_obj.read()
-
-        with gzip.GzipFile(fileobj=io.BytesIO(nii_gz_bytes), mode="rb") as gz:
-            nii_bytes = gz.read()
-
-        img = nib.Nifti1Image.from_bytes(nii_bytes)
-        mask_raw = np.asanyarray(img.dataobj)
-        mask_raw = np.squeeze(mask_raw)
-
-        mask_binary = (mask_raw == VIDEO_LV_LABEL).astype(np.uint8)
-
-        out_nii = nib.Nifti1Image(
-            mask_binary,
-            affine=img.affine,
-        )
-
-        out_nii.set_data_dtype(np.uint8)
-
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
-        nib.save(out_nii, str(dst_path))
-
-        return True
-
-    except Exception as e:
-        log_warn(f"Could not extract binary LV mask from {src_path}: {e}")
-        return False
+    return True
 
 
-def prepare_video_dataset(data_root, output_dir, test=False):
+def prepare_video_dataset(data_root, nnunet_raw, test=False, num_processes=None):
     log_section("Processing Task 3 VIDEO")
 
     rows = collect_video_files(data_root)
 
     if len(rows) == 0:
         log_warn("No files found for VIDEO")
-        return
+        return None
 
     file_df = pd.DataFrame(rows)
     print_group_counts(file_df, ["split", "file_type"], "Collected files")
-
+    
     sample_df = build_sample_dataframe(rows)
+    sample_df = reassign_training_case_names_sequentially(sample_df)
+    print_group_counts(sample_df, ["split"], "Prepared samples")
 
-    print_group_counts(sample_df, ["split", "is_labeled"], "Prepared samples")
-
-    write_dataset(
+    dataset_dir = write_dataset(
         sample_df=sample_df,
         dataset_id=DATASET_ID,
-        data_type=DATA_TYPE,
-        output_dir=output_dir,
+        output_dir=nnunet_raw,
+        data_type="video",
         test=test,
         fixed_labels=VIDEO_BINARY_LV_LABELS,
         write_image_fn=write_video_rgb_image_as_nnunet_channels,
         write_real_mask_fn=write_video_lv_binary_mask_from_tar,
         write_dummy_mask_fn=write_dummy_mask_from_image,
-        description_extra=(
-            "Task 3 VIDEO dataset. RGB frames are stored as three nnU-Net "
-            "channels. Video masks are converted to binary LV masks."
-        ),
+        description_extra="Task 3 VIDEO RGB dataset.",
+        num_processes=num_processes,
     )
+
+    return dataset_dir
 
 
 @app.command()
@@ -263,30 +329,68 @@ def main(
     data_root: Path = typer.Option(
         Path("dirs/data_storage/raw/MVAA"),
         "--data-root",
-        help="MVAA root directory containing reference_data/ and images/.",
+        help="MVAA root directory containing reference_data/ and optional images/.",
     ),
     output_dir: Path = typer.Option(
-        Path("dirs/data_storage/raw/MVAA_nnUNET_SSL"),
+        Path("dirs/data_storage/processed/MVAA_nnUNET"),
         "--output-dir",
-        help="Output directory for prepared nnU-Net dataset.",
+        help="Final nnU-Net root containing nnUNet_raw, nnUNet_preprocessed, and nnUNet_results.",
     ),
     test: bool = typer.Option(
         False,
         "--test",
         help="Prepare only a few samples per split.",
     ),
+    num_processes: int = typer.Option(
+        os.cpu_count() or 1,
+        "--num-processes",
+        "-np",
+        help="Number of workers for raw writing and nn-U-Net preprocessing.",
+    ),
 ):
+    output_dir = Path(output_dir).resolve()
+    num_processes = max(1, int(num_processes))
+
+    nnunet_raw = output_dir / "nnUNet_raw"
+    nnunet_preprocessed = output_dir / "nnUNet_preprocessed"
+    nnunet_results = output_dir / "nnUNet_results"
+
     output_dir.mkdir(parents=True, exist_ok=True)
+    nnunet_raw.mkdir(parents=True, exist_ok=True)
+    nnunet_preprocessed.mkdir(parents=True, exist_ok=True)
+    nnunet_results.mkdir(parents=True, exist_ok=True)
 
-    log_info(f"data_root  : {data_root}")
-    log_info(f"output_dir : {output_dir}")
-    log_info(f"test mode  : {test}")
+    log_info(f"data_root           : {data_root}")
+    log_info(f"output_dir          : {output_dir}")
+    log_info(f"test mode           : {test}")
+    log_info(f"num_processes       : {num_processes}")
+    log_info("preprocess          : True")
+    log_info("verify              : True")
+    log_info("keep_nnunet_raw     : True")
+    log_info("keep_nnunet_results : True")
 
-    prepare_video_dataset(
-        data_root=data_root,
-        output_dir=output_dir,
-        test=test,
+    set_nnunet_env(
+        nnunet_raw=nnunet_raw,
+        nnunet_preprocessed=nnunet_preprocessed,
+        nnunet_results=nnunet_results,
     )
+
+    dataset_dir = prepare_video_dataset(
+        data_root=data_root,
+        nnunet_raw=nnunet_raw,
+        test=test,
+        num_processes=num_processes,
+    )
+
+    if dataset_dir is not None:
+        run_nnunet_plan_and_preprocess(
+            dataset_id=DATASET_ID,
+            num_processes=num_processes,
+        )
+
+    log_ok(f"Raw nnU-Net dataset is in: {nnunet_raw / DATASET_ID}")
+    log_ok(f"Preprocessed dataset is in: {nnunet_preprocessed / DATASET_ID}")
+    log_ok(f"nnU-Net results folder is in: {nnunet_results}")
 
 
 if __name__ == "__main__":

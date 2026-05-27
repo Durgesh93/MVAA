@@ -4,6 +4,8 @@ import shutil
 import tarfile
 import io
 import gzip
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import nibabel as nib
@@ -16,12 +18,8 @@ TEST_N = 5
 
 METADATA_COLS = [
     "dataid",
-    "data_type",
-    "task_id",
     "case_name",
-    "original_case_name",
     "split",
-    "is_labeled",
     "has_foreground",
     "labels_in_mask",
     "image_shape",
@@ -105,13 +103,13 @@ def nifti_shape(path):
         return ""
 
 
-def make_case_name(path, prefix, case_suffixes):
+def make_case_name(path, case_suffixes):
     name = Path(path).name
 
     for suffix in case_suffixes:
         name = name.replace(suffix, "")
 
-    return f"{prefix}_{name}"
+    return f"{name}"
 
 
 def find_task_dirs(reference_dir, patterns):
@@ -201,16 +199,15 @@ def check_mask_foreground(mask_path):
     return has_foreground, labels_in_mask
 
 
-def detect_labels_from_sample_df(sample_df, data_type):
+def detect_labels_from_sample_df(sample_df):
     labeled_df = sample_df[
         (sample_df["split"] == "TrL") &
-        (sample_df["is_labeled"] == 1) &
         (sample_df["original_mask_path"].notna()) &
         (sample_df["original_mask_path"].astype(str).str.strip().ne(""))
     ].copy()
 
     if labeled_df.empty:
-        log_warn(f"No labeled masks found for {data_type}. Falling back to binary labels.")
+        log_warn(f"No labeled masks found Falling back to binary labels.")
         return {
             "background": 0,
             "foreground": 1,
@@ -221,12 +218,12 @@ def detect_labels_from_sample_df(sample_df, data_type):
     masks_with_foreground = 0
     background_only_masks = []
 
-    log_info(f"Scanning all real TrL masks for {data_type} labels...")
+    log_info(f"Scanning all real TrL masks for labels...")
 
     for _, row in tqdm(
         labeled_df.iterrows(),
         total=len(labeled_df),
-        desc=f"Detecting labels {data_type}",
+        desc=f"Detecting labels",
     ):
         mask_path = Path(row["original_mask_path"])
 
@@ -250,56 +247,31 @@ def detect_labels_from_sample_df(sample_df, data_type):
     all_seen_labels = sorted([int(v) for v in all_seen_labels])
 
     if len(all_seen_labels) == 0:
-        log_warn(f"No labels detected for {data_type}. Falling back to binary labels.")
+        log_warn(f"No labels detected, Falling back to binary labels.")
         all_seen_labels = [0, 1]
 
     if 0 not in all_seen_labels:
-        log_warn(f"Label 0 not found for {data_type}. Adding background=0.")
+        log_warn(f"Label 0 not found for Adding background=0.")
         all_seen_labels = [0] + all_seen_labels
 
     labels = labels_from_values(all_seen_labels)
 
-    log_ok(f"Complete label scan for {data_type}")
-    typer.echo(f"  masks checked          : {checked_masks}")
-    typer.echo(f"  masks with foreground  : {masks_with_foreground}")
-    typer.echo(f"  background-only masks  : {len(background_only_masks)}")
-    typer.echo(f"  raw labels found       : {all_seen_labels}")
-    typer.echo("  detected labels:")
+    log_ok(f"Complete label scan")
+    log_info(f"  masks checked          : {checked_masks}")
+    log_info(f"  masks with foreground  : {masks_with_foreground}")
+    log_info(f"  background-only masks  : {len(background_only_masks)}")
+    log_info(f"  raw labels found       : {all_seen_labels}")
+    log_info("  detected labels:")
 
     for name, value in labels.items():
-        typer.echo(f"    {name}: {value}")
+        log_info(f"    {name}: {value}")
 
     if background_only_masks:
-        typer.echo("  background-only examples:")
+        log_info("  background-only examples:")
         for p in background_only_masks[:10]:
-            typer.echo(f"    {p}")
+            log_info(f"    {p}")
 
     return labels
-
-
-def get_labels_for_dataset_json(sample_df, data_type, fixed_labels=None):
-    detected_labels = detect_labels_from_sample_df(sample_df, data_type)
-
-    if fixed_labels is None:
-        return detected_labels
-
-    detected_values = sorted([int(v) for v in detected_labels.values()])
-    fixed_values = sorted([int(v) for v in fixed_labels.values()])
-    missing_from_detected = sorted(set(fixed_values) - set(detected_values))
-    extra_detected = sorted(set(detected_values) - set(fixed_values))
-
-    log_ok(f"Using fixed labels for {data_type} in dataset.json.")
-    typer.echo(f"  detected raw label values : {detected_values}")
-    typer.echo(f"  fixed label values        : {fixed_values}")
-    typer.echo(f"  missing in current masks  : {missing_from_detected}")
-    typer.echo(f"  extra detected labels     : {extra_detected}")
-    typer.echo("  final dataset.json labels:")
-
-    for name, value in fixed_labels.items():
-        typer.echo(f"    {name}: {value}")
-
-    return fixed_labels
-
 
 def build_sample_dataframe(rows):
     file_df = pd.DataFrame(rows)
@@ -311,16 +283,12 @@ def build_sample_dataframe(rows):
     mask_df = mask_df.rename(columns={"file_path": "original_mask_path"})
 
     image_cols = [
-        "data_type",
-        "task_id",
         "split",
         "case_name",
         "original_image_path",
     ]
 
     mask_cols = [
-        "data_type",
-        "task_id",
         "split",
         "case_name",
         "original_mask_path",
@@ -328,66 +296,62 @@ def build_sample_dataframe(rows):
 
     sample_df = image_df[image_cols].merge(
         mask_df[mask_cols],
-        on=["data_type", "task_id", "split", "case_name"],
+        on=["split", "case_name"],
         how="left",
     )
 
+    sample_df["original_image_path"] = sample_df["original_image_path"].fillna("")
     sample_df["original_mask_path"] = sample_df["original_mask_path"].fillna("")
-    sample_df["is_labeled"] = sample_df["split"].eq("TrL").astype(int)
-    sample_df["original_case_name"] = sample_df["case_name"]
-
-    split_order = {
-        "TrL": 0,
-        "TrU": 1,
-        "Ts": 2,
-    }
-
-    sample_df["_split_order"] = sample_df["split"].map(split_order)
-
-    sample_df = sample_df.sort_values(
-        ["_split_order", "task_id", "case_name"]
-    ).reset_index(drop=True)
-
-    sample_df = sample_df.drop(columns=["_split_order"])
-
-    duplicated = sample_df["case_name"].duplicated(keep=False)
-
-    if duplicated.any():
-        log_warn("Duplicate case names found:")
-        typer.echo(
-            sample_df.loc[
-                duplicated,
-                ["case_name", "split", "original_image_path"],
-            ].to_string(index=False)
-        )
-
     return sample_df
 
 
-def reassign_case_names_sequentially(sample_df, prefix):
+def reassign_training_case_names_sequentially(sample_df):
+    """
+    Reassign case_name sequentially only for training cases.
+
+    Prefix is detected automatically from existing case_name.
+    TrL and TrU are renamed together.
+    Ts keeps original case_name.
+    """
+
+    sample_df = sample_df.copy()
+
     split_order = {
         "TrL": 0,
         "TrU": 1,
-        "Ts": 2,
+        "Ts":  2,
     }
 
     sample_df["_split_order"] = sample_df["split"].map(split_order)
 
     sample_df = sample_df.sort_values(
-        ["_split_order", "task_id", "original_case_name"]
+        ["_split_order", "case_name"]
     ).reset_index(drop=True)
 
-    sample_df["case_name"] = [
-        f"{prefix}_{i + 1:04d}"
-        for i in range(len(sample_df))
+    train_mask = sample_df["split"].isin(["TrL", "TrU"])
+    n_train = train_mask.sum()
+
+
+    train_case_names = (
+        sample_df.loc[train_mask, "case_name"]
+        .drop_duplicates()
+        .tolist()
+    )
+
+    if len(train_case_names) == 0:
+        raise RuntimeError("No TrL/TrU cases found for renaming.")
+
+    sample_df.loc[train_mask, "case_name"] = [
+        f"{i:04d}"
+        for i in range(n_train)
     ]
-
+    
     sample_df = sample_df.drop(columns=["_split_order"])
-
-    log_ok(f"{prefix.upper()} final case names reassigned sequentially.")
-    typer.echo("  TrL first, then TrU, then Ts.")
-
+    log_ok(f"Training case names reassigned sequentially.")
+    log_info("  TrL first, then TrU.")
+    log_info("  Ts case names kept unchanged.")
     return sample_df
+
 
 
 def channel_names(data_type):
@@ -423,6 +387,7 @@ def get_image_paths(dataset_dir, split, case_name, data_type):
 
 
 def fix_mask_shape_if_needed(image_path, mask_path):
+    
     if mask_path is None or not Path(mask_path).exists():
         return ""
 
@@ -431,7 +396,7 @@ def fix_mask_shape_if_needed(image_path, mask_path):
 
     image = np.squeeze(np.asanyarray(image_nii.dataobj))
     mask = np.squeeze(np.asanyarray(mask_nii.dataobj))
-
+   
     if image.shape == mask.shape:
         return "x".join(str(x) for x in mask.shape)
 
@@ -499,17 +464,129 @@ def write_dummy_mask_from_image(image_path, mask_path):
 # Generic dataset writer
 # =============================================================================
 
+def write_one_sample(
+    dataid,
+    row,
+    dataset_dir,
+    data_type,
+    write_image_fn,
+    write_real_mask_fn,
+    write_dummy_mask_fn,
+    fixed_labels=None,
+):
+    split     = row["split"]
+    case_name = row["case_name"]
+
+    src_image = Path(row["original_image_path"])
+
+    src_mask = (
+        Path(row["original_mask_path"])
+        if row["original_mask_path"] != ""
+        else None
+    )
+
+    image_rel, dst_image_for_writer = get_image_paths(
+        dataset_dir=dataset_dir,
+        split=split,
+        case_name=case_name,
+        data_type=data_type,
+    )
+
+    mask_rel = None
+    dst_mask = None
+
+    if split in ["TrL", "TrU"]:
+        mask_rel = Path("labelsTr") / f"{case_name}.nii.gz"
+        dst_mask = dataset_dir / mask_rel
+
+    primary_image_path = write_image_fn(
+        src_path=src_image,
+        dst_path=dst_image_for_writer,
+    )
+
+    image_shape    = nifti_shape(primary_image_path)
+    mask_shape     = ""
+    has_foreground = 0
+    labels_in_mask = ""
+
+    if split == "TrL":
+        if src_mask is None or not src_mask.exists():
+            log_warn(f"Missing mask for labeled case: {src_image}")
+        else:
+            ok = write_real_mask_fn(src_mask, dst_mask)
+
+            if ok:
+                mask_shape = fix_mask_shape_if_needed(
+                    image_path=primary_image_path,
+                    mask_path=dst_mask,
+                )
+
+                has_foreground, labels_in_mask = check_mask_foreground(
+                    dst_mask
+                )
+
+                if fixed_labels is not None:
+                    allowed_values = set(int(v) for v in fixed_labels.values())
+                    mask_values    = set(
+                        int(v) for v in labels_in_mask.split("|")
+                        if str(v).strip() != ""
+                    )
+
+                    unknown_values = sorted(mask_values - allowed_values)
+
+                    if unknown_values:
+                        log_flag(
+                            f"Mask has labels outside fixed_labels: "
+                            f"{unknown_values}, mask={dst_mask}"
+                        )
+
+                if has_foreground == 0:
+                    log_flag(f"Background-only TrL mask: {dst_mask}")
+
+    elif split == "TrU":
+        write_dummy_mask_fn(primary_image_path, dst_mask)
+
+        mask_shape = fix_mask_shape_if_needed(
+            image_path=primary_image_path,
+            mask_path=dst_mask,
+        )
+
+        has_foreground = 0
+        labels_in_mask = "0"
+
+    elif split == "Ts":
+        pass
+
+    else:
+        raise ValueError(f"Unknown split: {split}")
+
+    return {
+        "dataid": int(dataid),
+        "data_type": data_type,
+        "case_name": case_name,
+        "split": split,
+        "is_labeled": int(split == "TrL"),
+        "has_foreground": has_foreground,
+        "labels_in_mask": labels_in_mask,
+        "image_shape": image_shape,
+        "mask_shape": mask_shape,
+        "image_path": str(image_rel),
+        "mask_path": "" if mask_rel is None else str(mask_rel),
+    }
+
+
 def write_dataset(
     sample_df,
     dataset_id,
-    data_type,
     output_dir,
+    data_type,
     test=False,
-    fixed_labels=None,
     write_image_fn=None,
     write_real_mask_fn=None,
     write_dummy_mask_fn=None,
     description_extra="",
+    num_processes=None,
+    fixed_labels=None,
 ):
     dataset_dir = prepare_output_dirs(output_dir, dataset_id)
 
@@ -521,111 +598,68 @@ def write_dataset(
             .reset_index(drop=True)
         )
 
-    labels = get_labels_for_dataset_json(
-        sample_df=sample_df,
-        data_type=data_type,
-        fixed_labels=fixed_labels,
-    )
+    if num_processes is None:
+        num_processes = os.cpu_count() or 1
 
-    metadata_rows = []
+    num_processes = max(1, int(num_processes))
 
-    counts = {
-        "TrL": 0,
-        "TrU": 0,
-        "Ts": 0,
-    }
+    log_info(f"Raw dataset writing workers: {num_processes}")
 
-    for dataid, row in tqdm(
-        sample_df.iterrows(),
-        total=len(sample_df),
-        desc=f"Writing {dataset_id}",
-    ):
-        split = row["split"]
-        case_name = row["case_name"]
-
-        src_image = Path(row["original_image_path"])
-
-        src_mask = (
-            Path(row["original_mask_path"])
-            if row["original_mask_path"] != ""
-            else None
+    # ------------------------------------------------------------
+    # Labels
+    # ------------------------------------------------------------
+    if fixed_labels is None:
+        labels = detect_labels_from_sample_df(
+            sample_df=sample_df
         )
+    else:
+        labels = fixed_labels
 
-        image_rel, dst_image_for_writer = get_image_paths(
-            dataset_dir=dataset_dir,
-            split=split,
-            case_name=case_name,
-            data_type=data_type,
-        )
+    metadata_rows     = []
+    rows_for_parallel = list(sample_df.iterrows())
 
-        mask_rel = None
-        dst_mask = None
-
-        if split in ["TrL", "TrU"]:
-            mask_rel = Path("labelsTr") / f"{case_name}.nii.gz"
-            dst_mask = dataset_dir / mask_rel
-
-        primary_image_path = write_image_fn(
-            src_path=src_image,
-            dst_path=dst_image_for_writer,
-        )
-
-        image_shape = nifti_shape(primary_image_path)
-        mask_shape = ""
-        has_foreground = 0
-        labels_in_mask = ""
-
-        if split == "TrL":
-            if src_mask is None or not src_mask.exists():
-                log_warn(f"Missing mask for labeled case: {src_image}")
-            else:
-                ok = write_real_mask_fn(src_mask, dst_mask)
-
-                if ok:
-                    mask_shape = fix_mask_shape_if_needed(
-                        image_path=primary_image_path,
-                        mask_path=dst_mask,
-                    )
-
-                    has_foreground, labels_in_mask = check_mask_foreground(dst_mask)
-
-                    if has_foreground == 0:
-                        log_flag(f"Background-only TrL mask: {dst_mask}")
-
-        elif split == "TrU":
-            write_dummy_mask_fn(primary_image_path, dst_mask)
-
-            mask_shape = fix_mask_shape_if_needed(
-                image_path=primary_image_path,
-                mask_path=dst_mask,
+    if num_processes == 1:
+        for dataid, row in tqdm(
+            rows_for_parallel,
+            total=len(rows_for_parallel),
+            desc=f"Writing {dataset_id}",
+        ):
+            metadata_row = write_one_sample(
+                dataid=dataid,
+                row=row,
+                dataset_dir=dataset_dir,
+                data_type=data_type,
+                write_image_fn=write_image_fn,
+                write_real_mask_fn=write_real_mask_fn,
+                write_dummy_mask_fn=write_dummy_mask_fn,
+                fixed_labels=fixed_labels,
             )
 
-            has_foreground = 0
-            labels_in_mask = "0"
+            metadata_rows.append(metadata_row)
 
-        elif split == "Ts":
-            pass
+    else:
+        with ThreadPoolExecutor(max_workers=num_processes) as executor:
+            futures = [
+                executor.submit(
+                    write_one_sample,
+                    dataid,
+                    row,
+                    dataset_dir,
+                    data_type,
+                    write_image_fn,
+                    write_real_mask_fn,
+                    write_dummy_mask_fn,
+                    fixed_labels,
+                )
+                for dataid, row in rows_for_parallel
+            ]
 
-        else:
-            raise ValueError(f"Unknown split: {split}")
-
-        counts[split] += 1
-
-        metadata_rows.append({
-            "dataid": int(dataid),
-            "data_type": data_type,
-            "task_id": row["task_id"],
-            "case_name": case_name,
-            "original_case_name": row["original_case_name"],
-            "split": split,
-            "is_labeled": int(row["is_labeled"]),
-            "has_foreground": has_foreground,
-            "labels_in_mask": labels_in_mask,
-            "image_shape": image_shape,
-            "mask_shape": mask_shape,
-            "image_path": str(image_rel),
-            "mask_path": "" if mask_rel is None else str(mask_rel),
-        })
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc=f"Writing {dataset_id}",
+            ):
+                metadata_rows.append(future.result())
 
     metadata_df = pd.DataFrame(metadata_rows)
 
@@ -633,6 +667,32 @@ def write_dataset(
         metadata_df = pd.DataFrame(columns=METADATA_COLS)
     else:
         metadata_df = metadata_df[METADATA_COLS]
+        metadata_df = metadata_df.sort_values("dataid").reset_index(drop=True)
+
+    counts = {
+        "TrL": 0,
+        "TrU": 0,
+        "Ts":  0,
+    }
+
+    ssl_case_ids = {
+        "TrL": [],
+        "TrU": [],
+        "Ts":  [],
+    }
+
+    # ------------------------------------------------------------
+    # Count unique cases, not image/mask rows
+    # ------------------------------------------------------------
+    for split in ["TrL", "TrU", "Ts"]:
+        case_names = (
+            metadata_df.loc[metadata_df["split"] == split, "case_name"]
+            .drop_duplicates()
+            .tolist()
+        )
+
+        counts[split]       = len(case_names)
+        ssl_case_ids[split] = case_names
 
     metadata_df.to_csv(dataset_dir / "metadata.csv", index=False)
 
@@ -650,7 +710,12 @@ def write_dataset(
         "ssl_counts": {
             "TrL": int(counts["TrL"]),
             "TrU": int(counts["TrU"]),
-            "Ts": int(counts["Ts"]),
+            "Ts":  int(counts["Ts"]),
+        },
+        "ssl_case_ids": {
+            "TrL": ssl_case_ids["TrL"],
+            "TrU": ssl_case_ids["TrU"],
+            "Ts":  ssl_case_ids["Ts"],
         },
     }
 
@@ -669,3 +734,25 @@ def write_dataset(
     typer.echo(f"  imagesTs              : {len(list((dataset_dir / 'imagesTs').glob('*')))}")
     typer.echo(f"  metadata              : {dataset_dir / 'metadata.csv'}")
     typer.echo(f"  dataset.json          : {dataset_dir / 'dataset.json'}")
+
+    return dataset_dir
+
+
+
+def set_nnunet_env(nnunet_raw, nnunet_preprocessed, nnunet_results):
+    nnunet_raw = Path(nnunet_raw).resolve()
+    nnunet_preprocessed = Path(nnunet_preprocessed).resolve()
+    nnunet_results = Path(nnunet_results).resolve()
+
+    nnunet_raw.mkdir(parents=True, exist_ok=True)
+    nnunet_preprocessed.mkdir(parents=True, exist_ok=True)
+    nnunet_results.mkdir(parents=True, exist_ok=True)
+
+    os.environ["nnUNet_raw"] = str(nnunet_raw)
+    os.environ["nnUNet_preprocessed"] = str(nnunet_preprocessed)
+    os.environ["nnUNet_results"] = str(nnunet_results)
+
+    log_info(f"nnUNet_raw          : {os.environ['nnUNet_raw']}")
+    log_info(f"nnUNet_preprocessed : {os.environ['nnUNet_preprocessed']}")
+    log_info(f"nnUNet_results      : {os.environ['nnUNet_results']}")
+

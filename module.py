@@ -1,107 +1,156 @@
 """
 LightningModule for semi-supervised nnU-Net v2 training.
-Uses Hydra/OmegaConf litmodule config object.
+
+Prediction logic is in:
+    prediction_module.py
+
+Metric tracking and progress plotting logic is in:
+    metrics_module.py
 """
 
 from typing import Any, Dict
 
 import torch
 import lightning as L
-from batchgenerators.utilities.file_and_folder_operations import join, load_json
-from nnunetv2.paths import nnUNet_preprocessed
+from batchgenerators.utilities.file_and_folder_operations import (
+    join,
+    load_json,
+)
+
+from nnunetv2.paths import (
+    nnUNet_preprocessed,
+    nnUNet_results,
+)
+
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.utilities.dataset_name_id_conversion import maybe_convert_to_dataset_name
-from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
+from nnunetv2.utilities.label_handling.label_handling import (
+    determine_num_input_channels,
+)
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
-from utils import set_nnunet_env
+
+from prediction_module import PredictionMixin
+from metrics_module import MetricsMixin
 
 
-class SSLnnUNetLightningModule(L.LightningModule):
+class SSLnnUNetLightningModule(
+    PredictionMixin,
+    MetricsMixin,
+    L.LightningModule,
+):
     def __init__(self, litmodule_cfg):
         super().__init__()
 
         self.cfg = litmodule_cfg
 
-        # ------------------------------------------------------------------
-        # nnU-Net paths
-        # ------------------------------------------------------------------
-        self.nnunet_raw = self.cfg.paths.nnunet_raw
-        self.nnunet_preprocessed = self.cfg.paths.nnunet_preprocessed
-        self.nnunet_results = self.cfg.paths.nnunet_results
-
-        set_nnunet_env(
-            nnunet_raw=self.nnunet_raw,
-            nnunet_preprocessed=self.nnunet_preprocessed,
-            nnunet_results=self.nnunet_results,
-        )
-
-        self._env = {
-            "nnunet_raw": self.nnunet_raw,
-            "nnunet_preprocessed": self.nnunet_preprocessed,
-            "nnunet_results": self.nnunet_results,
-        }
-
-        # ------------------------------------------------------------------
-        # Config values
-        # ------------------------------------------------------------------
         self.dataset_id = self.cfg.dataset_id
         self.configuration = self.cfg.configuration
-        self.seed = self.cfg.get("seed", 12345)
+        self.fold = self.cfg.fold
+        self.seed = self.cfg.seed
+        
 
-        self.plans_identifier = self.cfg.get("plans_identifier", "nnUNetPlans")
+        self.plans_identifier = self.cfg.plans_identifier
 
-        self.initial_lr = self.cfg.get("initial_lr", 1e-2)
-        self.weight_decay = self.cfg.get("weight_decay", 3e-5)
-        self.num_epochs = self.cfg.get("num_epochs", 1000)
+        self.initial_lr = self.cfg.initial_lr
+        self.weight_decay = self.cfg.weight_decay
+        self.num_epochs = self.cfg.num_epochs
 
-        self.enable_deep_supervision = self.cfg.get(
-            "enable_deep_supervision",
-            True,
-        )
+        self.enable_deep_supervision = True
 
-        self.lambda_pseudo = self.cfg.get("lambda_pseudo", 0.0)
-        self.pseudo_threshold = self.cfg.get("pseudo_threshold", 0.95)
-        self.compile_network = self.cfg.get("compile_network", False)
+        self.lambda_pseudo = self.cfg.lambda_pseudo
+        self.pseudo_threshold = self.cfg.pseudo_threshold
+        self.task_id = self.cfg.task_id
+        self.prefix = self.cfg.prefix
 
-        # ------------------------------------------------------------------
+        # ------------------------------------------------------------
         # Load plans.json and dataset.json
-        # ------------------------------------------------------------------
+        # ------------------------------------------------------------
         self.dataset_name = maybe_convert_to_dataset_name(self.dataset_id)
-        self.base = join(nnUNet_preprocessed, self.dataset_name)
-
-        self.plans = load_json(join(self.base, self.plans_identifier + ".json"))
+        self.base         = join(nnUNet_preprocessed, self.dataset_name)
+        self.plans        = load_json(join(self.base, self.plans_identifier + ".json"))
         self.dataset_json = load_json(join(self.base, "dataset.json"))
 
-        # ------------------------------------------------------------------
-        # Managers
-        # ------------------------------------------------------------------
+        # ------------------------------------------------------------
+        # nnU-Net managers
+        # ------------------------------------------------------------
         self.pm = PlansManager(self.plans)
         self.cm = self.pm.get_configuration(self.configuration)
         self.lm = self.pm.get_label_manager(self.dataset_json)
 
-        self.num_input_channels = determine_num_input_channels(
-            self.pm,
-            self.cm,
-            self.dataset_json,
+        self.num_input_channels = determine_num_input_channels(self.pm,self.cm,self.dataset_json)
+
+        # ------------------------------------------------------------
+        # Output folders
+        # ------------------------------------------------------------
+        self.actual_validation_output_base = join(
+            nnUNet_results,
+            self.dataset_name,
+            self.plans_identifier
+            + "__"
+            + self.configuration,
         )
 
-        # ------------------------------------------------------------------
+        self.actual_validation_output_folder = join(
+            self.actual_validation_output_base,
+            f"fold_{self.fold}",
+            "validation",
+        )
+
+        self.actual_prediction_output_folder = join(
+            self.actual_validation_output_base,
+            f"fold_{self.fold}",
+            f"{self.prefix}",
+        )
+
+        # Used by PredictionMixin._zip_validation_cases()
+        # Stores validation zip files: image + prediction + GT.
+        self.actual_validation_cases_folder = join(
+            self.actual_validation_output_folder,
+            "cases",
+        )
+
+        self.actual_prediction_cases_folder = join(
+            self.actual_validation_output_base,
+            f"fold_{self.fold}",
+            f"{self.prefix}",
+            f"cases",
+        )
+
+        # Temporary validation predictions used for metrics.
+        self.actual_validation_tmp_preds_folder = join(
+            self.actual_validation_output_folder,
+            "_tmp_predictions",
+        )
+
+        self.gt_folder = join(
+            self.base,
+            "gt_segmentations",
+        )
+
+        # ------------------------------------------------------------
+        # Progress plot output
+        # ------------------------------------------------------------
+        self.progress_folder = join(
+            self.actual_validation_output_base,
+            f"fold_{self.fold}",
+        )
+
+        self.progress_png_file = join(
+            self.progress_folder,
+            "training_progress.png",
+        )
+
+        # ------------------------------------------------------------
+        # Metric tracking
+        # ------------------------------------------------------------
+        self._init_metric_tracking()
+
+        # ------------------------------------------------------------
         # Lazy build
-        # ------------------------------------------------------------------
+        # ------------------------------------------------------------
         self.network = None
         self.loss = None
         self._built = False
-
-        self.save_hyperparameters(
-            ignore=[
-                "litmodule_cfg",
-                "plans",
-                "dataset_json",
-                "pm",
-                "cm",
-                "lm",
-            ]
-        )
 
     # ------------------------------------------------------------------
     # Lazy build
@@ -111,34 +160,14 @@ class SSLnnUNetLightningModule(L.LightningModule):
             return
 
         self.network = self._build_network()
-
-        if self.compile_network:
-            self.network = torch.compile(self.network)
-
         self.loss = self._build_loss()
         self._built = True
 
-    # ------------------------------------------------------------------
-    # Lightning hooks
-    # ------------------------------------------------------------------
     def setup(self, stage=None):
-        set_nnunet_env(**self._env)
-        self._ensure_built()
-
-    def on_train_start(self):
-        self._ensure_built()
-
-    def on_validation_start(self):
-        self._ensure_built()
-
-    def on_test_start(self):
-        self._ensure_built()
-
-    def on_predict_start(self):
         self._ensure_built()
 
     # ------------------------------------------------------------------
-    # nnU-Net shim helpers
+    # nnU-Net trainer shim
     # ------------------------------------------------------------------
     def _make_trainer_shim(self):
         shim = type("S", (), {})()
@@ -147,9 +176,11 @@ class SSLnnUNetLightningModule(L.LightningModule):
         shim.label_manager = self.lm
         shim.enable_deep_supervision = self.enable_deep_supervision
 
-        try:
-            shim.is_ddp = self.trainer.world_size > 1
-        except RuntimeError:
+        trainer = getattr(self, "trainer", None)
+
+        if trainer is not None:
+            shim.is_ddp = getattr(self.trainer, "world_size", 1) > 1
+        else:
             shim.is_ddp = False
 
         shim._get_deep_supervision_scales = (
@@ -161,7 +192,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
         return shim
 
     # ------------------------------------------------------------------
-    # Network
+    # Network/loss
     # ------------------------------------------------------------------
     def _build_network(self):
         return nnUNetTrainer.build_network_architecture(
@@ -172,18 +203,11 @@ class SSLnnUNetLightningModule(L.LightningModule):
             self.enable_deep_supervision,
         )
 
-    # ------------------------------------------------------------------
-    # Loss
-    # ------------------------------------------------------------------
     def _build_loss(self):
         shim = self._make_trainer_shim()
         return nnUNetTrainer._build_loss(shim)
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
     def forward(self, x):
-        self._ensure_built()
         return self.network(x)
 
     # ------------------------------------------------------------------
@@ -191,7 +215,6 @@ class SSLnnUNetLightningModule(L.LightningModule):
     # ------------------------------------------------------------------
     def _get_batch_data_target(self, batch: Dict[str, Any]):
         data = batch["data"].to(self.device, non_blocking=True)
-
         target = batch.get("target", None)
 
         if target is not None:
@@ -209,41 +232,17 @@ class SSLnnUNetLightningModule(L.LightningModule):
     # Supervised loss
     # ------------------------------------------------------------------
     def _supervised_loss(self, batch: Dict[str, Any]):
-        self._ensure_built()
-
         data, target = self._get_batch_data_target(batch)
+
         output = self.network(data)
-
-        if self.enable_deep_supervision:
-            if not isinstance(output, (list, tuple)):
-                raise RuntimeError(
-                    "enable_deep_supervision=True, but network output is not a list/tuple."
-                )
-
-            if not isinstance(target, (list, tuple)):
-                raise RuntimeError(
-                    "enable_deep_supervision=True, but target is not a list/tuple. "
-                    "Fix SSLnnUNetDataModule so deep_supervision_scales is passed "
-                    "to nnU-Net transforms."
-                )
-
-        else:
-            if isinstance(output, (list, tuple)):
-                output = output[0]
-
-            if isinstance(target, (list, tuple)):
-                target = target[0]
-
         loss = self.loss(output, target)
 
         return loss, output, target
 
     # ------------------------------------------------------------------
-    # Optional pseudo-label loss
+    # Pseudo-label loss
     # ------------------------------------------------------------------
     def _pseudo_loss(self, batch: Dict[str, Any]):
-        self._ensure_built()
-
         if self.lambda_pseudo <= 0:
             return torch.tensor(0.0, device=self.device)
 
@@ -253,28 +252,49 @@ class SSLnnUNetLightningModule(L.LightningModule):
             pseudo_output = self.network(data)
 
             if isinstance(pseudo_output, (list, tuple)):
-                pseudo_output = pseudo_output[0]
+                pseudo_logits = pseudo_output[0]
+            else:
+                pseudo_logits = pseudo_output
 
             if self.lm.has_regions:
-                probs = torch.sigmoid(pseudo_output)
-                pseudo_target = (probs > self.pseudo_threshold).float()
+                probs = torch.sigmoid(pseudo_logits)
+
+                pseudo_target = (
+                    probs > self.pseudo_threshold
+                ).float()
+
+                confident_voxels = probs > self.pseudo_threshold
 
             else:
-                probs = torch.softmax(pseudo_output, dim=1)
-                conf, pseudo_target = probs.max(dim=1, keepdim=True)
+                probs = torch.softmax(pseudo_logits, dim=1)
+
+                conf, pseudo_target = probs.max(
+                    dim=1,
+                    keepdim=True,
+                )
+
                 pseudo_target = pseudo_target.long()
+                confident_voxels = conf >= self.pseudo_threshold
 
                 if self.lm.ignore_label is not None:
-                    pseudo_target[conf < self.pseudo_threshold] = self.lm.ignore_label
+                    pseudo_target[~confident_voxels] = self.lm.ignore_label
 
         student_output = self.network(data)
 
         if isinstance(student_output, (list, tuple)):
-            student_output = student_output[0]
+            student_logits = student_output[0]
+        else:
+            student_logits = student_output
 
-        base_loss = getattr(self.loss, "loss", self.loss)
+        # Use the base loss, not DeepSupervisionWrapper,
+        # because pseudo targets are only highest-resolution targets.
+        pseudo_loss = self.loss.loss(
+            student_logits,
+            pseudo_target,
+        )
 
-        pseudo_loss = base_loss(student_output, pseudo_target)
+        if confident_voxels.sum() == 0:
+            pseudo_loss = pseudo_loss * 0.0
 
         return pseudo_loss
 
@@ -282,8 +302,6 @@ class SSLnnUNetLightningModule(L.LightningModule):
     # Training step
     # ------------------------------------------------------------------
     def training_step(self, batch, batch_idx):
-        self._ensure_built()
-
         labeled_batch = batch["labeled"]
         unlabeled_batch = batch.get("unlabeled", None)
 
@@ -295,8 +313,22 @@ class SSLnnUNetLightningModule(L.LightningModule):
             pseudo_loss = torch.tensor(0.0, device=self.device)
 
         total_loss = sup_loss + self.lambda_pseudo * pseudo_loss
-
         batch_size = labeled_batch["data"].shape[0]
+
+        self.loss_metrics["train_loss"].update(
+            total_loss.detach(),
+            weight=batch_size,
+        )
+
+        self.loss_metrics["train_sup_loss"].update(
+            sup_loss.detach(),
+            weight=batch_size,
+        )
+
+        self.loss_metrics["train_pseudo_loss"].update(
+            pseudo_loss.detach(),
+            weight=batch_size,
+        )
 
         self.log(
             "train_loss",
@@ -305,6 +337,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
             on_step=False,
             on_epoch=True,
             batch_size=batch_size,
+            sync_dist=True,
         )
 
         self.log(
@@ -314,6 +347,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
             on_step=False,
             on_epoch=True,
             batch_size=batch_size,
+            sync_dist=True,
         )
 
         self.log(
@@ -323,6 +357,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
             on_step=False,
             on_epoch=True,
             batch_size=batch_size,
+            sync_dist=True,
         )
 
         return total_loss
@@ -331,9 +366,13 @@ class SSLnnUNetLightningModule(L.LightningModule):
     # Validation step
     # ------------------------------------------------------------------
     def validation_step(self, batch, batch_idx):
-        self._ensure_built()
-
         val_loss, _, _ = self._supervised_loss(batch)
+        batch_size = batch["data"].shape[0]
+
+        self.loss_metrics["val_loss"].update(
+            val_loss.detach(),
+            weight=batch_size,
+        )
 
         self.log(
             "val_loss",
@@ -341,38 +380,101 @@ class SSLnnUNetLightningModule(L.LightningModule):
             prog_bar=True,
             on_step=False,
             on_epoch=True,
-            batch_size=batch["data"].shape[0],
+            batch_size=batch_size,
+            sync_dist=True,
         )
-
         return val_loss
 
     # ------------------------------------------------------------------
-    # Test step
+    # Predict step
     # ------------------------------------------------------------------
-    def test_step(self, batch, batch_idx):
-        self._ensure_built()
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        """
+        No-op predict step.
 
-        test_loss, _, _ = self._supervised_loss(batch)
+        Actual test prediction export is handled in on_predict_start()
+        using nnU-Net's raw-file predictor.
+        """
+        return None
+        
+    # ------------------------------------------------------------------
+    # Validation epoch end
+    # ------------------------------------------------------------------
+    def on_validation_epoch_end(self):
+        if self.trainer.sanity_checking:
+            return
 
-        self.log(
-            "test_loss",
-            test_loss,
-            prog_bar=True,
-            on_step=False,
-            on_epoch=True,
-            batch_size=batch["data"].shape[0],
+        run_actual_validation = (
+            self.current_epoch % 5 == 0
+            or self.current_epoch == self.trainer.max_epochs - 1
         )
 
-        return test_loss
+        if not run_actual_validation:
+            self.loss_metrics.reset()
+            return
 
+        epoch_losses = self.loss_metrics.compute()
+        self.loss_metrics.reset()
+
+        if not self.trainer.is_global_zero:
+            return
+
+        # ------------------------------------------------------------
+        # 1. Actual validation with metrics
+        # Uses labeled validation cases.
+        # PredictionMixin handles prediction, zip creation, and metrics.
+        # ------------------------------------------------------------
+        metrics = self.run_validation_prediction_with_metrics()
+        validation_scores = self._extract_validation_scores(metrics)
+
+        # ------------------------------------------------------------
+        # 2. Test prediction export from raw imagesTs
+        # No metrics, no GT, no zip.
+        # PredictionMixin writes to actual_prediction_output_folder.
+        # ------------------------------------------------------------
+        self.run_test_prediction(
+            save_probabilities=False,
+            overwrite=True,
+        )
+
+        self._update_progress_metrics(
+            epoch_losses=epoch_losses,
+            validation_scores=validation_scores,
+        )
+
+        self._save_training_progress_plot()
+
+    # ------------------------------------------------------------------
+    # Predict start
+    # ------------------------------------------------------------------
+    def on_predict_start(self):
+        """
+        Export test predictions from raw imagesTs.
+
+        The checkpoint is selected outside this module by Lightning:
+
+            trainer.predict(model, datamodule=datamodule, ckpt_path="best")
+            trainer.predict(model, datamodule=datamodule, ckpt_path="last")
+
+        By the time this hook runs, Lightning has already loaded the selected
+        checkpoint weights into self.network.
+        """
+
+        self._ensure_built()
+
+        if not self.trainer.is_global_zero:
+            return
+
+        self.run_test_prediction(
+            save_probabilities=False,
+            overwrite=True,
+        )
+        
     # ------------------------------------------------------------------
     # Optimizer + scheduler
     # ------------------------------------------------------------------
     def configure_optimizers(self):
-        self._ensure_built()
-
         shim = type("S", (), {})()
-
         shim.network = self.network
         shim.initial_lr = self.initial_lr
         shim.weight_decay = self.weight_decay
