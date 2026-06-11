@@ -7,6 +7,13 @@ seed: 12345
 experiment_name: ssl_nnunet
 
 # =============================================================================
+# Runtime / cluster-controlled values
+# =============================================================================
+
+devices: ???
+training_strategy: ???
+
+# =============================================================================
 # Dataset / nnU-Net setup
 # =============================================================================
 
@@ -23,23 +30,20 @@ plans_identifier: nnUNetPlans
 
 paths:
   nnunet_data_root: dirs/data_storage/nnUNet/MVAA_nnUNET
-  nnunet_raw:  ${paths.nnunet_data_root}/nnUNet_raw
+  nnunet_raw: ${paths.nnunet_data_root}/nnUNet_raw
   nnunet_preprocessed: ${paths.nnunet_data_root}/nnUNet_preprocessed
-  nnunet_results:  ${paths.nnunet_data_root}/nnUNet_results
-
+  nnunet_results: ${paths.nnunet_data_root}/nnUNet_results
 
 # =============================================================================
 # DataModule config
 # =============================================================================
 
 datamodule:
-  num_devices: ???
   dataset_id: ${dataset_id}
   configuration: ${configuration}
   fold: ${fold}
   seed: ${seed}
   plans_identifier: ${plans_identifier}
-
 
 # =============================================================================
 # LightningModule config
@@ -59,30 +63,30 @@ litmodule:
   lambda_pseudo: 0.1
   pseudo_threshold: 0.95
 
-
-
 # =============================================================================
 # Trainer config
 # =============================================================================
+
 trainer:
-  max_epochs: 80
-  strategy: ddp
+  max_epochs: 300
+  strategy: ${training_strategy}
   precision: 16-mixed
   log_every_n_steps: 1
   check_val_every_n_epoch: 1
   enable_progress_bar: true
   enable_checkpointing: true
   deterministic: false
-  limit_train_batches: ???
-  limit_val_batches: ???
-  devices: ???
+  devices: ${devices}
   num_nodes: 1
-  accelerator: "gpu"
+  accelerator: gpu
   logger: false
+  use_distributed_sampler: false
+  num_sanity_val_steps: 0
 
 # =============================================================================
-# progress bar
+# Progress bar
 # =============================================================================
+
 progress_bar:
   _target_: lightning.pytorch.callbacks.TQDMProgressBar
   refresh_rate: 1
@@ -90,12 +94,14 @@ progress_bar:
 # =============================================================================
 # Checkpointer config
 # =============================================================================
+
+
 checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.nnunet_results}/${dataset_id}/${plans_identifier}__${configuration}/fold_${fold}/checkpoints
-  filename: "best-{epoch:03d}-{val_loss:.4f}"
+  filename: "best-{epoch:03d}-{dice:.4f}"
   save_last: true
   save_top_k: 1
-  monitor: "val_loss"
-  mode: "min"
+  monitor: "dice"
+  mode: "max"
   auto_insert_metric_name: false

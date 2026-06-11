@@ -9,44 +9,51 @@ Usage:
     python engine.py predict video
     python engine.py predict tee
     python engine.py predict ct
+    python engine.py predict all
+
+    python engine.py predict video --ckpt best
+    python engine.py predict video --ckpt last
+    python engine.py predict video --ckpt /path/to/checkpoint.ckpt
+
+    python engine.py predict all --ckpt best
+    python engine.py predict all --ckpt last
 
     python engine.py submit
-
-Examples:
-    python engine.py train video --fold-num all
-    python engine.py train video --fold-num all --keep-checkpoints
-
-    python engine.py predict video --fold-num all --ckpt best
-    python engine.py predict video --fold-num all --ckpt last
-    python engine.py predict video --fold-num all --ckpt /path/to/checkpoint.ckpt
-
-    python engine.py submit --fold-num all
-
-With py wrapper:
-    py engine.py train video --fold-num all
-    py engine.py predict video --fold-num all --ckpt last
-    py engine.py submit
 """
 
 from pathlib import Path
-import shutil
 import zipfile
 
 import typer
-import torch
 import lightning as L
 
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
+from lightning.pytorch.strategies import DDPStrategy
+
+try:
+    from lightning.fabric.plugins.environments import LightningEnvironment
+except ImportError:
+    from lightning.pytorch.plugins.environments import LightningEnvironment
+
 from config import build_config
+
 from utils import (
     set_nnunet_env,
-    ActualValidationTQDMCallback,
+    resolve_runtime_config,
+    clear_checkpoint_dir,
+    validate_experiment_name,
+    collect_submission_files,
+    resolve_prediction_ckpt,
 )
 
 
 app = typer.Typer()
+
+
+FOLD_NUM = "all"
+CKPT = "best"
 
 
 CONFIG_MAP = {
@@ -56,52 +63,39 @@ CONFIG_MAP = {
 }
 
 
-def _get_num_devices(cfg):
-    strategy = cfg.trainer.get("strategy", None)
+def _use_plain_lightning_ddp(
+    trainer_cfg,
+):
+    """
+    Force plain Lightning DDP for non-managed clusters.
+    """
 
-    if strategy == "ddp":
-        return max(1, torch.cuda.device_count())
-
-    return 1
-
-
-def _get_checkpoint_dir(cfg):
-    return (
-        Path(cfg.paths.nnunet_results)
-        / cfg.dataset_id
-        / f"{cfg.plans_identifier}__{cfg.configuration}"
-        / f"fold_{cfg.fold}"
-        / "checkpoints"
+    strategy = trainer_cfg.get(
+        "strategy",
+        "auto",
     )
 
+    if strategy != "ddp":
+        return trainer_cfg
 
-def _clear_checkpoint_dir(cfg):
-    checkpoint_dir = _get_checkpoint_dir(cfg)
+    trainer_cfg["num_nodes"] = 1
 
-    if checkpoint_dir.exists():
-        shutil.rmtree(checkpoint_dir)
+    trainer_cfg["strategy"] = DDPStrategy(
+        cluster_environment=LightningEnvironment(),
+    )
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    print()
-    print("[checkpoint] Cleared checkpoint directory:")
-    print(f"  {checkpoint_dir}")
-    print()
+    return trainer_cfg
 
 
-def _build_trainer(cfg, prediction=False):
+def _build_trainer(
+    cfg,
+    prediction=False,
+):
     """
     Build Lightning Trainer.
 
-    Training:
-        - normal Lightning TQDMProgressBar from cfg.progress_bar
-        - custom ActualValidationTQDMCallback for actual validation/prediction stages
-        - checkpoint callback from cfg.checkpoint
-
-    Prediction:
-        - normal Lightning TQDMProgressBar from cfg.progress_bar
-        - custom ActualValidationTQDMCallback
-        - no checkpoint callback
+    Keep ModelCheckpoint callback also during prediction.
+    For prediction, ckpt='best'/'last' is resolved manually before trainer.test().
     """
 
     trainer_cfg = OmegaConf.to_container(
@@ -109,31 +103,22 @@ def _build_trainer(cfg, prediction=False):
         resolve=True,
     )
 
+    trainer_cfg = _use_plain_lightning_ddp(
+        trainer_cfg,
+    )
+
     callbacks = []
 
-    # ------------------------------------------------------------
-    # Normal Lightning progress bar
-    # This requires cfg.progress_bar to be outside cfg.trainer.
-    # ------------------------------------------------------------
-    if cfg.trainer.get("enable_progress_bar", True):
+    if trainer_cfg.get("enable_progress_bar", True):
         if "progress_bar" in cfg:
             callbacks.append(
                 instantiate(cfg.progress_bar)
             )
 
-    # ------------------------------------------------------------
-    # Custom tqdm bar for actual validation / prediction / zip / metrics
-    # ------------------------------------------------------------
-    callbacks.append(
-        ActualValidationTQDMCallback(every=1)
-    )
-
-    # ------------------------------------------------------------
-    # Checkpointing only during training
-    # ------------------------------------------------------------
-    if not prediction and cfg.trainer.get("enable_checkpointing", True):
-        checkpoint_callback = instantiate(cfg.checkpoint)
-        callbacks.append(checkpoint_callback)
+    if trainer_cfg.get("enable_checkpointing", True):
+        callbacks.append(
+            instantiate(cfg.checkpoint)
+        )
 
     trainer = L.Trainer(
         **trainer_cfg,
@@ -145,45 +130,45 @@ def _build_trainer(cfg, prediction=False):
 
 def _build_objects(
     config_name,
-    fold_num="all",
     prediction=False,
     clear_checkpoints=False,
 ):
     cfg = build_config(
         config_name=config_name,
-        overrides=[f"fold={fold_num}"],
+        overrides=[
+            f"fold={FOLD_NUM}",
+        ],
     )
 
-    set_nnunet_env(cfg)
-    L.seed_everything(cfg.seed, workers=True)
+    set_nnunet_env(
+        cfg,
+    )
+
+    L.seed_everything(
+        cfg.seed,
+        workers=True,
+    )
 
     from datamodule import SSLnnUNetDataModule
     from module import SSLnnUNetLightningModule
 
-    if prediction:
-        # Prediction/export should run on one process only.
-        cfg.datamodule.num_devices = 1
-        cfg.trainer.devices = 1
-        cfg.trainer.strategy = "auto"
-        cfg.trainer.num_nodes = 1
+    cfg = resolve_runtime_config(
+        cfg,
+        prediction=prediction,
+    )
 
-        # We load from ckpt_path in trainer.predict(...), so no callback needed.
-        cfg.trainer.enable_checkpointing = False
+    if not prediction and clear_checkpoints:
+        clear_checkpoint_dir(
+            cfg,
+        )
 
-    else:
-        cfg.datamodule.num_devices = _get_num_devices(cfg)
-        cfg.trainer.devices = cfg.datamodule.num_devices
+    datamodule = SSLnnUNetDataModule(
+        cfg.datamodule,
+    )
 
-        # Clear old checkpoints only when training.
-        if clear_checkpoints:
-            _clear_checkpoint_dir(cfg)
-
-    datamodule = SSLnnUNetDataModule(cfg.datamodule)
-
-    cfg.trainer.limit_train_batches = datamodule.limit_train_batches
-    cfg.trainer.limit_val_batches = datamodule.limit_val_batches
-
-    model = SSLnnUNetLightningModule(cfg.litmodule)
+    model = SSLnnUNetLightningModule(
+        cfg.litmodule,
+    )
 
     trainer = _build_trainer(
         cfg,
@@ -195,12 +180,10 @@ def _build_objects(
 
 def _run_training(
     config_name,
-    fold_num="all",
     clear_checkpoints=True,
 ):
     cfg, datamodule, model, trainer = _build_objects(
         config_name=config_name,
-        fold_num=fold_num,
         prediction=False,
         clear_checkpoints=clear_checkpoints,
     )
@@ -213,74 +196,152 @@ def _run_training(
 
 def _run_prediction(
     config_name,
-    fold_num="all",
-    ckpt="best",
+    ckpt=CKPT,
 ):
     cfg, datamodule, model, trainer = _build_objects(
         config_name=config_name,
-        fold_num=fold_num,
         prediction=True,
         clear_checkpoints=False,
     )
 
-    trainer.predict(
+    resolved_ckpt = resolve_prediction_ckpt(
+        cfg=cfg,
+        ckpt=ckpt,
+    )
+
+    print()
+    print("[predict] Using checkpoint:")
+    print(f"  requested: {ckpt}")
+    print(f"  resolved : {resolved_ckpt}")
+    print()
+
+    trainer.test(
         model=model,
         datamodule=datamodule,
-        ckpt_path=ckpt,
+        ckpt_path=resolved_ckpt,
     )
 
 
-def _get_prediction_folder(cfg):
-    return (
-        Path(cfg.paths.nnunet_results)
-        / cfg.dataset_id
-        / f"{cfg.plans_identifier}__{cfg.configuration}"
-        / f"fold_{cfg.fold}"
-        / cfg.prefix
-    )
-
-
-def _collect_submission_files(config_name, fold_num="all"):
-    cfg = build_config(
-        config_name=config_name,
-        overrides=[f"fold={fold_num}"],
-    )
-
-    set_nnunet_env(cfg)
-
-    prediction_folder = _get_prediction_folder(cfg)
-
-    if not prediction_folder.exists():
-        raise FileNotFoundError(
-            f"Prediction folder not found: {prediction_folder}"
-        )
-
-    json_file = prediction_folder / f"{cfg.task_id}_predictions.json"
-
-    if not json_file.exists():
-        raise FileNotFoundError(
-            f"Prediction JSON not found: {json_file}"
-        )
-
-    nii_files = sorted(prediction_folder.glob("*.nii.gz"))
-
-    if not nii_files:
-        raise FileNotFoundError(
-            f"No .nii.gz prediction files found in: {prediction_folder}"
-        )
-
-    return {
-        "prefix": cfg.prefix,
-        "task_id": cfg.task_id,
-        "prediction_folder": prediction_folder,
-        "json_file": json_file,
-        "nii_files": nii_files,
-    }
-
-
-def _make_submission_zip_all(fold_num="all"):
+def _run_prediction_all(
+    ckpt=CKPT,
+):
     """
-    Create one submission.zip in the engine.py folder.
+    Run prediction for ct, tee, and video.
+    """
+
+    if ckpt not in ["best", "last"]:
+        raise typer.BadParameter(
+            "When using 'predict all', use --ckpt best or --ckpt last. "
+            "A single explicit .ckpt path cannot safely be shared across "
+            "ct, tee, and video."
+        )
+
+    print()
+    print("Predicting all experiments")
+    print(f"Experiments: {', '.join(CONFIG_MAP.keys())}")
+    print(f"Fold: {FOLD_NUM}")
+    print(f"Checkpoint: {ckpt}")
+    print()
+
+    for experiment, config_name in CONFIG_MAP.items():
+        print()
+        print("=" * 80)
+        print(f"[predict all] Experiment: {experiment}")
+        print(f"[predict all] Config: {config_name}")
+        print("=" * 80)
+        print()
+
+        _run_prediction(
+            config_name=config_name,
+            ckpt=ckpt,
+        )
+
+
+@app.command()
+def train(
+    experiment: str = typer.Argument(
+        ...,
+        help="Which experiment to train: ct, tee, or video.",
+    ),
+    clear_checkpoints: bool = typer.Option(
+        True,
+        "--clear-checkpoints/--keep-checkpoints",
+        help="Clear checkpoint directory before training. Default is true.",
+    ),
+):
+    try:
+        experiment, config_name = validate_experiment_name(
+            experiment,
+            CONFIG_MAP,
+        )
+    except ValueError as e:
+        raise typer.BadParameter(
+            str(e)
+        )
+
+    print()
+    print(f"Training experiment: {experiment}")
+    print(f"Config: {config_name}")
+    print(f"Fold: {FOLD_NUM}")
+    print(f"Clear checkpoints: {clear_checkpoints}")
+    print()
+
+    _run_training(
+        config_name=config_name,
+        clear_checkpoints=clear_checkpoints,
+    )
+
+
+@app.command()
+def predict(
+    experiment: str = typer.Argument(
+        ...,
+        help="Which experiment to predict: ct, tee, video, or all.",
+    ),
+    ckpt: str = typer.Option(
+        CKPT,
+        "--ckpt",
+        help="Checkpoint to use: best, last, or full .ckpt path.",
+    ),
+):
+    experiment = str(
+        experiment
+    ).lower().strip()
+
+    if experiment == "all":
+        _run_prediction_all(
+            ckpt=ckpt,
+        )
+
+        return
+
+    try:
+        experiment, config_name = validate_experiment_name(
+            experiment,
+            CONFIG_MAP,
+        )
+    except ValueError as e:
+        raise typer.BadParameter(
+            str(e)
+        )
+
+    print()
+    print(f"Predicting experiment: {experiment}")
+    print(f"Config: {config_name}")
+    print(f"Fold: {FOLD_NUM}")
+    print(f"Checkpoint: {ckpt}")
+    print()
+
+    _run_prediction(
+        config_name=config_name,
+        ckpt=ckpt,
+    )
+
+
+@app.command()
+def submit():
+    """
+    Create one submission.zip for all experiments.
 
     Structure:
         submission.zip
@@ -292,8 +353,13 @@ def _make_submission_zip_all(fold_num="all"):
         │   └── *.nii.gz
         └── t3_vid/
             ├── task3_predictions.json
-            └── *.nii.gz
+            └── *.png
     """
+
+    print()
+    print("Creating one submission.zip for all experiments")
+    print(f"Fold: {FOLD_NUM}")
+    print()
 
     output_zip = Path(__file__).resolve().parent / "submission.zip"
 
@@ -303,13 +369,27 @@ def _make_submission_zip_all(fold_num="all"):
     all_items = []
 
     for experiment, config_name in CONFIG_MAP.items():
-        item = _collect_submission_files(
+        cfg = build_config(
             config_name=config_name,
-            fold_num=fold_num,
+            overrides=[
+                f"fold={FOLD_NUM}",
+            ],
+        )
+
+        set_nnunet_env(
+            cfg,
+        )
+
+        item = collect_submission_files(
+            cfg=cfg,
+            fold_num=FOLD_NUM,
         )
 
         item["experiment"] = experiment
-        all_items.append(item)
+
+        all_items.append(
+            item
+        )
 
     with zipfile.ZipFile(
         output_zip,
@@ -319,17 +399,17 @@ def _make_submission_zip_all(fold_num="all"):
         for item in all_items:
             prefix = item["prefix"]
             json_file = item["json_file"]
-            nii_files = item["nii_files"]
+            prediction_files = item["prediction_files"]
 
             zf.write(
                 json_file,
                 arcname=f"{prefix}/{json_file.name}",
             )
 
-            for nii_file in nii_files:
+            for prediction_file in prediction_files:
                 zf.write(
-                    nii_file,
-                    arcname=f"{prefix}/{nii_file.name}",
+                    prediction_file,
+                    arcname=f"{prefix}/{prediction_file.name}",
                 )
 
     print()
@@ -341,114 +421,8 @@ def _make_submission_zip_all(fold_num="all"):
         print(f"[submission] {item['experiment']}")
         print(f"  folder inside zip: {item['prefix']}/")
         print(f"  json: {item['json_file'].name}")
-        print(f"  nii.gz files: {len(item['nii_files'])}")
+        print(f"  prediction files: {len(item['prediction_files'])}")
         print()
-
-    return output_zip
-
-
-@app.command()
-def train(
-    experiment: str = typer.Argument(
-        ...,
-        help="Which experiment to train: ct, tee, or video.",
-    ),
-    fold_num: str = typer.Option(
-        "all",
-        "--fold-num",
-        "-f",
-        help="Fold number to train, or 'all'. Default is 'all'.",
-    ),
-    clear_checkpoints: bool = typer.Option(
-        True,
-        "--clear-checkpoints/--keep-checkpoints",
-        help="Clear checkpoint directory before training. Default is true.",
-    ),
-):
-    experiment = experiment.lower()
-
-    if experiment not in CONFIG_MAP:
-        valid = ", ".join(CONFIG_MAP.keys())
-        raise typer.BadParameter(
-            f"Unknown experiment '{experiment}'. Choose one of: {valid}"
-        )
-
-    config_name = CONFIG_MAP[experiment]
-
-    print()
-    print(f"Training experiment: {experiment}")
-    print(f"Config: {config_name}")
-    print(f"Fold: {fold_num}")
-    print(f"Clear checkpoints: {clear_checkpoints}")
-    print()
-
-    _run_training(
-        config_name=config_name,
-        fold_num=fold_num,
-        clear_checkpoints=clear_checkpoints,
-    )
-
-
-@app.command()
-def predict(
-    experiment: str = typer.Argument(
-        ...,
-        help="Which experiment to predict: ct, tee, or video.",
-    ),
-    fold_num: str = typer.Option(
-        "all",
-        "--fold-num",
-        "-f",
-        help="Fold number to predict, or 'all'. Default is 'all'.",
-    ),
-    ckpt: str = typer.Option(
-        "best",
-        "--ckpt",
-        "-c",
-        help="Checkpoint to use: 'best', 'last', or full checkpoint path.",
-    ),
-):
-    experiment = experiment.lower()
-
-    if experiment not in CONFIG_MAP:
-        valid = ", ".join(CONFIG_MAP.keys())
-        raise typer.BadParameter(
-            f"Unknown experiment '{experiment}'. Choose one of: {valid}"
-        )
-
-    config_name = CONFIG_MAP[experiment]
-
-    print()
-    print(f"Predicting experiment: {experiment}")
-    print(f"Config: {config_name}")
-    print(f"Fold: {fold_num}")
-    print(f"Checkpoint: {ckpt}")
-    print()
-
-    _run_prediction(
-        config_name=config_name,
-        fold_num=fold_num,
-        ckpt=ckpt,
-    )
-
-
-@app.command()
-def submit(
-    fold_num: str = typer.Option(
-        "all",
-        "--fold-num",
-        "-f",
-        help="Fold number to package, or 'all'. Default is 'all'.",
-    ),
-):
-    print()
-    print("Creating one submission.zip for all experiments")
-    print(f"Fold: {fold_num}")
-    print()
-
-    _make_submission_zip_all(
-        fold_num=fold_num,
-    )
 
 
 if __name__ == "__main__":
