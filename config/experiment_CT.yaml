@@ -60,7 +60,7 @@ litmodule:
   initial_lr: 0.01
   weight_decay: 0.00003
   num_epochs: ${trainer.max_epochs}
-  lambda_pseudo: 0.5
+  lambda_pseudo: 0.25
   pseudo_threshold: 0.95
 
 # =============================================================================
