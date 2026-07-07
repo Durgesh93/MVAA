@@ -5,7 +5,7 @@ Folder structure:
     fold_all/
     ├── validation/          # Slicer MRML case zips, includes gt
     ├── Test/                # Slicer MRML case zips, no gt
-    ├── submission/          # *_pred.nii.gz / *_pred.png + task_id_predictions.json
+    ├── submission/          # *-pred.nii.gz / *_label_bin.png (task_id_predictions.json is built by engine.py submit, from zip contents)
     ├── _rank_outputs/       # temporary DDP rank-local outputs
     ├── checkpoints/
     └── training_progress.png
@@ -115,6 +115,16 @@ class SSLnnUNetLightningModule(
                 self.base,
                 "dataset.json",
             )
+        )
+
+        # Task 3 masks are multi-class (class_10 "LV", class_11).
+        # Submission output keeps only these classes as foreground.
+        # Currently just class_10 (LV); add more label names here
+        # to keep additional classes in the submission.
+        self.keep_classes = (
+            [self.dataset_json["labels"]["class_10"]]
+            if self.is_t3_vid
+            else None
         )
 
         self.pm = PlansManager(self.plans)
@@ -481,10 +491,9 @@ class SSLnnUNetLightningModule(
             write_prediction_case_zip(
                 prediction=prediction,
                 zip_dir=rank_output_folder / "validation",
-                image_reader_writer=self.pm.image_reader_writer_class,
                 configuration_manager=self.cm,
                 include_gt=True,
-                convert_to_255=self.convert_to_255,
+                reset_direction=self.is_t3_vid,
             )
 
             metrics = self.compute_metrics(
@@ -504,18 +513,17 @@ class SSLnnUNetLightningModule(
         write_prediction_case_zip(
             prediction=prediction,
             zip_dir=rank_output_folder / "prediction",
-            image_reader_writer=self.pm.image_reader_writer_class,
             configuration_manager=self.cm,
             include_gt=False,
-            convert_to_255=self.convert_to_255,
+            reset_direction=self.is_t3_vid,
         )
 
         write_submission_prediction(
             prediction=prediction,
             output_folder=rank_output_folder / "submission",
-            image_reader_writer=self.pm.image_reader_writer_class,
             configuration_manager=self.cm,
             convert_to_255=self.convert_to_255,
+            keep_classes=self.keep_classes,
             output_format=self.submission_output_format,
         )
 

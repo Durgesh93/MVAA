@@ -15,15 +15,24 @@ Usage:
     python engine.py predict video --ckpt last
     python engine.py predict video --ckpt /path/to/checkpoint.ckpt
 
-    python engine.py predict all --ckpt best
-    python engine.py predict all --ckpt last
-
     python engine.py submit
+
+    All commands use the experiment_name set in the yaml configs. Results
+    are written to / read from nnUNet_results/<experiment_name>/, and
+    submit names its output submission_<experiment_name>.zip accordingly.
+    To switch experiments, edit experiment_name in the yaml configs.
+
+    train always clears the fold's whole output folder first (checkpoints,
+    validation, prediction, submission, _rank_outputs).
 """
 
+import json
+import re
+import shutil
 from pathlib import Path
 import zipfile
 
+import torch
 import typer
 import lightning as L
 
@@ -31,18 +40,14 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
 from lightning.pytorch.strategies import DDPStrategy
+from lightning.fabric.plugins.environments import LightningEnvironment
 
-try:
-    from lightning.fabric.plugins.environments import LightningEnvironment
-except ImportError:
-    from lightning.pytorch.plugins.environments import LightningEnvironment
 
 from config import build_config
 
 from utils import (
     set_nnunet_env,
     resolve_runtime_config,
-    clear_checkpoint_dir,
     validate_experiment_name,
     collect_submission_files,
     resolve_prediction_ckpt,
@@ -55,6 +60,10 @@ app = typer.Typer()
 FOLD_NUM = "all"
 CKPT = "best"
 
+VIDEO_SUBMISSION_SUFFIX = "_label_bin.png"
+VIDEO_CASE_ID_PATTERN = re.compile(r"^(?P<video_id>.+)_(?P<frame>\d{6})$")
+NIFTI_SUBMISSION_SUFFIX = "-pred.nii.gz"
+
 
 CONFIG_MAP = {
     "ct": "experiment_CT",
@@ -63,26 +72,39 @@ CONFIG_MAP = {
 }
 
 
-def _use_plain_lightning_ddp(
+def _select_cluster_environment(
     trainer_cfg,
 ):
     """
-    Force plain Lightning DDP for non-managed clusters.
+    This cluster does not launch training via srun, so Lightning's automatic
+    cluster-environment detection is unsafe: SLURMEnvironment's constructor
+    validates srun variables eagerly and raises whenever SLURM_NTASKS > 1
+    without SLURM_NTASKS_PER_NODE (this cluster's job scripts set --ntasks),
+    regardless of accelerator/strategy. Force Lightning's unmanaged
+    environment and pin topology explicitly so that detection never runs,
+    for both single-device and DDP training.
     """
+
+    device_count = (
+        torch.cuda.device_count()
+        if torch.cuda.is_available()
+        else 1
+    )
+
+    trainer_cfg["num_nodes"] = 1
+    trainer_cfg["devices"] = device_count
 
     strategy = trainer_cfg.get(
         "strategy",
         "auto",
     )
 
-    if strategy != "ddp":
-        return trainer_cfg
-
-    trainer_cfg["num_nodes"] = 1
-
-    trainer_cfg["strategy"] = DDPStrategy(
-        cluster_environment=LightningEnvironment(),
-    )
+    if strategy == "ddp":
+        trainer_cfg["strategy"] = DDPStrategy(
+            cluster_environment=LightningEnvironment(),
+        )
+    else:
+        trainer_cfg["plugins"] = [LightningEnvironment()]
 
     return trainer_cfg
 
@@ -103,7 +125,7 @@ def _build_trainer(
         resolve=True,
     )
 
-    trainer_cfg = _use_plain_lightning_ddp(
+    trainer_cfg = _select_cluster_environment(
         trainer_cfg,
     )
 
@@ -131,7 +153,6 @@ def _build_trainer(
 def _build_objects(
     config_name,
     prediction=False,
-    clear_checkpoints=False,
 ):
     cfg = build_config(
         config_name=config_name,
@@ -157,8 +178,8 @@ def _build_objects(
         prediction=prediction,
     )
 
-    if not prediction and clear_checkpoints:
-        clear_checkpoint_dir(
+    if not prediction:
+        clear_results(
             cfg,
         )
 
@@ -180,12 +201,10 @@ def _build_objects(
 
 def _run_training(
     config_name,
-    clear_checkpoints=True,
 ):
     cfg, datamodule, model, trainer = _build_objects(
         config_name=config_name,
         prediction=False,
-        clear_checkpoints=clear_checkpoints,
     )
 
     trainer.fit(
@@ -201,7 +220,6 @@ def _run_prediction(
     cfg, datamodule, model, trainer = _build_objects(
         config_name=config_name,
         prediction=True,
-        clear_checkpoints=False,
     )
 
     resolved_ckpt = resolve_prediction_ckpt(
@@ -257,16 +275,39 @@ def _run_prediction_all(
         )
 
 
+def clear_results(cfg):
+    """
+    Clear the entire fold output folder for one experiment:
+    checkpoints, validation, prediction, submission, and any
+    leftover _rank_outputs.
+    """
+
+    fold_output_folder = (
+        Path(cfg.paths.nnunet_results)
+        / cfg.dataset_id
+        / f"{cfg.plans_identifier}__{cfg.configuration}"
+        / f"fold_{cfg.fold}"
+    )
+
+    if fold_output_folder.exists():
+        shutil.rmtree(fold_output_folder)
+
+    fold_output_folder.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print()
+    print("[clear-results] Cleared fold output folder:")
+    print(f"  {fold_output_folder}")
+    print()
+
+
 @app.command()
 def train(
     experiment: str = typer.Argument(
         ...,
         help="Which experiment to train: ct, tee, or video.",
-    ),
-    clear_checkpoints: bool = typer.Option(
-        True,
-        "--clear-checkpoints/--keep-checkpoints",
-        help="Clear checkpoint directory before training. Default is true.",
     ),
 ):
     try:
@@ -283,12 +324,10 @@ def train(
     print(f"Training experiment: {experiment}")
     print(f"Config: {config_name}")
     print(f"Fold: {FOLD_NUM}")
-    print(f"Clear checkpoints: {clear_checkpoints}")
     print()
 
     _run_training(
         config_name=config_name,
-        clear_checkpoints=clear_checkpoints,
     )
 
 
@@ -341,32 +380,28 @@ def predict(
 @app.command()
 def submit():
     """
-    Create one submission.zip for all experiments.
+    Create one submission_<experiment_name>.zip for all experiments.
+
+    task*_predictions.json is built here from the actual zip contents
+    (case_id + path relative to the task's zip folder), not copied from
+    disk, so it always matches the file layout inside the zip.
 
     Structure:
-        submission.zip
+        submission_<experiment_name>.zip
         ├── t1_ct/
         │   ├── task1_predictions.json
-        │   └── *.nii.gz
+        │   └── *-pred.nii.gz
         ├── t2_tee/
         │   ├── task2_predictions.json
-        │   └── *.nii.gz
+        │   └── *-pred.nii.gz
         └── t3_vid/
             ├── task3_predictions.json
-            └── *.png
+            └── <video_id>/
+                └── *_label_bin.png
     """
 
-    print()
-    print("Creating one submission.zip for all experiments")
-    print(f"Fold: {FOLD_NUM}")
-    print()
-
-    output_zip = Path(__file__).resolve().parent / "submission.zip"
-
-    if output_zip.exists():
-        output_zip.unlink()
-
     all_items = []
+    resolved_experiment_name = None
 
     for experiment, config_name in CONFIG_MAP.items():
         cfg = build_config(
@@ -380,6 +415,8 @@ def submit():
             cfg,
         )
 
+        resolved_experiment_name = str(cfg.experiment_name)
+
         item = collect_submission_files(
             cfg=cfg,
             fold_num=FOLD_NUM,
@@ -391,6 +428,20 @@ def submit():
             item
         )
 
+    print()
+    print("Creating one submission zip for all experiments")
+    print(f"Fold: {FOLD_NUM}")
+    print(f"Experiment name: {resolved_experiment_name}")
+    print()
+
+    output_zip = (
+        Path(__file__).resolve().parent
+        / f"submission_{resolved_experiment_name}.zip"
+    )
+
+    if output_zip.exists():
+        output_zip.unlink()
+
     with zipfile.ZipFile(
         output_zip,
         "w",
@@ -398,19 +449,67 @@ def submit():
     ) as zf:
         for item in all_items:
             prefix = item["prefix"]
-            json_file = item["json_file"]
+            task_id = item["task_id"]
             prediction_files = item["prediction_files"]
 
-            zf.write(
-                json_file,
-                arcname=f"{prefix}/{json_file.name}",
-            )
+            cases = []
 
             for prediction_file in prediction_files:
+                relative_path = prediction_file.name
+
+                if prediction_file.name.endswith(VIDEO_SUBMISSION_SUFFIX):
+                    case_id = prediction_file.name[
+                        : -len(VIDEO_SUBMISSION_SUFFIX)
+                    ]
+
+                    match = VIDEO_CASE_ID_PATTERN.match(case_id)
+
+                    if match is None:
+                        raise ValueError(
+                            "Video case_id does not match expected "
+                            f"'<video_id>_<6-digit frame>' pattern: {case_id}"
+                        )
+
+                    video_id = match.group("video_id")
+
+                    relative_path = f"{video_id}/{prediction_file.name}"
+
+                elif prediction_file.name.endswith(NIFTI_SUBMISSION_SUFFIX):
+                    case_id = prediction_file.name[
+                        : -len(NIFTI_SUBMISSION_SUFFIX)
+                    ]
+
+                else:
+                    raise ValueError(
+                        f"Unrecognized submission file name: {prediction_file.name}"
+                    )
+
                 zf.write(
                     prediction_file,
-                    arcname=f"{prefix}/{prediction_file.name}",
+                    arcname=f"{prefix}/{relative_path}",
                 )
+
+                cases.append(
+                    {
+                        "case_id": case_id,
+                        "segmentation": relative_path,
+                    }
+                )
+
+            item["json_name"] = f"{task_id}_predictions.json"
+
+            zf.writestr(
+                f"{prefix}/{item['json_name']}",
+                json.dumps(
+                    {
+                        "cases": sorted(
+                            cases,
+                            key=lambda x: x["case_id"],
+                        ),
+                    },
+                    indent=2,
+                ),
+            )
 
     print()
     print("[submission] Created single submission zip:")
@@ -420,7 +519,7 @@ def submit():
     for item in all_items:
         print(f"[submission] {item['experiment']}")
         print(f"  folder inside zip: {item['prefix']}/")
-        print(f"  json: {item['json_file'].name}")
+        print(f"  json: {item['json_name']}")
         print(f"  prediction files: {len(item['prediction_files'])}")
         print()
 

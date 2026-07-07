@@ -10,12 +10,10 @@ Rule:
 """
 
 import os
-import json
 import math
 import shutil
 import zipfile
 from pathlib import Path
-from PIL import Image
 import numpy as np
 import torch
 
@@ -25,6 +23,8 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator, MaxNLocator
 
 from medpy.metric.binary import dc, asd, hd, hd95
+from skimage.io import imsave as skimage_imsave
+import SimpleITK as sitk
 
 # =============================================================================
 # Basic shared helpers
@@ -294,9 +294,9 @@ def collect_submission_files(
     Collect submission files for one experiment.
 
     Format:
-        task1 -> *_pred.nii.gz
-        task2 -> *_pred.nii.gz
-        task3 -> *_pred.png
+        task1 -> *-pred.nii.gz
+        task2 -> *-pred.nii.gz
+        task3 -> *_label_bin.png
     """
 
     dataset_name = str(
@@ -317,22 +317,15 @@ def collect_submission_files(
 
     submission_folder = fold_output_folder / "submission"
 
-    json_file = submission_folder / f"{task_id}_predictions.json"
-
-    if not json_file.exists():
-        raise FileNotFoundError(
-            f"Missing submission JSON: {json_file}"
-        )
-
     task_id_str = str(
         task_id
     ).lower().strip()
 
     if task_id_str == "task3":
-        prediction_pattern = "*_pred.png"
+        prediction_pattern = "*_label_bin.png"
 
     elif task_id_str in ["task1", "task2"]:
-        prediction_pattern = "*_pred.nii.gz"
+        prediction_pattern = "*-pred.nii.gz"
 
     else:
         raise ValueError(
@@ -353,7 +346,7 @@ def collect_submission_files(
 
     return {
         "prefix": prefix,
-        "json_file": json_file,
+        "task_id": task_id,
         "prediction_files": prediction_files,
     }
 
@@ -714,8 +707,8 @@ def merge_rank_folders(
     Merge rank-local outputs into final folders.
 
     Submission format:
-        task1/task2 -> *_pred.nii.gz
-        task3       -> *_pred.png
+        task1/task2 -> *-pred.nii.gz
+        task3       -> *_label_bin.png
     """
 
     fold_output_folder = Path(fold_output_folder)
@@ -759,11 +752,9 @@ def merge_rank_folders(
     task_id_str = str(task_id).lower().strip()
 
     if task_id_str == "task3":
-        submission_pattern = "*_pred.png"
-        submission_suffix = "_pred.png"
+        submission_pattern = "*_label_bin.png"
     else:
-        submission_pattern = "*_pred.nii.gz"
-        submission_suffix = "_pred.nii.gz"
+        submission_pattern = "*-pred.nii.gz"
 
     copied_validation = 0
     copied_prediction = 0
@@ -849,50 +840,6 @@ def merge_rank_folders(
             "or rank 0 merged before other ranks finished writing."
         )
 
-    # ------------------------------------------------------------------
-    # Write submission JSON
-    # ------------------------------------------------------------------
-    if copied_submission > 0:
-        pred_files = sorted(
-            p for p in final_submission.glob(submission_pattern)
-            if p.is_file()
-        )
-
-        cases = []
-
-        for pred_file in pred_files:
-            case_id = pred_file.name[: -len(submission_suffix)]
-
-            cases.append(
-                {
-                    "case_id": case_id,
-                    "segmentation": pred_file.name,
-                }
-            )
-
-        output_json = final_submission / f"{task_id}_predictions.json"
-
-        tmp_json = final_submission / (
-            f"{task_id}_predictions.tmp_{os.getpid()}.json"
-        )
-
-        with open(tmp_json, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "cases": sorted(
-                        cases,
-                        key=lambda x: x["case_id"],
-                    ),
-                },
-                f,
-                indent=2,
-            )
-
-        os.replace(
-            tmp_json,
-            output_json,
-        )
-
     return {
         "validation": copied_validation,
         "prediction": copied_prediction,
@@ -900,17 +847,120 @@ def merge_rank_folders(
     }
 
 # =============================================================================
+# Segmentation -> 0/255 conversion
+# =============================================================================
+def convert_segmentation_to_255(segmentation):
+    # Matches the Codabench baseline scripts' convention: binary mask as
+    # plain 0/255 uint8.
+    return (segmentation > 0).astype(np.uint8) * 255
+
+
+# =============================================================================
+# Segment colors
+# =============================================================================
+SEGMENT_COLOR_PALETTE = [
+    (1.0, 0.0, 0.0),  # red
+    (0.0, 1.0, 0.0),  # green
+    (0.2, 0.4, 1.0),  # blue
+    (1.0, 1.0, 0.0),  # yellow
+    (1.0, 0.0, 1.0),  # magenta
+    (0.0, 1.0, 1.0),  # cyan
+    (1.0, 0.5, 0.0),  # orange
+]
+
+
+def segment_color_string(segment_idx):
+    r, g, b = SEGMENT_COLOR_PALETTE[segment_idx % len(SEGMENT_COLOR_PALETTE)]
+    return f"{r} {g} {b}"
+
+
+# =============================================================================
+# Shared segmentation image I/O
+#
+# nnU-Net's own image_reader_writer.write_seg() trips into 16-bit output
+# whenever a mask's max value is exactly 255
+# (np.uint8 if np.max(seg) < 255 else np.uint16). We control the dtype
+# ourselves everywhere a segmentation is written, so this always writes
+# uint8 directly and skips that writer entirely. Used by both the Slicer
+# case zip writer and the Codabench submission writer, so both paths stay
+# consistent with each other.
+# =============================================================================
+class SegmentationImageIO:
+
+    def read(self, path, reset_direction=False):
+        image = sitk.ReadImage(str(path))
+
+        if reset_direction:
+            image.SetDirection(
+                tuple(np.eye(image.GetDimension()).flatten())
+            )
+
+        return image
+
+    def write_volume(self, image, path):
+        sitk.WriteImage(image, str(path), useCompression=True)
+
+    def build_segmentation_image(
+        self,
+        array,
+        reference=None,
+        spacing=None,
+        origin=None,
+        direction=None,
+    ):
+        image = sitk.GetImageFromArray(array.astype(np.uint8, copy=False))
+
+        if reference is not None:
+            if image.GetDimension() == reference.GetDimension():
+                image.CopyInformation(reference)
+        else:
+            if spacing is not None:
+                image.SetSpacing(spacing)
+            if origin is not None:
+                image.SetOrigin(origin)
+            if direction is not None:
+                image.SetDirection(direction)
+
+        return image
+
+    def write_segmentation_file(
+        self,
+        array,
+        path,
+        spacing,
+        origin,
+        direction,
+    ):
+        image = self.build_segmentation_image(
+            array,
+            spacing=spacing,
+            origin=origin,
+            direction=direction,
+        )
+
+        self.write_volume(image, path)
+
+    def write_png(self, array, path):
+        skimage_imsave(
+            str(path),
+            array.astype(np.uint8, copy=False),
+            check_contrast=False,
+        )
+
+
+segmentation_io = SegmentationImageIO()
+
+
+# =============================================================================
 # Prediction zip writer
 # =============================================================================
 def write_prediction_case_zip(
     prediction,
     zip_dir,
-    image_reader_writer,
     configuration_manager,
     include_gt=False,
-    convert_to_255=False,
     keep_temp_folder=False,
-    make_rgb=True,
+    reset_direction=False,
 ):
     """
     Write one prediction dictionary as one Slicer-friendly case zip.
@@ -972,6 +1022,7 @@ def write_prediction_case_zip(
         )
 
     display_image_files = []
+    reference_image = None
 
     for idx, src in enumerate(image_files):
         if not src.exists():
@@ -981,15 +1032,20 @@ def write_prediction_case_zip(
 
         dst = case_tmp_dir / f"image_view_{idx:04d}.nii.gz"
 
-        shutil.copy2(src, dst)
+        # reset_direction=True only for tasks whose raw nii.gz direction is
+        # a placeholder artifact (e.g. task3 video: nibabel writes with an
+        # identity affine, then SimpleITK/ITK applies its RAS -> LPS sign
+        # convention on read, producing a (-1, -1) direction with no real
+        # spatial meaning). Tasks with real scan geometry (CT/TEE) must
+        # keep their true spacing/origin/direction, so this defaults False.
+        image = segmentation_io.read(src, reset_direction=reset_direction)
+        segmentation_io.write_volume(image, dst)
+
+        if idx == 0:
+            reference_image = image
 
         display_image_files.append(dst)
         written_files.append(dst)
-
-    import SimpleITK as sitk
-
-    reference_image_file = display_image_files[0]
-    reference_image = sitk.ReadImage(str(reference_image_file))
 
     probability_files = []
 
@@ -1030,20 +1086,14 @@ def write_prediction_case_zip(
             ):
                 prob_display = prob_display[0]
 
-            prob_img = sitk.GetImageFromArray(
-                prob_display
+            prob_img = segmentation_io.build_segmentation_image(
+                prob_display,
+                reference=reference_image,
             )
-
-            if prob_img.GetDimension() == reference_image.GetDimension():
-                prob_img.CopyInformation(reference_image)
 
             prob_file = case_tmp_dir / f"probability_{c:04d}.nii.gz"
 
-            sitk.WriteImage(
-                prob_img,
-                str(prob_file),
-                useCompression=True,
-            )
+            segmentation_io.write_volume(prob_img, prob_file)
 
             probability_files.append(prob_file)
             written_files.append(prob_file)
@@ -1054,17 +1104,12 @@ def write_prediction_case_zip(
     if segmentation.ndim >= 3 and segmentation.shape[0] == 1:
         segmentation = segmentation[0]
 
-    if convert_to_255:
-        segmentation = (segmentation > 0).astype(np.uint8) * 255
-    else:
-        segmentation = segmentation.astype(np.uint8)
-
     prediction_seg_file = case_tmp_dir / "prediction.seg.nrrd"
 
-    prediction_seg_image = sitk.GetImageFromArray(segmentation)
-
-    if prediction_seg_image.GetDimension() == reference_image.GetDimension():
-        prediction_seg_image.CopyInformation(reference_image)
+    prediction_seg_image = segmentation_io.build_segmentation_image(
+        segmentation,
+        reference=reference_image,
+    )
 
     unique_labels = sorted(
         int(x) for x in np.unique(segmentation)
@@ -1082,16 +1127,12 @@ def write_prediction_case_zip(
 
         prediction_seg_image.SetMetaData(
             f"Segment{segment_idx}_Name",
-            (
-                "Prediction"
-                if len(unique_labels) == 1
-                else f"Prediction_{label_value}"
-            ),
+            f"Prediction_{label_value}",
         )
 
         prediction_seg_image.SetMetaData(
             f"Segment{segment_idx}_Color",
-            "1.0 0.0 0.0",
+            segment_color_string(segment_idx),
         )
 
         prediction_seg_image.SetMetaData(
@@ -1124,11 +1165,7 @@ def write_prediction_case_zip(
         "0 0 0",
     )
 
-    sitk.WriteImage(
-        prediction_seg_image,
-        str(prediction_seg_file),
-        useCompression=True,
-    )
+    segmentation_io.write_volume(prediction_seg_image, prediction_seg_file)
 
     written_files.append(prediction_seg_file)
 
@@ -1141,17 +1178,12 @@ def write_prediction_case_zip(
         if gt.ndim >= 3 and gt.shape[0] == 1:
             gt = gt[0]
 
-        if convert_to_255:
-            gt = (gt > 0).astype(np.uint8) * 255
-        else:
-            gt = gt.astype(np.uint8)
-
         gt_seg_file = case_tmp_dir / "gt.seg.nrrd"
 
-        gt_seg_image = sitk.GetImageFromArray(gt)
-
-        if gt_seg_image.GetDimension() == reference_image.GetDimension():
-            gt_seg_image.CopyInformation(reference_image)
+        gt_seg_image = segmentation_io.build_segmentation_image(
+            gt,
+            reference=reference_image,
+        )
 
         unique_gt_labels = sorted(
             int(x) for x in np.unique(gt)
@@ -1169,16 +1201,12 @@ def write_prediction_case_zip(
 
             gt_seg_image.SetMetaData(
                 f"Segment{segment_idx}_Name",
-                (
-                    "GroundTruth"
-                    if len(unique_gt_labels) == 1
-                    else f"GroundTruth_{label_value}"
-                ),
+                f"GroundTruth_{label_value}",
             )
 
             gt_seg_image.SetMetaData(
                 f"Segment{segment_idx}_Color",
-                "0.0 1.0 0.0",
+                segment_color_string(segment_idx),
             )
 
             gt_seg_image.SetMetaData(
@@ -1211,11 +1239,7 @@ def write_prediction_case_zip(
             "0 0 0",
         )
 
-        sitk.WriteImage(
-            gt_seg_image,
-            str(gt_seg_file),
-            useCompression=True,
-        )
+        segmentation_io.write_volume(gt_seg_image, gt_seg_file)
 
         written_files.append(gt_seg_file)
 
@@ -1451,9 +1475,9 @@ def write_prediction_case_zip(
 def write_submission_prediction(
     prediction,
     output_folder,
-    image_reader_writer,
     configuration_manager,
     convert_to_255=False,
+    keep_classes=None,
     output_format="nii.gz",   # "nii.gz" or "png"
     file_ending=".nii.gz",
 ):
@@ -1461,8 +1485,8 @@ def write_submission_prediction(
     Write one predict_step output in rank-local submission format.
 
     Supported output:
-        <case_id>_pred.nii.gz
-        <case_id>_pred.png
+        <case_id>-pred.nii.gz
+        <case_id>_label_bin.png
 
     PNG is only allowed for 2D nnU-Net predictions.
     """
@@ -1488,6 +1512,23 @@ def write_submission_prediction(
     if segmentation.ndim == 4 and segmentation.shape[0] == 1:
         segmentation = segmentation[0]
 
+    # More than one kept class -> RGB PNG, one color per class.
+    # Single kept class (or no filtering) -> single-channel {0, 255}, unchanged.
+    build_rgb = (
+        output_format == "png"
+        and keep_classes is not None
+        and len(keep_classes) > 1
+    )
+
+    if build_rgb:
+        segmentation = np.where(
+            np.isin(segmentation, keep_classes),
+            segmentation,
+            0,
+        ).astype(segmentation.dtype)
+    elif keep_classes is not None:
+        segmentation = np.isin(segmentation, keep_classes).astype(segmentation.dtype)
+
     plan_dim = len(configuration_manager.patch_size)
 
     # ------------------------------------------------------------------
@@ -1495,10 +1536,7 @@ def write_submission_prediction(
     # ------------------------------------------------------------------
     if output_format == "nii.gz":
 
-        if convert_to_255:
-            segmentation = (segmentation > 0).astype(np.uint8) * 255
-        else:
-            segmentation = segmentation.astype(np.uint8)
+        segmentation = segmentation.astype(np.uint8)
 
         if plan_dim == 2:
             if segmentation.ndim == 2:
@@ -1526,18 +1564,22 @@ def write_submission_prediction(
                 f"Unsupported nnU-Net plan dimension: {configuration_manager.patch_size}"
             )
 
-        pred_file = output_folder / f"{case_id}_pred{file_ending}"
+        pred_file = output_folder / f"{case_id}-pred{file_ending}"
 
         tmp_pred_file = output_folder / (
-            f"{case_id}_pred.tmp_{os.getpid()}{file_ending}"
+            f"{case_id}-pred.tmp_{os.getpid()}{file_ending}"
         )
 
-        rw = image_reader_writer()
+        sitk_stuff = prediction["properties"]["sitk_stuff"]
 
-        rw.write_seg(
-            segmentation,
-            str(tmp_pred_file),
-            prediction.get("properties", None),
+        # 2D nnU-Net plans carry a dummy leading axis ([1, H, W]) for the
+        # sliding-window machinery; a 2D nii.gz file has no such axis.
+        segmentation_io.write_segmentation_file(
+            segmentation[0] if plan_dim == 2 else segmentation,
+            tmp_pred_file,
+            spacing=sitk_stuff["spacing"],
+            origin=sitk_stuff["origin"],
+            direction=sitk_stuff["direction"],
         )
 
         os.replace(
@@ -1558,30 +1600,67 @@ def write_submission_prediction(
                 f"Got patch_size={configuration_manager.patch_size}"
             )
 
-        if segmentation.ndim == 3:
+        if build_rgb:
+            if segmentation.ndim == 3 and segmentation.shape[0] == 1:
+                segmentation = segmentation[0]
+
+            if segmentation.ndim != 2:
+                raise ValueError(
+                    f"RGB PNG writer expects [H, W], got {segmentation.shape}"
+                )
+
+            rgb = np.zeros(segmentation.shape + (3,), dtype=np.uint8)
+
+            for color_idx, class_value in enumerate(keep_classes):
+                color = SEGMENT_COLOR_PALETTE[
+                    color_idx % len(SEGMENT_COLOR_PALETTE)
+                ]
+
+                rgb[segmentation == class_value] = tuple(
+                    int(round(c * 255)) for c in color
+                )
+
+            pred_file = output_folder / f"{case_id}_label_bin.png"
+
+            tmp_pred_file = output_folder / (
+                f"{case_id}_label_bin.tmp_{os.getpid()}.png"
+            )
+
+            segmentation_io.write_png(rgb, tmp_pred_file)
+
+            os.replace(
+                tmp_pred_file,
+                pred_file,
+            )
+
+            return pred_file
+
+        if convert_to_255:
+            segmentation = convert_segmentation_to_255(segmentation)
+        else:
+            segmentation = segmentation.astype(np.uint8)
+
+        if segmentation.ndim == 2:
+            segmentation = segmentation[None, ...]
+
+        elif segmentation.ndim == 3:
             if segmentation.shape[0] != 1:
                 raise ValueError(
                     f"PNG writer expects [H, W] or [1, H, W], got {segmentation.shape}"
                 )
-            segmentation = segmentation[0]
 
-        elif segmentation.ndim != 2:
+        else:
             raise ValueError(
                 f"PNG writer expects [H, W] or [1, H, W], got {segmentation.shape}"
             )
 
-        if convert_to_255:
-            segmentation = (segmentation > 0).astype(np.uint8) * 255
-        else:
-            segmentation = segmentation.astype(np.uint8)
-
-        pred_file = output_folder / f"{case_id}_pred.png"
+        pred_file = output_folder / f"{case_id}_label_bin.png"
 
         tmp_pred_file = output_folder / (
-            f"{case_id}_pred.tmp_{os.getpid()}.png"
+            f"{case_id}_label_bin.tmp_{os.getpid()}.png"
         )
 
-        Image.fromarray(segmentation).save(tmp_pred_file)
+        segmentation_io.write_png(segmentation[0], tmp_pred_file)
 
         os.replace(
             tmp_pred_file,

@@ -49,17 +49,17 @@ def run_command(cmd, env=None):
 @app.command()
 def main(
     data_root: Path = typer.Option(
-        Path("dirs/data_storage/raw/MVAA"),
+        Path("dirs/data_storage/nnUNet/MVAA_nnUNET"),
         "--data-root",
         help="MVAA root directory containing reference_data/.",
     ),
     output_dir: Path = typer.Option(
-        Path("dirs/data_storage/nnUNet/MVAA_nnUNET"),
+        Path("dirs/data_storage/nnUNet"),
         "--output-dir",
         help="Final nnU-Net root containing nnUNet_raw, nnUNet_preprocessed, and nnUNet_results.",
     ),
     num_processes: int = typer.Option(
-        os.cpu_count() or 1,
+        64,
         "--num-processes",
         "-np",
         help="Number of workers for raw writing and nnU-Net preprocessing.",

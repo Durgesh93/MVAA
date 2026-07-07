@@ -26,6 +26,7 @@ from data_preparation.utils import (
     write_dataset,
     set_nnunet_env,
     reassign_training_case_names_sequentially,
+    read_labels_from_mask_path,
 )
 
 
@@ -36,12 +37,32 @@ app = typer.Typer(help="Prepare MVAA Task 3 VIDEO dataset in nnU-Net format.")
 DATASET_ID = "Dataset003_MVAA_VIDEO_SSL"
 PATTERNS = ["t3_vid", "*vid*", "*video*"]
 CASE_SUFFIXES = [".png", ".jpg", ".jpeg", "_png_Label.tar"]
-VIDEO_LV_LABEL = 10
-
-VIDEO_BINARY_LV_LABELS = {
-    "background": 0,
-    "LV": 1,
+VIDEO_LABEL_VALUE_TO_CLASS = {
+    10: 1,
+    11: 2,
 }
+
+VIDEO_MULTI_CLASS_LABELS = {
+    "background": 0,
+    "class_10": 1,
+    "class_11": 2,
+}
+
+VIDEO_EXCLUDED_CASE_NAMES = {
+    "REC_20250322_101917_746A_000130",
+}
+
+def align_video_spatial_shape(arr, target_format="hw"):
+    if target_format not in ("hw", "wh"):
+        raise ValueError(f"Unknown target_format: {target_format!r}, expected 'hw' or 'wh'")
+
+    larger_axis_first = arr.shape[0] >= arr.shape[1]
+    want_larger_first = target_format == "hw"
+
+    if larger_axis_first != want_larger_first:
+        return arr.swapaxes(0, 1)
+
+    return arr
 
 
 def get_dataset_number(dataset_id):
@@ -151,6 +172,56 @@ def collect_extra_unlabeled_video(data_root):
     )
     return rows
 
+
+def filter_video_excluded_cases(rows):
+    excluded_case_names = {
+        r["case_name"] for r in rows
+        if r["case_name"] in VIDEO_EXCLUDED_CASE_NAMES
+    }
+
+    if excluded_case_names:
+        log_warn(
+            f"Excluding {len(excluded_case_names)} known-bad video case(s): "
+            f"{sorted(excluded_case_names)}"
+        )
+
+    return [
+        row for row in rows
+        if row["case_name"] not in VIDEO_EXCLUDED_CASE_NAMES
+    ]
+
+
+def filter_video_multiclass_cases(rows):
+    required_values = set(VIDEO_LABEL_VALUE_TO_CLASS.keys())
+
+    mask_rows = [
+        r for r in rows
+        if r["split"] == "TrL" and r["file_type"] == "mask"
+    ]
+
+    valid_case_names   = set()
+    dropped_case_names = set()
+
+    for row in mask_rows:
+        labels_in_mask = set(read_labels_from_mask_path(row["file_path"]))
+
+        if required_values.issubset(labels_in_mask):
+            valid_case_names.add(row["case_name"])
+        else:
+            dropped_case_names.add(row["case_name"])
+
+    if dropped_case_names:
+        log_warn(
+            f"Dropping {len(dropped_case_names)} TrL video case(s) missing one "
+            f"of labels {sorted(required_values)}: {sorted(dropped_case_names)}"
+        )
+
+    return [
+        row for row in rows
+        if not (row["split"] == "TrL" and row["case_name"] not in valid_case_names)
+    ]
+
+
 def collect_video_files(data_root):
     reference_dir = Path(data_root) / "reference_data"
     task_dirs     = find_task_dirs(reference_dir, PATTERNS)
@@ -208,6 +279,9 @@ def collect_video_files(data_root):
             )
 
 
+    rows = filter_video_excluded_cases(rows)
+    rows = filter_video_multiclass_cases(rows)
+
     rows.extend(collect_extra_unlabeled_video(data_root))
 
     return rows
@@ -225,6 +299,8 @@ def write_video_rgb_image_as_nnunet_channels(src_path, dst_path):
 
     if arr.ndim != 3 or arr.shape[-1] != 3:
         raise ValueError(f"Expected RGB image, got shape {arr.shape}: {src_path}")
+
+    arr = align_video_spatial_shape(arr, target_format="hw")
 
     affine = np.eye(4)
 
@@ -272,7 +348,7 @@ def _read_first_nifti_from_tar(tar_path):
     return img
 
 
-def write_video_lv_binary_mask_from_tar(src_path, dst_path):
+def write_video_multiclass_mask_from_tar(src_path, dst_path):
     src_path = Path(src_path)
     dst_path = Path(dst_path)
 
@@ -280,10 +356,14 @@ def write_video_lv_binary_mask_from_tar(src_path, dst_path):
 
     img = _read_first_nifti_from_tar(src_path)
     mask = np.asanyarray(img.dataobj)
+    mask = align_video_spatial_shape(mask, target_format="hw")
 
-    binary = (mask == VIDEO_LV_LABEL).astype(np.uint8)
+    multiclass = np.zeros(mask.shape, dtype=np.uint8)
 
-    out = nib.Nifti1Image(binary, affine=img.affine, header=img.header)
+    for raw_value, class_value in VIDEO_LABEL_VALUE_TO_CLASS.items():
+        multiclass[mask == raw_value] = class_value
+
+    out = nib.Nifti1Image(multiclass, affine=img.affine, header=img.header)
     out.set_data_dtype(np.uint8)
 
     nib.save(out, str(dst_path))
@@ -302,7 +382,7 @@ def prepare_video_dataset(data_root, nnunet_raw, test=False, num_processes=None)
 
     file_df = pd.DataFrame(rows)
     print_group_counts(file_df, ["split", "file_type"], "Collected files")
-    
+
     sample_df = build_sample_dataframe(rows)
     sample_df = reassign_training_case_names_sequentially(sample_df)
     print_group_counts(sample_df, ["split"], "Prepared samples")
@@ -313,11 +393,11 @@ def prepare_video_dataset(data_root, nnunet_raw, test=False, num_processes=None)
         output_dir=nnunet_raw,
         data_type="video",
         test=test,
-        fixed_labels=VIDEO_BINARY_LV_LABELS,
+        fixed_labels=VIDEO_MULTI_CLASS_LABELS,
         write_image_fn=write_video_rgb_image_as_nnunet_channels,
-        write_real_mask_fn=write_video_lv_binary_mask_from_tar,
+        write_real_mask_fn=write_video_multiclass_mask_from_tar,
         write_dummy_mask_fn=write_dummy_mask_from_image,
-        description_extra="Task 3 VIDEO RGB dataset.",
+        description_extra="Task 3 VIDEO RGB multi-class dataset (labels 10 and 11).",
         num_processes=num_processes,
     )
 
@@ -327,12 +407,12 @@ def prepare_video_dataset(data_root, nnunet_raw, test=False, num_processes=None)
 @app.command()
 def main(
     data_root: Path = typer.Option(
-        Path("dirs/data_storage/raw/MVAA"),
+        Path("dirs/data_storage/nnUNet/MVAA_nnUNET"),
         "--data-root",
         help="MVAA root directory containing reference_data/ and optional images/.",
     ),
     output_dir: Path = typer.Option(
-        Path("dirs/data_storage/processed/MVAA_nnUNET"),
+        Path("dirs/data_storage/nnUNet/nnUNet_preprocessed"),
         "--output-dir",
         help="Final nnU-Net root containing nnUNet_raw, nnUNet_preprocessed, and nnUNet_results.",
     ),

@@ -400,25 +400,15 @@ def fix_mask_shape_if_needed(image_path, mask_path):
     if image.shape == mask.shape:
         return "x".join(str(x) for x in mask.shape)
 
-    if image.ndim == 2 and mask.ndim == 2 and image.shape == mask.T.shape:
+    swapped_mask = mask.swapaxes(0, 1)
+
+    if image.ndim == mask.ndim and image.shape == swapped_mask.shape:
         log_fix(
             f"Transposing mask to match image: "
             f"image={image.shape}, mask={mask.shape}, mask_path={mask_path}"
         )
 
-        fixed_mask = mask.T.astype(mask.dtype)
-        fixed_nii = nib.Nifti1Image(fixed_mask, affine=image_nii.affine)
-        nib.save(fixed_nii, str(mask_path))
-
-        return "x".join(str(x) for x in fixed_mask.shape)
-
-    if image.ndim == 3 and mask.ndim == 3 and image.shape == mask.transpose(1, 0, 2).shape:
-        log_fix(
-            f"Transposing 3D mask axes to match image: "
-            f"image={image.shape}, mask={mask.shape}, mask_path={mask_path}"
-        )
-
-        fixed_mask = mask.transpose(1, 0, 2).astype(mask.dtype)
+        fixed_mask = swapped_mask.astype(mask.dtype)
         fixed_nii = nib.Nifti1Image(fixed_mask, affine=image_nii.affine)
         nib.save(fixed_nii, str(mask_path))
 

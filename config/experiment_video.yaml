@@ -4,7 +4,7 @@
 
 seed: 12345
 
-experiment_name: ssl_nnunet
+experiment_name: pseudo_label
 
 # =============================================================================
 # Runtime / cluster-controlled values
@@ -29,10 +29,10 @@ plans_identifier: nnUNetPlans
 # =============================================================================
 
 paths:
-  nnunet_data_root: dirs/data_storage/nnUNet/MVAA_nnUNET
+  nnunet_data_root: dirs/data_storage/nnUNet
   nnunet_raw: ${paths.nnunet_data_root}/nnUNet_raw
   nnunet_preprocessed: ${paths.nnunet_data_root}/nnUNet_preprocessed
-  nnunet_results: ${paths.nnunet_data_root}/nnUNet_results
+  nnunet_results: ${paths.nnunet_data_root}/nnUNet_results/${experiment_name}
 
 # =============================================================================
 # DataModule config

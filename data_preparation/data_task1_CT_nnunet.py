@@ -141,7 +141,7 @@ def collect_ct_files(data_root):
         for p in sorted(test_unlabeled_image_dir.glob("*.nii.gz")):
             rows.append(
                 {
-                  
+
                     "split": "TrU",
                     "file_type": "image",
                     "case_name": make_case_name(p, CASE_SUFFIXES),
@@ -175,9 +175,9 @@ def prepare_ct_dataset(data_root, nnunet_raw, test=False, num_processes=None):
 
     sample_df = build_sample_dataframe(rows)
     sample_df = reassign_training_case_names_sequentially(sample_df)
-   
+
     print_group_counts(sample_df, ["split"], "Prepared samples")
-    
+
     dataset_dir = write_dataset(
         sample_df=sample_df,
         dataset_id=DATASET_ID,
@@ -197,7 +197,7 @@ def prepare_ct_dataset(data_root, nnunet_raw, test=False, num_processes=None):
 @app.command()
 def main(
     data_root: Path = typer.Option(
-        Path("dirs/data_storage/raw/MVAA"),
+        Path("dirs/data_storage/nnUNet/MVAA_nnUNET"),
         "--data-root",
         help="MVAA root directory containing reference_data/.",
     ),
