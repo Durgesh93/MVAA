@@ -26,7 +26,6 @@ class MetricsMixin:
         self.tracked_metric_keys = [
             "train_loss",
             "train_sup_loss",
-            "train_pseudo_loss",
             "dice",
             "asd_mm",
             "hd_mm",
@@ -221,12 +220,10 @@ class MetricsMixin:
         self,
         train_loss,
         train_sup_loss,
-        train_pseudo_loss,
     ):
         values = {
             "train_loss": train_loss,
             "train_sup_loss": train_sup_loss,
-            "train_pseudo_loss": train_pseudo_loss,
         }
 
         for key, value in values.items():

@@ -377,7 +377,6 @@ def save_training_progress_plot(
     plot_keys = [
         ("train_loss", "Train loss", "min"),
         ("train_sup_loss", "Supervised loss", "min"),
-        ("train_pseudo_loss", "Pseudo loss", "min"),
         ("dice", "Dice", "max"),
         ("asd_mm", "ASD mm", "min"),
         ("hd_mm", "HD mm", "min"),

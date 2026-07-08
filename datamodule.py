@@ -1,8 +1,8 @@
 """
-Semi-supervised LightningDataModule for SSL nnU-Net.
+Supervised-only LightningDataModule for nnU-Net.
 
 Train:
-    preprocessed nnUNetDataset + nnUNetDataLoader for TrL and TrU.
+    preprocessed nnUNetDataset + nnUNetDataLoader for TrL.
 
 Validation:
     raw imagesTr + labelsTr.
@@ -25,7 +25,6 @@ import torch
 import lightning as L
 
 from torch.utils.data import Dataset, DataLoader
-from lightning.pytorch.utilities.combined_loader import CombinedLoader
 
 from batchgenerators.dataloading.single_threaded_augmenter import (
     SingleThreadedAugmenter,
@@ -291,7 +290,6 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         ssl = self.dataset_json["ssl_case_ids"]
 
         self.trl_all = list(ssl["TrL"])
-        self.tru_all = list(ssl["TrU"])
         self.ts_all = list(ssl["Ts"])
 
         self.splits_file = join(
@@ -302,7 +300,6 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         self.ds_class = None
 
         self.dataset_train_labeled = None
-        self.dataset_train_unlabeled = None
 
         self.raw_dataset_val = None
         self.raw_dataset_test = None
@@ -355,17 +352,16 @@ class SSLnnUNetDataModule(L.LightningDataModule):
 
         This version enforces minimum 4 workers per augmenter.
 
-        In this DataModule each rank creates two augmentation pipelines:
-            1. labeled augmenter
-            2. unlabeled augmenter
+        In this DataModule each rank creates one augmentation pipeline
+        (labeled only -- no unlabeled/pseudo-label data here).
 
         Therefore total augmentation workers are approximately:
-            world_size * 2 * num_processes
+            world_size * num_processes
 
         Example:
-            6 GPUs/ranks and num_processes=4
+            6 GPUs/ranks and num_processes=8
 
-            total workers = 6 * 2 * 4 = 48
+            total workers = 6 * 8 = 48
             plus 6 main rank processes.
         """
 
@@ -379,10 +375,8 @@ class SSLnnUNetDataModule(L.LightningDataModule):
             int(world_size),
         )
 
-        # Two train augmenters per rank:
-        #   1. labeled
-        #   2. unlabeled
-        augmenters_per_rank = 2
+        # One train augmenter per rank (labeled only).
+        augmenters_per_rank = 1
         total_augmenters = world_size * augmenters_per_rank
 
         # Reserve CPUs for:
@@ -535,7 +529,6 @@ class SSLnnUNetDataModule(L.LightningDataModule):
             full_tr = list(sorted(splits[fold]["train"]))
             full_val = list(sorted(splits[fold]["val"]))
 
-        full_tru = list(sorted(self.tru_all))
         full_test = list(sorted(self.ts_all))
 
         # ------------------------------------------------------------
@@ -543,12 +536,6 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         # ------------------------------------------------------------
         tr_cases = split_by_rank(
             full_tr,
-            global_rank=global_rank,
-            world_size=world_size,
-        )
-
-        tru_cases = split_by_rank(
-            full_tru,
             global_rank=global_rank,
             world_size=world_size,
         )
@@ -579,20 +566,9 @@ class SSLnnUNetDataModule(L.LightningDataModule):
                 world_size=world_size,
             )
 
-            rank_tru_cases = split_by_rank(
-                full_tru,
-                global_rank=rank,
-                world_size=world_size,
-            )
-
-            rank_cases = max(
-                len(rank_tr_cases),
-                len(rank_tru_cases),
-            )
-
             max_rank_cases = max(
                 max_rank_cases,
-                rank_cases,
+                len(rank_tr_cases),
             )
 
         self.limit_train_batches = max(
@@ -605,7 +581,6 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         print(
             f"\n[rank {global_rank}/{world_size}] "
             f"TrL={len(tr_cases)} | "
-            f"TrU={len(tru_cases)} | "
             f"ValRaw={len(val_cases)} | "
             f"TsRaw={len(test_cases)} | "
             f"limit_train_batches={self.limit_train_batches} | "
@@ -621,9 +596,6 @@ class SSLnnUNetDataModule(L.LightningDataModule):
             print("TrL:")
             print(tr_cases)
 
-            print("TrU:")
-            print(tru_cases)
-
             print("Val raw:")
             print(val_cases)
 
@@ -638,12 +610,6 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         self.dataset_train_labeled = self.ds_class(
             self.folder,
             tr_cases,
-            folder_with_segs_from_previous_stage=self.prev_stage_folder,
-        )
-
-        self.dataset_train_unlabeled = self.ds_class(
-            self.folder,
-            tru_cases,
             folder_with_segs_from_previous_stage=self.prev_stage_folder,
         )
 
@@ -684,11 +650,6 @@ class SSLnnUNetDataModule(L.LightningDataModule):
                 "dataset_train_labeled is None. setup() did not run correctly."
             )
 
-        if self.dataset_train_unlabeled is None:
-            raise RuntimeError(
-                "dataset_train_unlabeled is None. setup() did not run correctly."
-            )
-
         rot, dummy_2d, init_ps, mirror = self._get_da_params_from_nnunet()
 
         tfm = nnUNetTrainer.get_training_transforms(
@@ -721,34 +682,11 @@ class SSLnnUNetDataModule(L.LightningDataModule):
             transforms=tfm,
         )
 
-        unlabeled_loader = nnUNetDataLoader(
-            data=self.dataset_train_unlabeled,
-            batch_size=self.batch_size,
-            patch_size=init_ps,
-            final_patch_size=self.cm.patch_size,
-            label_manager=self.lm,
-            oversample_foreground_percent=0.0,
-            sampling_probabilities=None,
-            pad_sides=None,
-            probabilistic_oversampling=False,
-            transforms=tfm,
-        )
-
         labeled_iter = self._make_augmenter(
             labeled_loader,
         )
 
-        unlabeled_iter = self._make_augmenter(
-            unlabeled_loader,
-        )
-
-        return CombinedLoader(
-            {
-                "labeled": labeled_iter,
-                "unlabeled": unlabeled_iter,
-            },
-            mode="max_size_cycle",
-        )
+        return labeled_iter
 
     def val_dataloader(self):
         if self.raw_dataset_val is None:

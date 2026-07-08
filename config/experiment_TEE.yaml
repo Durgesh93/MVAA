@@ -4,7 +4,7 @@
 
 seed: 12345
 
-experiment_name: pseudo_label
+experiment_name: supervised_only
 
 # =============================================================================
 # Runtime / cluster-controlled values
@@ -60,15 +60,32 @@ litmodule:
   initial_lr: 0.01
   weight_decay: 0.00003
   num_epochs: ${trainer.max_epochs}
-  lambda_pseudo: 0.1
-  pseudo_threshold: 0.95
+
+  # loss_type: one of "dice_ce", "dice_focal", "tversky_ce",
+  # "focal_tversky", "dice_topk", "unified_focal" (see losses.py).
+  # Only the hyperparameters relevant to the selected loss_type are used.
+  loss_type: dice_ce
+
+  # Tversky / Focal Tversky (tversky_ce, focal_tversky)
+  tversky_alpha: 0.3        # false-positive weight
+  tversky_beta: 0.7         # false-negative weight (>alpha penalizes missed foreground harder)
+  focal_tversky_gamma: 1.33 # >1 sharpens focus onto low-Tversky (hard) classes
+
+  # Focal (dice_focal) / TopK (dice_topk)
+  focal_gamma: 2.0
+  topk_k: 10                # percent of hardest voxels used for CE
+
+  # Unified Focal (unified_focal)
+  unified_focal_lambda: 0.5 # weight between focal-CE and focal-Tversky halves
+  unified_focal_delta: 0.6  # class-imbalance weight, shared by both halves
+  unified_focal_gamma: 0.5  # focal sharpening exponent, in [0, 1)
 
 # =============================================================================
 # Trainer config
 # =============================================================================
 
 trainer:
-  max_epochs: 300
+  max_epochs: 100
   strategy: ${training_strategy}
   precision: 16-mixed
   log_every_n_steps: 1

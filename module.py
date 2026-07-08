@@ -13,6 +13,7 @@ Folder structure:
 
 from typing import Any, Dict
 
+import numpy as np
 import torch
 import lightning as L
 
@@ -24,6 +25,17 @@ from batchgenerators.utilities.file_and_folder_operations import (
 from nnunetv2.paths import (
     nnUNet_preprocessed,
     nnUNet_results,
+)
+
+from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
+
+from losses import (
+    DC_and_CE_loss,
+    DC_and_Focal_loss,
+    Tversky_and_CE_loss,
+    FocalTversky_and_CE_loss,
+    DC_and_TopK_loss,
+    UnifiedFocalLoss,
 )
 
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
@@ -71,10 +83,31 @@ class SSLnnUNetLightningModule(
         self.weight_decay = self.cfg.weight_decay
         self.num_epochs = self.cfg.num_epochs
 
-        self.enable_deep_supervision = True
+        self.loss_type = self.cfg.loss_type
 
-        self.lambda_pseudo = self.cfg.lambda_pseudo
-        self.pseudo_threshold = self.cfg.pseudo_threshold
+        assert self.loss_type in (
+            "dice_ce",
+            "dice_focal",
+            "tversky_ce",
+            "focal_tversky",
+            "dice_topk",
+            "unified_focal",
+        ), (
+            f"Unknown loss_type '{self.loss_type}'. "
+            "Use 'dice_ce', 'dice_focal', 'tversky_ce', 'focal_tversky', "
+            "'dice_topk', or 'unified_focal'."
+        )
+
+        self.tversky_alpha = self.cfg.tversky_alpha
+        self.tversky_beta = self.cfg.tversky_beta
+        self.focal_tversky_gamma = self.cfg.focal_tversky_gamma
+        self.focal_gamma = self.cfg.focal_gamma
+        self.topk_k = self.cfg.topk_k
+        self.unified_focal_lambda = self.cfg.unified_focal_lambda
+        self.unified_focal_delta = self.cfg.unified_focal_delta
+        self.unified_focal_gamma = self.cfg.unified_focal_gamma
+
+        self.enable_deep_supervision = True
 
         self.task_id = self.cfg.task_id
         self.prefix = self.cfg.prefix
@@ -295,7 +328,98 @@ class SSLnnUNetLightningModule(
     def _build_loss(self):
         shim = self._make_trainer_shim()
 
-        return nnUNetTrainer._build_loss(shim)
+        assert not self.lm.has_regions, (
+            "None of the compound losses in losses.py support "
+            "region-based labels"
+        )
+
+        soft_dice_kwargs = {
+            "batch_dice": self.cm.batch_dice,
+            "smooth": 1e-5,
+            "do_bg": False,
+            "ddp": shim.is_ddp,
+        }
+
+        tversky_kwargs = {
+            **soft_dice_kwargs,
+            "alpha": self.tversky_alpha,
+            "beta": self.tversky_beta,
+        }
+
+        focal_tversky_kwargs = {
+            **tversky_kwargs,
+            "gamma": self.focal_tversky_gamma,
+        }
+
+        if self.loss_type == "dice_ce":
+            loss = DC_and_CE_loss(
+                soft_dice_kwargs,
+                {},
+                weight_ce=1,
+                weight_dice=1,
+                ignore_label=self.lm.ignore_label,
+            )
+        elif self.loss_type == "dice_focal":
+            loss = DC_and_Focal_loss(
+                soft_dice_kwargs,
+                {"gamma": self.focal_gamma, "label_smoothing": 0.0},
+                weight_focal=1,
+                weight_dice=1,
+                ignore_label=self.lm.ignore_label,
+            )
+        elif self.loss_type == "tversky_ce":
+            loss = Tversky_and_CE_loss(
+                tversky_kwargs,
+                {},
+                weight_ce=1,
+                weight_tversky=1,
+                ignore_label=self.lm.ignore_label,
+            )
+        elif self.loss_type == "focal_tversky":
+            loss = FocalTversky_and_CE_loss(
+                focal_tversky_kwargs,
+                {},
+                weight_ce=1,
+                weight_focal_tversky=1,
+                ignore_label=self.lm.ignore_label,
+            )
+        elif self.loss_type == "dice_topk":
+            loss = DC_and_TopK_loss(
+                soft_dice_kwargs,
+                {"k": self.topk_k},
+                weight_ce=1,
+                weight_dice=1,
+                ignore_label=self.lm.ignore_label,
+            )
+        else:
+            loss = UnifiedFocalLoss(
+                lambda_weight=self.unified_focal_lambda,
+                delta=self.unified_focal_delta,
+                gamma=self.unified_focal_gamma,
+                batch_dice=self.cm.batch_dice,
+                do_bg=False,
+                smooth=1e-5,
+                ddp=shim.is_ddp,
+                ignore_label=self.lm.ignore_label,
+            )
+
+        if self.enable_deep_supervision:
+            deep_supervision_scales = shim._get_deep_supervision_scales()
+
+            weights = np.array(
+                [1 / (2**i) for i in range(len(deep_supervision_scales))]
+            )
+
+            if shim.is_ddp:
+                weights[-1] = 1e-6
+            else:
+                weights[-1] = 0
+
+            weights = weights / weights.sum()
+
+            loss = DeepSupervisionWrapper(loss, weights)
+
+        return loss
 
     def _unwrap_network(self):
         if hasattr(self.network, "module"):
@@ -354,80 +478,6 @@ class SSLnnUNetLightningModule(
 
         return loss, output, target
 
-    def _pseudo_loss(
-        self,
-        batch: Dict[str, Any],
-    ):
-        if self.lambda_pseudo <= 0 or batch is None:
-            return torch.tensor(
-                0.0,
-                device=self.device,
-            )
-
-        data, _ = self._get_train_batch_data_target(
-            batch
-        )
-
-        with torch.no_grad():
-            pseudo_output = self.network(data)
-
-            if isinstance(pseudo_output, (list, tuple)):
-                pseudo_logits = pseudo_output[0]
-            else:
-                pseudo_logits = pseudo_output
-
-            if self.lm.has_regions:
-                probs = torch.sigmoid(
-                    pseudo_logits
-                )
-
-                pseudo_target = (
-                    probs > self.pseudo_threshold
-                ).float()
-
-                confident_voxels = (
-                    probs > self.pseudo_threshold
-                )
-
-            else:
-                probs = torch.softmax(
-                    pseudo_logits,
-                    dim=1,
-                )
-
-                conf, pseudo_target = probs.max(
-                    dim=1,
-                    keepdim=True,
-                )
-
-                pseudo_target = pseudo_target.long()
-
-                confident_voxels = (
-                    conf >= self.pseudo_threshold
-                )
-
-                if self.lm.ignore_label is not None:
-                    pseudo_target[~confident_voxels] = (
-                        self.lm.ignore_label
-                    )
-
-        student_output = self.network(data)
-
-        if isinstance(student_output, (list, tuple)):
-            student_logits = student_output[0]
-        else:
-            student_logits = student_output
-
-        pseudo_loss = self.loss.loss(
-            student_logits,
-            pseudo_target,
-        )
-
-        if confident_voxels.sum() == 0:
-            pseudo_loss = pseudo_loss * 0.0
-
-        return pseudo_loss
-
     # ------------------------------------------------------------------
     # Train
     # ------------------------------------------------------------------
@@ -436,33 +486,16 @@ class SSLnnUNetLightningModule(
         batch,
         batch_idx,
     ):
-        labeled_batch = batch["labeled"]
-
-        unlabeled_batch = batch.get(
-            "unlabeled",
-            None,
-        )
-
         sup_loss, _, _ = self._supervised_loss(
-            labeled_batch
-        )
-
-        pseudo_loss = self._pseudo_loss(
-            unlabeled_batch
-        )
-
-        total_loss = (
-            sup_loss
-            + self.lambda_pseudo * pseudo_loss
+            batch
         )
 
         self.update_step_training_metrics(
-            train_loss=total_loss.detach(),
+            train_loss=sup_loss.detach(),
             train_sup_loss=sup_loss.detach(),
-            train_pseudo_loss=pseudo_loss.detach(),
         )
 
-        return total_loss
+        return sup_loss
 
     # ------------------------------------------------------------------
     # Validation
