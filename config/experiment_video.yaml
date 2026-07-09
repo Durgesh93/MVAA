@@ -4,7 +4,7 @@
 
 seed: 12345
 
-experiment_name: supervised_only
+experiment_name: sup_focal_tversky
 
 # =============================================================================
 # Runtime / cluster-controlled values
@@ -64,12 +64,12 @@ litmodule:
   # loss_type: one of "dice_ce", "dice_focal", "tversky_ce",
   # "focal_tversky", "dice_topk", "unified_focal" (see losses.py).
   # Only the hyperparameters relevant to the selected loss_type are used.
-  loss_type: dice_ce
+  loss_type: focal_tversky
 
   # Tversky / Focal Tversky (tversky_ce, focal_tversky)
-  tversky_alpha: 0.3        # false-positive weight
-  tversky_beta: 0.7         # false-negative weight (>alpha penalizes missed foreground harder)
-  focal_tversky_gamma: 1.33 # >1 sharpens focus onto low-Tversky (hard) classes
+  tversky_alpha: 0.5        # false-positive weight
+  tversky_beta: 0.4         # false-negative weight (>alpha penalizes missed foreground harder)
+  focal_tversky_gamma: 2.0  # >1 sharpens focus onto low-Tversky (hard) classes
 
   # Focal (dice_focal) / TopK (dice_topk)
   focal_gamma: 2.0
