@@ -37,16 +37,28 @@ app = typer.Typer(help="Prepare MVAA Task 3 VIDEO dataset in nnU-Net format.")
 DATASET_ID = "Dataset003_MVAA_VIDEO_SSL"
 PATTERNS = ["t3_vid", "*vid*", "*video*"]
 CASE_SUFFIXES = [".png", ".jpg", ".jpeg", "_png_Label.tar"]
-VIDEO_LABEL_VALUE_TO_CLASS = {
-    10: 1,
-    11: 2,
-}
 
+# Raw annotation tool labels 17 classes per frame. Only class_10
+# (mitral valve) is kept in the final submission (see keep_classes /
+# lightning_module.py's is_t3_vid filtering); class_11 (ventricle) and
+# class_2 (separating forceps) are training-only. {10, 11, 2} is the
+# highest-support 3-class combination that still co-occurs in the same
+# frame (78/180 frames, 43.3%). All 3 must be present for a case to be
+# kept for training.
 VIDEO_MULTI_CLASS_LABELS = {
     "background": 0,
     "class_10": 1,
     "class_11": 2,
+    "class_2": 3,
 }
+
+VIDEO_LABEL_VALUE_TO_CLASS = {
+    int(name.removeprefix("class_")): class_idx
+    for name, class_idx in VIDEO_MULTI_CLASS_LABELS.items()
+    if name != "background"
+}
+
+VIDEO_REQUIRED_LABEL_VALUES = set(VIDEO_LABEL_VALUE_TO_CLASS.keys())
 
 VIDEO_EXCLUDED_CASE_NAMES = {
     "REC_20250322_101917_746A_000130",
@@ -192,7 +204,7 @@ def filter_video_excluded_cases(rows):
 
 
 def filter_video_multiclass_cases(rows):
-    required_values = set(VIDEO_LABEL_VALUE_TO_CLASS.keys())
+    required_values = set(VIDEO_REQUIRED_LABEL_VALUES)
 
     mask_rows = [
         r for r in rows
@@ -397,7 +409,10 @@ def prepare_video_dataset(data_root, nnunet_raw, test=False, num_processes=None)
         write_image_fn=write_video_rgb_image_as_nnunet_channels,
         write_real_mask_fn=write_video_multiclass_mask_from_tar,
         write_dummy_mask_fn=write_dummy_mask_from_image,
-        description_extra="Task 3 VIDEO RGB multi-class dataset (labels 10 and 11).",
+        description_extra=(
+            "Task 3 VIDEO RGB multi-class dataset (task labels 10, 11; "
+            "auxiliary label 2)."
+        ),
         num_processes=num_processes,
     )
 

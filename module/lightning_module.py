@@ -66,10 +66,6 @@ class SSLnnUNetLightningModule(
 
         self._nnu_load_plans(litmodule_cfg)
 
-        # Task 3 masks are multi-class (class_10 "LV", class_11).
-        # Submission output keeps only these classes as foreground.
-        # Currently just class_10 (LV); add more label names here
-        # to keep additional classes in the submission.
         self.keep_classes = (
             [self.dataset_json["labels"]["class_10"]]
             if self.is_t3_vid
