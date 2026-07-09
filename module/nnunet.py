@@ -36,8 +36,6 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 from .losses import (
     BoundaryLoss,
     CompoundLoss,
-    FocalTverskyLoss,
-    FocalLoss,
 )
 
 
@@ -121,66 +119,9 @@ class NNUnetMixin:
         shim = self._nnu_make_trainer_shim()
 
         assert not self.lm.has_regions, (
-            "None of the compound losses in losses.py support "
-            "region-based labels"
+            "CompoundLoss (DC_and_CE_loss + optional BoundaryLoss) does "
+            "not support region-based labels"
         )
-
-        loss_cfg = self.cfg.losses[self.cfg.loss_type]
-
-        soft_dice_kwargs = {
-            "batch_dice": self.cm.batch_dice,
-            "smooth": 1e-5,
-            "do_bg": False,
-            "ddp": shim.is_ddp,
-        }
-
-        dice_region_kwargs = {
-            **soft_dice_kwargs,
-            "alpha": 0.5,
-            "beta": 0.5,
-            "gamma": 1.0,
-        }
-
-        ce_pixel_kwargs = {"gamma": 0.0}
-
-        if self.cfg.loss_type == "dice_ce":
-            region_kwargs = dice_region_kwargs
-            pixel_kwargs = ce_pixel_kwargs
-        elif self.cfg.loss_type == "dice_focal":
-            region_kwargs = dice_region_kwargs
-            pixel_kwargs = {"gamma": loss_cfg.focal_gamma, "label_smoothing": 0.0}
-        elif self.cfg.loss_type == "tversky_ce":
-            region_kwargs = {
-                **soft_dice_kwargs,
-                "alpha": loss_cfg.tversky_alpha,
-                "beta": loss_cfg.tversky_beta,
-                "gamma": 1.0,
-            }
-            pixel_kwargs = ce_pixel_kwargs
-        elif self.cfg.loss_type == "tversky_focal":
-            region_kwargs = {
-                **soft_dice_kwargs,
-                "alpha": loss_cfg.tversky_alpha,
-                "beta": loss_cfg.tversky_beta,
-                "gamma": 1.0,
-            }
-            pixel_kwargs = {"gamma": loss_cfg.focal_gamma, "label_smoothing": 0.0}
-        elif self.cfg.loss_type == "focaltversky_ce":
-            region_kwargs = {
-                **soft_dice_kwargs,
-                "alpha": loss_cfg.tversky_alpha,
-                "beta": loss_cfg.tversky_beta,
-                "gamma": loss_cfg.focal_tversky_gamma,
-            }
-            pixel_kwargs = ce_pixel_kwargs
-        else:
-            region_kwargs = {
-                **soft_dice_kwargs,
-                "alpha": loss_cfg.tversky_alpha,
-                "beta": loss_cfg.tversky_beta,
-                "gamma": loss_cfg.focal_tversky_gamma,
-            }
-            pixel_kwargs = {"gamma": loss_cfg.focal_gamma, "label_smoothing": 0.0}
 
         if self.cfg.use_boundary:
             boundary_cls = BoundaryLoss
@@ -190,8 +131,8 @@ class NNUnetMixin:
             boundary_kwargs = None
 
         loss = CompoundLoss(
-            FocalTverskyLoss, region_kwargs,
-            FocalLoss, pixel_kwargs,
+            batch_dice=self.cm.batch_dice,
+            ddp=shim.is_ddp,
             ignore_label=self.lm.ignore_label,
             boundary_cls=boundary_cls,
             boundary_kwargs=boundary_kwargs,
@@ -229,7 +170,7 @@ class NNUnetMixin:
         to boundary_weight_max at boundary_ramp_epochs (held at max
         beyond that). No-op if use_boundary is off. Called once per
         epoch (see lightning_module.py's on_train_epoch_start) --
-        region/pixel losses anchor training throughout the ramp so the
+        Dice+CE anchors training throughout the ramp so the
         no-floor-on-its-own boundary term (see BoundaryLoss docstring)
         never dominates early.
         """

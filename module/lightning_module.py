@@ -47,19 +47,6 @@ class SSLnnUNetLightningModule(
 
         self.cfg = litmodule_cfg
 
-        assert self.cfg.loss_type in (
-            "dice_ce",
-            "dice_focal",
-            "tversky_ce",
-            "tversky_focal",
-            "focaltversky_ce",
-            "focaltversky_focal",
-        ), (
-            f"Unknown loss_type '{self.cfg.loss_type}'. "
-            "Use 'dice_ce', 'dice_focal', 'tversky_ce', 'tversky_focal', "
-            "'focaltversky_ce', or 'focaltversky_focal'."
-        )
-
         self.enable_deep_supervision = True
 
         # ------------------------------------------------------------
