@@ -1,0 +1,4 @@
+- [Git commit co-authorship](git_commit_coauthor.md) — always add Claude as Co-Authored-By on commits made on user's behalf
+- [MVAA supervised loss decisions](mvaa_supervised_loss_decisions.md) — 6 loss_type options in losses.py; temperature scaling rejected
+- [MVAA Phase 1 video loss experiments](mvaa_phase1_video_loss_experiments.md) — "phase_1 track video" trigger; 6 branches, 2026-07-08 snapshot
+- [MVAA Phase 2: focal_tversky chosen](mvaa_phase2_focal_tversky.md) — 5 Phase 1 branches deleted 2026-07-09, sup_focal_tversky is Phase 2 base
