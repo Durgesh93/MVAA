@@ -167,15 +167,18 @@ class nnUNetRawCaseDataset(Dataset):
 
         gt_data, gt_properties = rw.read_seg(str(label_file))
 
-        # rw.read_seg returns NumPy.
-        # nnU-Net read_seg returns:
+        # gt_data is a label map (integer class ids), not multi-channel
+        # logits/probabilities -- it was read straight from labelsTr.
+        # rw.read_seg wraps it with a leading dim-1 axis that is just an
+        # I/O convention, not a real class channel:
         #   3D: (1, D, H, W)
-        #   2D: often (1, 1, H, W)
+        #   2D: (1, 1, H, W)
         #
-        # Remove only the leading segmentation channel.
-        # Keep the remaining shape unchanged:
-        #   3D: [D, H, W]
-        #   2D: [1, H, W]
+        # gt_data[0] removes only that reader-convention axis:
+        #   3D -> [D, H, W]            (clean)
+        #   2D -> [1, H, W]            (still has a leftover singleton,
+        #                               because the 2D slice itself is
+        #                               represented as (1, H, W))
         gt_data = to_tensor(gt_data[0])
 
         return gt_data, gt_properties
@@ -304,7 +307,6 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         self.raw_dataset_val = None
         self.raw_dataset_test = None
 
-        self.test_cases = None
         self.limit_train_batches = None
 
     # ------------------------------------------------------------------
@@ -551,8 +553,6 @@ class SSLnnUNetDataModule(L.LightningDataModule):
             global_rank=global_rank,
             world_size=world_size,
         )
-
-        self.test_cases = test_cases
 
         # ------------------------------------------------------------
         # Train limit for infinite nnU-Net loaders

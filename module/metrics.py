@@ -2,7 +2,11 @@
 Metric utilities for SSL nnU-Net LightningModule.
 
 Tracks training losses and computes validation segmentation metrics.
-compute_metrics() is called only in validation_step after run_prediction().
+metric_compute_metrics() is called only in validation_step after
+pred_run_prediction().
+
+All methods are prefixed with "metric" so call sites (self._metric_... /
+self.metric_...) make clear which mixin they come from.
 """
 
 from pathlib import Path
@@ -22,7 +26,7 @@ from utils import (
 
 
 class MetricsMixin:
-    def _init_metric_tracking(self):
+    def _metric_init_tracking(self):
         self.tracked_metric_keys = [
             "train_loss",
             "train_sup_loss",
@@ -51,7 +55,7 @@ class MetricsMixin:
             }
         )
 
-    def _mean_valid(self, values):
+    def _metric_mean_valid(self, values):
         valid_values = []
 
         for value in values:
@@ -65,7 +69,7 @@ class MetricsMixin:
 
         return float(np.mean(valid_values))
 
-    def _get_metric_labels(self):
+    def _metric_get_labels(self):
         foreground_labels = list(self.lm.foreground_labels)
 
         # Overall = background + foreground.
@@ -74,7 +78,7 @@ class MetricsMixin:
 
         return all_labels, foreground_labels
 
-    def _log_scalar(
+    def _metric_log_scalar(
         self,
         name,
         value,
@@ -107,7 +111,7 @@ class MetricsMixin:
 
         return value
 
-    def compute_metrics(self, prediction):
+    def metric_compute_metrics(self, prediction):
         """
         Compute validation segmentation metrics for one case.
 
@@ -143,10 +147,16 @@ class MetricsMixin:
         pred = np.asarray(pred)
         gt = np.asarray(gt)
 
-        # Safety: remove singleton channel dimension if present.
-        # Example:
-        #   pred [1, H, W]    -> [H, W]
-        #   gt   [1, D, H, W] -> [D, H, W]
+        # pred and gt are both label maps (integer class ids) here, not
+        # multi-channel logits/probabilities -- the network's C-channel
+        # logits were already collapsed to a label map upstream (nnU-Net's
+        # convert_predicted_logits_to_segmentation_with_correct_shape).
+        #
+        # Only the 2D case can still carry a leftover leading singleton,
+        # since a 2D slice is itself represented as (1, H, W):
+        #   pred [1, H, W] -> [H, W]
+        #   gt   [1, H, W] -> [H, W]
+        # 3D pred/gt arrive as (D, H, W) already and are left unchanged.
         if pred.ndim >= 3 and pred.shape[0] == 1:
             pred = pred[0]
 
@@ -164,7 +174,7 @@ class MetricsMixin:
         if len(voxel_spacing) != pred.ndim:
             voxel_spacing = voxel_spacing[-pred.ndim:]
 
-        all_labels, foreground_labels = self._get_metric_labels()
+        all_labels, foreground_labels = self._metric_get_labels()
 
         classwise = {}
 
@@ -196,14 +206,14 @@ class MetricsMixin:
         foreground_mean = {}
 
         for metric_name in metric_names:
-            overall_mean[metric_name] = self._mean_valid(
+            overall_mean[metric_name] = self._metric_mean_valid(
                 [
                     classwise[str(label)][metric_name]
                     for label in all_labels
                 ]
             )
 
-            foreground_mean[metric_name] = self._mean_valid(
+            foreground_mean[metric_name] = self._metric_mean_valid(
                 [
                     classwise[str(label)][metric_name]
                     for label in foreground_labels
@@ -216,7 +226,7 @@ class MetricsMixin:
             "classwise": classwise,
         }
 
-    def update_step_training_metrics(
+    def metric_update_step_training_metrics(
         self,
         train_loss,
         train_sup_loss,
@@ -232,7 +242,7 @@ class MetricsMixin:
             if value is not None:
                 self.step_metrics[key].update(value)
 
-    def update_step_val_metrics(
+    def metric_update_step_val_metrics(
         self,
         metrics,
     ):
@@ -248,7 +258,7 @@ class MetricsMixin:
                 dice -> dice/dataloader_idx_0
 
             The checkpoint monitors plain "dice", so validation
-            metrics are logged later in log_validation_epoch_metrics().
+            metrics are logged later in metric_log_validation_epoch_metrics().
         """
 
         # Main Dice = foreground mean.
@@ -267,7 +277,7 @@ class MetricsMixin:
             if value is not None:
                 self.step_metrics[key].update(value)
 
-    def print_validation_epoch_metrics(
+    def metric_print_validation_epoch_metrics(
         self,
         synced_metrics,
         stage="val",
@@ -307,7 +317,7 @@ class MetricsMixin:
         print("=" * 80)
         print()
         
-    def log_validation_epoch_metrics(
+    def metric_log_validation_epoch_metrics(
         self,
         synced_metrics,
     ):
@@ -330,7 +340,7 @@ class MetricsMixin:
             value = safe_float(synced_metrics[key])
 
             if value is not None:
-                self._log_scalar(
+                self._metric_log_scalar(
                     name=key,
                     value=value,
                     prog_bar=True,
@@ -338,7 +348,7 @@ class MetricsMixin:
                     sync_dist=False,
                 )
 
-    def _update_epoch_metrics(self, synced_metrics):
+    def _metric_update_epoch_metrics(self, synced_metrics):
         epoch_value = safe_float(self.current_epoch)
 
         if epoch_value is not None:
@@ -360,7 +370,7 @@ class MetricsMixin:
                     )
                 )
 
-    def _save_training_progress_plot(self):
+    def _metric_save_training_progress_plot(self):
         history = self.epoch_metrics.compute()
 
         history_np = {
@@ -373,5 +383,5 @@ class MetricsMixin:
             progress_png_file=Path(self.actual_validation_output_base)
             / "training_progress.png",
             dataset_name=self.dataset_name,
-            fold=self.fold,
+            fold=self.cfg.fold,
         )

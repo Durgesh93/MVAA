@@ -62,23 +62,35 @@ litmodule:
   num_epochs: ${trainer.max_epochs}
 
   # loss_type: one of "dice_ce", "dice_focal", "tversky_ce",
-  # "focal_tversky", "dice_topk", "unified_focal" (see losses.py).
-  # Only the hyperparameters relevant to the selected loss_type are used.
-  loss_type: focal_tversky
+  # "tversky_focal", "focaltversky_ce", "focaltversky_focal"
+  # (see module/losses.py). Only the losses.<loss_type> block below is read.
+  loss_type: focaltversky_ce
 
-  # Tversky / Focal Tversky (tversky_ce, focal_tversky)
-  tversky_alpha: 0.3        # false-positive weight
-  tversky_beta: 0.7         # false-negative weight (>alpha penalizes missed foreground harder)
-  focal_tversky_gamma: 1.33 # >1 sharpens focus onto low-Tversky (hard) classes
+  losses:
+    dice_ce: {}
 
-  # Focal (dice_focal) / TopK (dice_topk)
-  focal_gamma: 2.0
-  topk_k: 10                # percent of hardest voxels used for CE
+    dice_focal:
+      focal_gamma: 2.0
 
-  # Unified Focal (unified_focal)
-  unified_focal_lambda: 0.5 # weight between focal-CE and focal-Tversky halves
-  unified_focal_delta: 0.6  # class-imbalance weight, shared by both halves
-  unified_focal_gamma: 0.5  # focal sharpening exponent, in [0, 1)
+    tversky_ce:
+      tversky_alpha: 0.3        # false-positive weight
+      tversky_beta: 0.7         # false-negative weight (>alpha penalizes missed foreground harder)
+
+    tversky_focal:
+      tversky_alpha: 0.3        # false-positive weight
+      tversky_beta: 0.7         # false-negative weight (>alpha penalizes missed foreground harder)
+      focal_gamma: 2.0
+
+    focaltversky_ce:
+      tversky_alpha: 0.3        # false-positive weight
+      tversky_beta: 0.7         # false-negative weight (>alpha penalizes missed foreground harder)
+      focal_tversky_gamma: 1.33 # >1 sharpens focus onto low-Tversky (hard) classes
+
+    focaltversky_focal:
+      tversky_alpha: 0.3        # false-positive weight
+      tversky_beta: 0.7         # false-negative weight (>alpha penalizes missed foreground harder)
+      focal_tversky_gamma: 1.33 # >1 sharpens focus onto low-Tversky (hard) classes
+      focal_gamma: 2.0
 
 # =============================================================================
 # Trainer config

@@ -4,6 +4,9 @@ PredictionMixin for SSL nnU-Net.
 Takes a prepared case from the datamodule, runs sliding-window inference,
 restores prediction to original image shape, and returns the prediction
 dictionary.
+
+All methods are prefixed with "pred" so call sites (self._pred_... /
+self.pred_run_prediction) make clear which mixin they come from.
 """
 
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
@@ -16,7 +19,7 @@ from nnunetv2.inference.export_prediction import (
 class PredictionMixin:
 
 
-    def _unwrap_network(self):
+    def _pred_unwrap_network(self):
         net = self.network
 
         if hasattr(net, "module"):
@@ -24,7 +27,7 @@ class PredictionMixin:
 
         return net
 
-    def _make_predictor(self, net):
+    def _pred_make_predictor(self, net):
         predictor = nnUNetPredictor(
             tile_step_size=0.5,
             use_gaussian=True,
@@ -47,19 +50,19 @@ class PredictionMixin:
 
         return predictor
 
-    def _predict_logits(self, data):
+    def _pred_predict_logits(self, data):
         if self.cm.previous_stage_name is not None:
             raise RuntimeError(
-                f"Configuration {self.configuration} is cascaded, "
+                f"Configuration {self.cfg.configuration} is cascaded, "
                 "but this module does not support cascaded inference."
             )
 
-        net = self._unwrap_network()
+        net = self._pred_unwrap_network()
 
         old_deep_supervision = net.decoder.deep_supervision
         net.decoder.deep_supervision = False
 
-        predictor = self._make_predictor(net)
+        predictor = self._pred_make_predictor(net)
 
         try:
             logits = predictor.predict_sliding_window_return_logits(data)
@@ -69,7 +72,7 @@ class PredictionMixin:
 
         return logits
 
-    def _restore_prediction_shape(self, logits, properties):
+    def _pred_restore_prediction_shape(self, logits, properties):
         predicted_segments, predicted_probs = (
             convert_predicted_logits_to_segmentation_with_correct_shape(
                 predicted_logits=logits.cpu(),
@@ -86,16 +89,18 @@ class PredictionMixin:
     # =========================================================================
     # Main prediction entry point
     # =========================================================================
-    def run_prediction(self, batch, batch_idx=None):
+    def pred_run_prediction(self, batch, batch_idx=None):
         item = batch[0]
 
-        logits = self._predict_logits(
+        logits = self._pred_predict_logits(
             data=item["data"],
         )
 
-        predicted_segments, predicted_probs = self._restore_prediction_shape(
-            logits=logits,
-            properties=item["properties"],
+        predicted_segments, predicted_probs = (
+            self._pred_restore_prediction_shape(
+                logits=logits,
+                properties=item["properties"],
+            )
         )
 
         item.update(

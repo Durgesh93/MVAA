@@ -108,6 +108,38 @@ def to_numpy(x):
     return np.asarray(x)
 
 
+def get_train_batch_data_target(batch, device):
+    """
+    Extract (data, target) from an nnU-Net train batch and move to device.
+
+    target is either a Tensor or a list/tuple (deep supervision).
+    """
+
+    data = to_tensor(
+        batch["data"],
+        device=device,
+        dtype=torch.float32,
+    )
+
+    target = batch["target"]
+
+    if isinstance(target, (list, tuple)):
+        target = [
+            to_tensor(
+                t,
+                device=device,
+            )
+            for t in target
+        ]
+    else:
+        target = to_tensor(
+            target,
+            device=device,
+        )
+
+    return data, target
+
+
 # =============================================================================
 # DDP case splitting
 # =============================================================================
@@ -700,7 +732,6 @@ def merge_rank_folders(
     fold_output_folder,
     task_id,
     overwrite=True,
-    require_submission=True,
 ):
     """
     Merge rank-local outputs into final folders.
@@ -830,7 +861,7 @@ def merge_rank_folders(
 
                 copied_submission += 1
 
-    if require_submission and copied_submission == 0:
+    if copied_submission == 0:
         raise RuntimeError(
             "No submission files were copied from rank outputs. "
             "Expected files like:\n"
