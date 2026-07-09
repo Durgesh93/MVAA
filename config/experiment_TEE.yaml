@@ -64,7 +64,17 @@ litmodule:
   # loss_type: one of "dice_ce", "dice_focal", "tversky_ce",
   # "tversky_focal", "focaltversky_ce", "focaltversky_focal"
   # (see module/losses.py). Only the losses.<loss_type> block below is read.
-  loss_type: focaltversky_ce
+  loss_type: dice_ce
+
+  # Optional boundary loss (Kervadec et al. 2019) add-on, layered on
+  # top of whichever loss_type above is selected -- see module/losses.py
+  # BoundaryLoss / CompoundLoss.set_boundary_weight. Weight ramps
+  # linearly from 0 at epoch 0 to boundary_weight_max at
+  # boundary_ramp_epochs (held at max beyond that); the loss_type
+  # region+pixel terms anchor training throughout the ramp.
+  use_boundary: false
+  boundary_weight_max: 0.01
+  boundary_ramp_epochs: ${trainer.max_epochs}
 
   losses:
     dice_ce: {}

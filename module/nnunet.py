@@ -34,6 +34,7 @@ from nnunetv2.utilities.label_handling.label_handling import (
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
 from .losses import (
+    BoundaryLoss,
     CompoundLoss,
     FocalTverskyLoss,
     FocalLoss,
@@ -181,10 +182,19 @@ class NNUnetMixin:
             }
             pixel_kwargs = {"gamma": loss_cfg.focal_gamma, "label_smoothing": 0.0}
 
+        if self.cfg.use_boundary:
+            boundary_cls = BoundaryLoss
+            boundary_kwargs = {"do_bg": False}
+        else:
+            boundary_cls = None
+            boundary_kwargs = None
+
         loss = CompoundLoss(
             FocalTverskyLoss, region_kwargs,
             FocalLoss, pixel_kwargs,
             ignore_label=self.lm.ignore_label,
+            boundary_cls=boundary_cls,
+            boundary_kwargs=boundary_kwargs,
         )
 
         if self.enable_deep_supervision:
@@ -204,6 +214,33 @@ class NNUnetMixin:
             loss = DeepSupervisionWrapper(loss, weights)
 
         return loss
+
+    def _nnu_compound_loss(self):
+        """The underlying CompoundLoss, unwrapped from DeepSupervisionWrapper if present."""
+
+        return (
+            self.loss.loss
+            if isinstance(self.loss, DeepSupervisionWrapper) else self.loss
+        )
+
+    def _nnu_update_boundary_weight(self, epoch: int) -> None:
+        """
+        Ramps CompoundLoss.boundary_weight linearly from 0 at epoch 0
+        to boundary_weight_max at boundary_ramp_epochs (held at max
+        beyond that). No-op if use_boundary is off. Called once per
+        epoch (see lightning_module.py's on_train_epoch_start) --
+        region/pixel losses anchor training throughout the ramp so the
+        no-floor-on-its-own boundary term (see BoundaryLoss docstring)
+        never dominates early.
+        """
+
+        if not self.cfg.use_boundary:
+            return
+
+        ramp_epochs = max(int(self.cfg.boundary_ramp_epochs), 1)
+        weight = self.cfg.boundary_weight_max * min(epoch / ramp_epochs, 1.0)
+
+        self._nnu_compound_loss().set_boundary_weight(weight)
 
     def _nnu_build_optimizer_and_scheduler(self):
         shim = type("S", (), {})()

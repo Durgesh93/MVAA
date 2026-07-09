@@ -135,6 +135,9 @@ class SSLnnUNetLightningModule(
     def forward(self, x):
         return self.network(x)
 
+    def on_train_epoch_start(self):
+        self._nnu_update_boundary_weight(self.current_epoch)
+
     # ------------------------------------------------------------------
     # Training helpers
     # ------------------------------------------------------------------
