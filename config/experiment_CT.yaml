@@ -4,7 +4,7 @@
 
 seed: 12345
 
-experiment_name: sup_focal_tversky
+experiment_name: supervised
 
 # =============================================================================
 # Runtime / cluster-controlled values
