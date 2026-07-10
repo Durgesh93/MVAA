@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator, MaxNLocator
@@ -29,6 +30,7 @@ import SimpleITK as sitk
 # =============================================================================
 # Basic shared helpers
 # =============================================================================
+
 
 def safe_float(value):
     """
@@ -61,12 +63,7 @@ def safe_float(value):
     return value
 
 
-def to_tensor(
-    x,
-    device=None,
-    dtype=None,
-    non_blocking=True,
-):
+def to_tensor(x, device=None, dtype=None, non_blocking=True):
     """
     Convert NumPy array or Torch tensor to Torch tensor.
     """
@@ -78,18 +75,13 @@ def to_tensor(
         tensor = torch.from_numpy(x)
 
     else:
-        raise TypeError(
-            f"Expected torch.Tensor or np.ndarray, got {type(x)}"
-        )
+        raise TypeError(f"Expected torch.Tensor or np.ndarray, got {type(x)}")
 
     if dtype is not None:
         tensor = tensor.to(dtype=dtype)
 
     if device is not None:
-        tensor = tensor.to(
-            device,
-            non_blocking=non_blocking,
-        )
+        tensor = tensor.to(device, non_blocking=non_blocking)
 
     return tensor
 
@@ -115,27 +107,14 @@ def get_train_batch_data_target(batch, device):
     target is either a Tensor or a list/tuple (deep supervision).
     """
 
-    data = to_tensor(
-        batch["data"],
-        device=device,
-        dtype=torch.float32,
-    )
+    data = to_tensor(batch["data"], device=device, dtype=torch.float32)
 
     target = batch["target"]
 
     if isinstance(target, (list, tuple)):
-        target = [
-            to_tensor(
-                t,
-                device=device,
-            )
-            for t in target
-        ]
+        target = [to_tensor(t, device=device) for t in target]
     else:
-        target = to_tensor(
-            target,
-            device=device,
-        )
+        target = to_tensor(target, device=device)
 
     return data, target
 
@@ -144,21 +123,15 @@ def get_train_batch_data_target(batch, device):
 # DDP case splitting
 # =============================================================================
 
-def split_by_rank(
-    case_ids,
-    global_rank,
-    world_size,
-):
+
+def split_by_rank(case_ids, global_rank, world_size):
     """
     Split case IDs by DDP rank.
     """
 
     case_ids = list(sorted(case_ids))
 
-    world_size = max(
-        1,
-        int(world_size),
-    )
+    world_size = max(1, int(world_size))
 
     global_rank = int(global_rank)
 
@@ -169,9 +142,7 @@ def split_by_rank(
         return case_ids
 
     if len(case_ids) < world_size:
-        return [
-            case_ids[global_rank % len(case_ids)]
-        ]
+        return [case_ids[global_rank % len(case_ids)]]
 
     return case_ids[global_rank::world_size]
 
@@ -179,6 +150,7 @@ def split_by_rank(
 # =============================================================================
 # Engine / runtime helpers
 # =============================================================================
+
 
 def set_nnunet_env(cfg):
     """
@@ -193,52 +165,10 @@ def set_nnunet_env(cfg):
     os.environ["nnUNet_preprocessed"] = nnunet_preprocessed
     os.environ["nnUNet_results"] = nnunet_results
 
-    return {
-        "nnunet_raw": nnunet_raw,
-        "nnunet_preprocessed": nnunet_preprocessed,
-        "nnunet_results": nnunet_results,
-    }
+    return {"nnunet_raw": nnunet_raw, "nnunet_preprocessed": nnunet_preprocessed, "nnunet_results": nnunet_results}
 
 
-def get_checkpoint_dir(cfg):
-    """
-    Return checkpoint directory for current config.
-    """
-
-    return (
-        Path(cfg.paths.nnunet_results)
-        / cfg.dataset_id
-        / f"{cfg.plans_identifier}__{cfg.configuration}"
-        / f"fold_{cfg.fold}"
-        / "checkpoints"
-    )
-
-
-def clear_checkpoint_dir(cfg):
-    """
-    Clear and recreate checkpoint directory.
-    """
-
-    checkpoint_dir = get_checkpoint_dir(cfg)
-
-    if checkpoint_dir.exists():
-        shutil.rmtree(checkpoint_dir)
-
-    checkpoint_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    print()
-    print("[checkpoint] Cleared checkpoint directory:")
-    print(f"  {checkpoint_dir}")
-    print()
-
-
-def resolve_runtime_config(
-    cfg,
-    prediction=False,
-):
+def resolve_runtime_config(cfg, prediction=False):
     """
     Resolve runtime placeholders:
         devices: ???
@@ -246,10 +176,7 @@ def resolve_runtime_config(
     """
 
     if torch.cuda.is_available():
-        cfg.devices = max(
-            1,
-            torch.cuda.device_count(),
-        )
+        cfg.devices = max(1, torch.cuda.device_count())
     else:
         cfg.devices = 1
 
@@ -262,10 +189,8 @@ def resolve_runtime_config(
     cfg.trainer.strategy = cfg.training_strategy
     return cfg
 
-def resolve_prediction_ckpt(
-    cfg,
-    ckpt,
-):
+
+def resolve_prediction_ckpt(cfg, ckpt):
     ckpt = str(ckpt)
 
     checkpoint_dir = (
@@ -280,48 +205,32 @@ def resolve_prediction_ckpt(
         return str(checkpoint_dir / "last.ckpt")
 
     if ckpt == "best":
-        best_ckpts = sorted(
-            checkpoint_dir.glob("best-*.ckpt"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
+        best_ckpts = sorted(checkpoint_dir.glob("best-*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
 
         if len(best_ckpts) == 0:
-            raise FileNotFoundError(
-                f"No best checkpoint found in {checkpoint_dir}"
-            )
+            raise FileNotFoundError(f"No best checkpoint found in {checkpoint_dir}")
 
         return str(best_ckpts[0])
 
     return ckpt
 
-def validate_experiment_name(
-    experiment,
-    config_map,
-):
+
+def validate_experiment_name(experiment, config_map):
     """
     Validate experiment name against CONFIG_MAP.
     """
 
-    experiment = str(
-        experiment
-    ).lower().strip()
+    experiment = str(experiment).lower().strip()
 
     if experiment not in config_map:
-        valid = ", ".join(
-            config_map.keys()
-        )
+        valid = ", ".join(config_map.keys())
 
-        raise ValueError(
-            f"Unknown experiment '{experiment}'. Choose one of: {valid}"
-        )
+        raise ValueError(f"Unknown experiment '{experiment}'. Choose one of: {valid}")
 
     return experiment, config_map[experiment]
 
-def collect_submission_files(
-    cfg,
-    fold_num,
-):
+
+def collect_submission_files(cfg, fold_num):
     """
     Collect submission files for one experiment.
 
@@ -331,9 +240,7 @@ def collect_submission_files(
         task3 -> *_label_bin.png
     """
 
-    dataset_name = str(
-        cfg.litmodule.dataset_id
-    )
+    dataset_name = str(cfg.litmodule.dataset_id)
 
     configuration = cfg.litmodule.configuration
     plans_identifier = cfg.litmodule.plans_identifier
@@ -341,17 +248,12 @@ def collect_submission_files(
     prefix = cfg.litmodule.prefix
 
     fold_output_folder = (
-        Path(cfg.paths.nnunet_results)
-        / dataset_name
-        / f"{plans_identifier}__{configuration}"
-        / f"fold_{fold_num}"
+        Path(cfg.paths.nnunet_results) / dataset_name / f"{plans_identifier}__{configuration}" / f"fold_{fold_num}"
     )
 
     submission_folder = fold_output_folder / "submission"
 
-    task_id_str = str(
-        task_id
-    ).lower().strip()
+    task_id_str = str(task_id).lower().strip()
 
     if task_id_str == "task3":
         prediction_pattern = "*_label_bin.png"
@@ -360,14 +262,9 @@ def collect_submission_files(
         prediction_pattern = "*-pred.nii.gz"
 
     else:
-        raise ValueError(
-            f"Unsupported task_id={task_id}. Expected task1, task2, or task3."
-        )
+        raise ValueError(f"Unsupported task_id={task_id}. Expected task1, task2, or task3.")
 
-    prediction_files = sorted(
-        p for p in submission_folder.glob(prediction_pattern)
-        if p.is_file()
-    )
+    prediction_files = sorted(p for p in submission_folder.glob(prediction_pattern) if p.is_file())
 
     if len(prediction_files) == 0:
         raise FileNotFoundError(
@@ -376,22 +273,15 @@ def collect_submission_files(
             f"Expected pattern: {prediction_pattern}"
         )
 
-    return {
-        "prefix": prefix,
-        "task_id": task_id,
-        "prediction_files": prediction_files,
-    }
+    return {"prefix": prefix, "task_id": task_id, "prediction_files": prediction_files}
+
 
 # =============================================================================
 # Training progress plot
 # =============================================================================
 
-def save_training_progress_plot(
-    history,
-    progress_png_file,
-    dataset_name,
-    fold,
-):
+
+def save_training_progress_plot(history, progress_png_file, dataset_name, fold):
     """
     Save training_progress.png from already-computed NumPy history.
     """
@@ -399,9 +289,7 @@ def save_training_progress_plot(
     if "epoch" not in history:
         return
 
-    epochs = np.asarray(
-        history["epoch"]
-    )
+    epochs = np.asarray(history["epoch"])
 
     if epochs.size == 0:
         return
@@ -415,10 +303,7 @@ def save_training_progress_plot(
         ("hd95_mm", "HD95 mm", "min"),
     ]
 
-    plot_keys = [
-        item for item in plot_keys
-        if item[0] in history
-    ]
+    plot_keys = [item for item in plot_keys if item[0] in history]
 
     if len(plot_keys) == 0:
         return
@@ -427,61 +312,30 @@ def save_training_progress_plot(
     n_cols = math.ceil(math.sqrt(n_plots))
     n_rows = math.ceil(n_plots / n_cols)
 
-    fig, axes = plt.subplots(
-        n_rows,
-        n_cols,
-        figsize=(13 * n_cols, 11 * n_rows),
-    )
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(13 * n_cols, 11 * n_rows))
 
     axes = np.asarray(axes).reshape(-1)
 
     for ax, (key, title, best_mode) in zip(axes, plot_keys):
-        values = np.asarray(
-            history[key],
-            dtype=float,
-        )
+        values = np.asarray(history[key], dtype=float)
 
         mask = ~np.isnan(values)
 
         xs = epochs[mask]
         ys = values[mask]
 
-        ax.set_title(
-            title,
-            fontsize=13,
-        )
+        ax.set_title(title, fontsize=13)
 
         ax.set_xlabel("Epoch")
 
-        ax.xaxis.set_major_locator(
-            MaxNLocator(integer=True)
-        )
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
 
-        ax.grid(
-            True,
-            which="major",
-            linestyle="-",
-            linewidth=0.7,
-            alpha=0.45,
-        )
+        ax.grid(True, which="major", linestyle="-", linewidth=0.7, alpha=0.45)
 
-        ax.grid(
-            True,
-            which="minor",
-            linestyle=":",
-            linewidth=0.5,
-            alpha=0.30,
-        )
+        ax.grid(True, which="minor", linestyle=":", linewidth=0.5, alpha=0.30)
 
         if len(xs) == 0:
-            ax.text(
-                0.5,
-                0.5,
-                "No values yet",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-            )
+            ax.text(0.5, 0.5, "No values yet", ha="center", va="center", transform=ax.transAxes)
             continue
 
         last_value = ys[-1]
@@ -499,22 +353,13 @@ def save_training_progress_plot(
             marker="o",
             linewidth=1.8,
             markersize=4,
-            label=(
-                f"last={last_value:.4f}, "
-                f"{best_word}={best_value:.4f}"
-            ),
+            label=(f"last={last_value:.4f}, " f"{best_word}={best_value:.4f}"),
         )
 
         if key == "dice":
-            ymin = max(
-                0.0,
-                float(ys.min()) - 0.02,
-            )
+            ymin = max(0.0, float(ys.min()) - 0.02)
 
-            ymax = min(
-                1.0,
-                float(ys.max()) + 0.02,
-            )
+            ymax = min(1.0, float(ys.max()) + 0.02)
 
             if ymax - ymin < 0.05:
                 center = (ymin + ymax) / 2
@@ -523,19 +368,12 @@ def save_training_progress_plot(
 
             ax.set_ylim(ymin, ymax)
 
-            ax.yaxis.set_major_locator(
-                MultipleLocator(0.01)
-            )
+            ax.yaxis.set_major_locator(MultipleLocator(0.01))
 
-            ax.yaxis.set_minor_locator(
-                MultipleLocator(0.005)
-            )
+            ax.yaxis.set_minor_locator(MultipleLocator(0.005))
 
         elif key in ["asd_mm", "hd_mm", "hd95_mm"]:
-            ymin = max(
-                0.0,
-                float(ys.min()) * 0.95,
-            )
+            ymin = max(0.0, float(ys.min()) * 0.95)
 
             ymax = float(ys.max()) * 1.05
 
@@ -544,22 +382,15 @@ def save_training_progress_plot(
 
             ax.set_ylim(ymin, ymax)
 
-            ax.yaxis.set_major_locator(
-                MaxNLocator(nbins=8)
-            )
+            ax.yaxis.set_major_locator(MaxNLocator(nbins=8))
 
-            ax.yaxis.set_minor_locator(
-                MaxNLocator(nbins=16)
-            )
+            ax.yaxis.set_minor_locator(MaxNLocator(nbins=16))
 
         else:
             ymin = float(ys.min())
             ymax = float(ys.max())
 
-            margin = 0.05 * max(
-                abs(ymax - ymin),
-                1e-6,
-            )
+            margin = 0.05 * max(abs(ymax - ymin), 1e-6)
 
             ymin = ymin - margin
             ymax = ymax + margin
@@ -569,42 +400,24 @@ def save_training_progress_plot(
 
             ax.set_ylim(ymin, ymax)
 
-            ax.yaxis.set_major_locator(
-                MaxNLocator(nbins=8)
-            )
+            ax.yaxis.set_major_locator(MaxNLocator(nbins=8))
 
-            ax.yaxis.set_minor_locator(
-                MaxNLocator(nbins=16)
-            )
+            ax.yaxis.set_minor_locator(MaxNLocator(nbins=16))
 
-        ax.legend(
-            loc="best",
-            fontsize=10,
-        )
+        ax.legend(loc="best", fontsize=10)
 
-    for ax in axes[len(plot_keys):]:
+    for ax in axes[len(plot_keys) :]:
         ax.axis("off")
 
     progress_png_file = Path(progress_png_file)
 
-    progress_png_file.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    progress_png_file.parent.mkdir(parents=True, exist_ok=True)
 
-    fig.suptitle(
-        f"Training progress | {dataset_name} | fold {fold}",
-        fontsize=16,
-    )
+    fig.suptitle(f"Training progress | {dataset_name} | fold {fold}", fontsize=16)
 
-    fig.tight_layout(
-        rect=[0, 0, 1, 0.97],
-    )
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
 
-    fig.savefig(
-        progress_png_file,
-        dpi=180,
-    )
+    fig.savefig(progress_png_file, dpi=180)
 
     plt.close(fig)
 
@@ -613,11 +426,14 @@ def save_training_progress_plot(
 # Safe MedPy segmentation metrics
 # =============================================================================
 
-def safe_binary_segmentation_metrics(
-    pred_mask,
-    gt_mask,
-    voxel_spacing,
-):
+# Surface distance is undefined when only one of pred/gt is empty for a
+# label (missed or hallucinated class -- no surface on one side to
+# measure to/from). Used as a fixed worst-case penalty instead of None,
+# so it actively drags down the mean instead of being excluded from it.
+MISSED_CLASS_DISTANCE_MM = 1000.0
+
+
+def safe_binary_segmentation_metrics(pred_mask, gt_mask, voxel_spacing):
     """
     Compute binary segmentation metrics safely.
     """
@@ -627,62 +443,34 @@ def safe_binary_segmentation_metrics(
 
     if pred_mask.shape != gt_mask.shape:
         raise ValueError(
-            "pred_mask and gt_mask must have the same shape. "
-            f"Got pred={pred_mask.shape}, gt={gt_mask.shape}"
+            "pred_mask and gt_mask must have the same shape. " f"Got pred={pred_mask.shape}, gt={gt_mask.shape}"
         )
 
     if voxel_spacing is not None:
-        voxel_spacing = tuple(
-            float(x) for x in voxel_spacing
-        )
+        voxel_spacing = tuple(float(x) for x in voxel_spacing)
 
         if len(voxel_spacing) != pred_mask.ndim:
-            voxel_spacing = voxel_spacing[-pred_mask.ndim:]
+            voxel_spacing = voxel_spacing[-pred_mask.ndim :]
 
     pred_empty = not pred_mask.any()
     gt_empty = not gt_mask.any()
 
     if pred_empty and gt_empty:
-        return {
-            "Dice": 1.0,
-            "ASD_mm": 0.0,
-            "HD_mm": 0.0,
-            "HD95_mm": 0.0,
-        }
+        return {"Dice": 1.0, "ASD_mm": 0.0, "HD_mm": 0.0, "HD95_mm": 0.0}
 
     if pred_empty or gt_empty:
         return {
             "Dice": 0.0,
-            "ASD_mm": None,
-            "HD_mm": None,
-            "HD95_mm": None,
+            "ASD_mm": MISSED_CLASS_DISTANCE_MM,
+            "HD_mm": MISSED_CLASS_DISTANCE_MM,
+            "HD95_mm": MISSED_CLASS_DISTANCE_MM,
         }
 
     return {
-        "Dice": float(
-            dc(pred_mask, gt_mask)
-        ),
-        "ASD_mm": float(
-            asd(
-                pred_mask,
-                gt_mask,
-                voxelspacing=voxel_spacing,
-            )
-        ),
-        "HD_mm": float(
-            hd(
-                pred_mask,
-                gt_mask,
-                voxelspacing=voxel_spacing,
-            )
-        ),
-        "HD95_mm": float(
-            hd95(
-                pred_mask,
-                gt_mask,
-                voxelspacing=voxel_spacing,
-            )
-        ),
+        "Dice": float(dc(pred_mask, gt_mask)),
+        "ASD_mm": float(asd(pred_mask, gt_mask, voxelspacing=voxel_spacing)),
+        "HD_mm": float(hd(pred_mask, gt_mask, voxelspacing=voxel_spacing)),
+        "HD95_mm": float(hd95(pred_mask, gt_mask, voxelspacing=voxel_spacing)),
     }
 
 
@@ -690,31 +478,20 @@ def safe_binary_segmentation_metrics(
 # Rank-local output helpers
 # =============================================================================
 
-def get_rank_output_folder(
-    fold_output_folder,
-    global_rank,
-):
+
+def get_rank_output_folder(fold_output_folder, global_rank):
     """
     Rank-local output folder for DDP.
     """
 
-    rank_folder = (
-        Path(fold_output_folder)
-        / "_rank_outputs"
-        / f"rank_{int(global_rank)}"
-    )
+    rank_folder = Path(fold_output_folder) / "_rank_outputs" / f"rank_{int(global_rank)}"
 
-    rank_folder.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    rank_folder.mkdir(parents=True, exist_ok=True)
 
     return rank_folder
 
 
-def cleanup_rank_outputs(
-    fold_output_folder,
-):
+def cleanup_rank_outputs(fold_output_folder):
     """
     Remove fold_all/_rank_outputs.
     """
@@ -722,17 +499,10 @@ def cleanup_rank_outputs(
     rank_root = Path(fold_output_folder) / "_rank_outputs"
 
     if rank_root.exists():
-        shutil.rmtree(
-            rank_root,
-            ignore_errors=True,
-        )
+        shutil.rmtree(rank_root, ignore_errors=True)
 
 
-def merge_rank_folders(
-    fold_output_folder,
-    task_id,
-    overwrite=True,
-):
+def merge_rank_folders(fold_output_folder, task_id, overwrite=True):
     """
     Merge rank-local outputs into final folders.
 
@@ -749,35 +519,19 @@ def merge_rank_folders(
     final_prediction = fold_output_folder / "prediction"
     final_submission = fold_output_folder / "submission"
 
-    final_validation.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    final_validation.mkdir(parents=True, exist_ok=True)
 
-    final_prediction.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    final_prediction.mkdir(parents=True, exist_ok=True)
 
-    final_submission.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    final_submission.mkdir(parents=True, exist_ok=True)
 
     if not rank_root.exists():
-        raise FileNotFoundError(
-            f"Rank output root does not exist: {rank_root}"
-        )
+        raise FileNotFoundError(f"Rank output root does not exist: {rank_root}")
 
-    rank_folders = sorted(
-        p for p in rank_root.glob("rank_*")
-        if p.is_dir()
-    )
+    rank_folders = sorted(p for p in rank_root.glob("rank_*") if p.is_dir())
 
     if len(rank_folders) == 0:
-        raise RuntimeError(
-            f"No rank folders found inside: {rank_root}"
-        )
+        raise RuntimeError(f"No rank folders found inside: {rank_root}")
 
     task_id_str = str(task_id).lower().strip()
 
@@ -806,14 +560,9 @@ def merge_rank_folders(
                 dst = final_validation / src.name
 
                 if dst.exists() and not overwrite:
-                    raise RuntimeError(
-                        f"Duplicate output file during rank merge: {dst}"
-                    )
+                    raise RuntimeError(f"Duplicate output file during rank merge: {dst}")
 
-                shutil.copy2(
-                    src,
-                    dst,
-                )
+                shutil.copy2(src, dst)
 
                 copied_validation += 1
 
@@ -828,14 +577,9 @@ def merge_rank_folders(
                 dst = final_prediction / src.name
 
                 if dst.exists() and not overwrite:
-                    raise RuntimeError(
-                        f"Duplicate output file during rank merge: {dst}"
-                    )
+                    raise RuntimeError(f"Duplicate output file during rank merge: {dst}")
 
-                shutil.copy2(
-                    src,
-                    dst,
-                )
+                shutil.copy2(src, dst)
 
                 copied_prediction += 1
 
@@ -850,14 +594,9 @@ def merge_rank_folders(
                 dst = final_submission / src.name
 
                 if dst.exists() and not overwrite:
-                    raise RuntimeError(
-                        f"Duplicate output file during rank merge: {dst}"
-                    )
+                    raise RuntimeError(f"Duplicate output file during rank merge: {dst}")
 
-                shutil.copy2(
-                    src,
-                    dst,
-                )
+                shutil.copy2(src, dst)
 
                 copied_submission += 1
 
@@ -870,11 +609,8 @@ def merge_rank_folders(
             "or rank 0 merged before other ranks finished writing."
         )
 
-    return {
-        "validation": copied_validation,
-        "prediction": copied_prediction,
-        "submission": copied_submission,
-    }
+    return {"validation": copied_validation, "prediction": copied_prediction, "submission": copied_submission}
+
 
 # =============================================================================
 # Segmentation -> 0/255 conversion
@@ -921,23 +657,14 @@ class SegmentationImageIO:
         image = sitk.ReadImage(str(path))
 
         if reset_direction:
-            image.SetDirection(
-                tuple(np.eye(image.GetDimension()).flatten())
-            )
+            image.SetDirection(tuple(np.eye(image.GetDimension()).flatten()))
 
         return image
 
     def write_volume(self, image, path):
         sitk.WriteImage(image, str(path), useCompression=True)
 
-    def build_segmentation_image(
-        self,
-        array,
-        reference=None,
-        spacing=None,
-        origin=None,
-        direction=None,
-    ):
+    def build_segmentation_image(self, array, reference=None, spacing=None, origin=None, direction=None):
         image = sitk.GetImageFromArray(array.astype(np.uint8, copy=False))
 
         if reference is not None:
@@ -953,29 +680,13 @@ class SegmentationImageIO:
 
         return image
 
-    def write_segmentation_file(
-        self,
-        array,
-        path,
-        spacing,
-        origin,
-        direction,
-    ):
-        image = self.build_segmentation_image(
-            array,
-            spacing=spacing,
-            origin=origin,
-            direction=direction,
-        )
+    def write_segmentation_file(self, array, path, spacing, origin, direction):
+        image = self.build_segmentation_image(array, spacing=spacing, origin=origin, direction=direction)
 
         self.write_volume(image, path)
 
     def write_png(self, array, path):
-        skimage_imsave(
-            str(path),
-            array.astype(np.uint8, copy=False),
-            check_contrast=False,
-        )
+        skimage_imsave(str(path), array.astype(np.uint8, copy=False), check_contrast=False)
 
 
 segmentation_io = SegmentationImageIO()
@@ -985,12 +696,7 @@ segmentation_io = SegmentationImageIO()
 # Prediction zip writer
 # =============================================================================
 def write_prediction_case_zip(
-    prediction,
-    zip_dir,
-    configuration_manager,
-    include_gt=False,
-    keep_temp_folder=False,
-    reset_direction=False,
+    prediction, zip_dir, configuration_manager, include_gt=False, keep_temp_folder=False, reset_direction=False
 ):
     """
     Write one prediction dictionary as one Slicer-friendly case zip.
@@ -1004,10 +710,7 @@ def write_prediction_case_zip(
 
     zip_dir = Path(zip_dir)
 
-    zip_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    zip_dir.mkdir(parents=True, exist_ok=True)
 
     zip_file = zip_dir / f"{case_id}.zip"
     tmp_zip_file = zip_dir / f"{case_id}.zip.tmp_{os.getpid()}"
@@ -1017,10 +720,7 @@ def write_prediction_case_zip(
     if case_tmp_dir.exists():
         shutil.rmtree(case_tmp_dir)
 
-    case_tmp_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    case_tmp_dir.mkdir(parents=True, exist_ok=True)
 
     if tmp_zip_file.exists():
         tmp_zip_file.unlink()
@@ -1030,16 +730,12 @@ def write_prediction_case_zip(
     image_files = prediction.get("image_files", None)
 
     while (
-        isinstance(image_files, (list, tuple))
-        and len(image_files) == 1
-        and isinstance(image_files[0], (list, tuple))
+        isinstance(image_files, (list, tuple)) and len(image_files) == 1 and isinstance(image_files[0], (list, tuple))
     ):
         image_files = image_files[0]
 
     if image_files is None:
-        raise RuntimeError(
-            "prediction['image_files'] is missing or empty."
-        )
+        raise RuntimeError("prediction['image_files'] is missing or empty.")
 
     if isinstance(image_files, (str, Path)):
         image_files = [image_files]
@@ -1047,18 +743,14 @@ def write_prediction_case_zip(
     image_files = [Path(str(p)) for p in image_files]
 
     if len(image_files) == 0:
-        raise RuntimeError(
-            "prediction['image_files'] is empty."
-        )
+        raise RuntimeError("prediction['image_files'] is empty.")
 
     display_image_files = []
     reference_image = None
 
     for idx, src in enumerate(image_files):
         if not src.exists():
-            raise FileNotFoundError(
-                f"Raw image file not found: {src}"
-            )
+            raise FileNotFoundError(f"Raw image file not found: {src}")
 
         dst = case_tmp_dir / f"image_view_{idx:04d}.nii.gz"
 
@@ -1087,39 +779,20 @@ def write_prediction_case_zip(
             probs = probs[0]
 
         for c in range(probs.shape[0]):
-            prob_array = np.asarray(
-                probs[c],
-                dtype=np.float32,
-            )
+            prob_array = np.asarray(probs[c], dtype=np.float32)
 
-            prob_array = np.clip(
-                prob_array,
-                0.0,
-                1.0,
-            )
+            prob_array = np.clip(prob_array, 0.0, 1.0)
 
             # Store probability as scalar uint8:
             # 0.0 -> 1
             # 1.0 -> 255
             # Colors are applied later by MRML colorNodeRef.
-            prob_display = np.rint(
-                1.0 + prob_array * 254.0
-            ).clip(
-                1,
-                255,
-            ).astype(np.uint8)
+            prob_display = np.rint(1.0 + prob_array * 254.0).clip(1, 255).astype(np.uint8)
 
-            if (
-                reference_image.GetDimension() == 2
-                and prob_display.ndim == 3
-                and prob_display.shape[0] == 1
-            ):
+            if reference_image.GetDimension() == 2 and prob_display.ndim == 3 and prob_display.shape[0] == 1:
                 prob_display = prob_display[0]
 
-            prob_img = segmentation_io.build_segmentation_image(
-                prob_display,
-                reference=reference_image,
-            )
+            prob_img = segmentation_io.build_segmentation_image(prob_display, reference=reference_image)
 
             prob_file = case_tmp_dir / f"probability_{c:04d}.nii.gz"
 
@@ -1136,64 +809,31 @@ def write_prediction_case_zip(
 
     prediction_seg_file = case_tmp_dir / "prediction.seg.nrrd"
 
-    prediction_seg_image = segmentation_io.build_segmentation_image(
-        segmentation,
-        reference=reference_image,
-    )
+    prediction_seg_image = segmentation_io.build_segmentation_image(segmentation, reference=reference_image)
 
-    unique_labels = sorted(
-        int(x) for x in np.unique(segmentation)
-        if int(x) > 0
-    )
+    unique_labels = sorted(int(x) for x in np.unique(segmentation) if int(x) > 0)
 
     if len(unique_labels) == 0:
         unique_labels = [1]
 
     for segment_idx, label_value in enumerate(unique_labels):
-        prediction_seg_image.SetMetaData(
-            f"Segment{segment_idx}_ID",
-            f"Segment_{label_value}",
-        )
+        prediction_seg_image.SetMetaData(f"Segment{segment_idx}_ID", f"Segment_{label_value}")
 
-        prediction_seg_image.SetMetaData(
-            f"Segment{segment_idx}_Name",
-            f"Prediction_{label_value}",
-        )
+        prediction_seg_image.SetMetaData(f"Segment{segment_idx}_Name", f"Prediction_{label_value}")
 
-        prediction_seg_image.SetMetaData(
-            f"Segment{segment_idx}_Color",
-            segment_color_string(segment_idx),
-        )
+        prediction_seg_image.SetMetaData(f"Segment{segment_idx}_Color", segment_color_string(segment_idx))
 
-        prediction_seg_image.SetMetaData(
-            f"Segment{segment_idx}_LabelValue",
-            str(label_value),
-        )
+        prediction_seg_image.SetMetaData(f"Segment{segment_idx}_LabelValue", str(label_value))
 
-        prediction_seg_image.SetMetaData(
-            f"Segment{segment_idx}_Layer",
-            "0",
-        )
+        prediction_seg_image.SetMetaData(f"Segment{segment_idx}_Layer", "0")
 
-    prediction_seg_image.SetMetaData(
-        "Segmentation_ContainedRepresentationNames",
-        "Binary labelmap",
-    )
+    prediction_seg_image.SetMetaData("Segmentation_ContainedRepresentationNames", "Binary labelmap")
 
-    prediction_seg_image.SetMetaData(
-        "Segmentation_ConversionParameters",
-        "",
-    )
+    prediction_seg_image.SetMetaData("Segmentation_ConversionParameters", "")
 
-    prediction_seg_image.SetMetaData(
-        "Segmentation_MasterRepresentation",
-        "Binary labelmap",
-    )
+    prediction_seg_image.SetMetaData("Segmentation_MasterRepresentation", "Binary labelmap")
 
-    prediction_seg_image.SetMetaData(
-        "Segmentation_ReferenceImageExtentOffset",
-        "0 0 0",
-    )
+    prediction_seg_image.SetMetaData("Segmentation_ReferenceImageExtentOffset", "0 0 0")
 
     segmentation_io.write_volume(prediction_seg_image, prediction_seg_file)
 
@@ -1210,64 +850,31 @@ def write_prediction_case_zip(
 
         gt_seg_file = case_tmp_dir / "gt.seg.nrrd"
 
-        gt_seg_image = segmentation_io.build_segmentation_image(
-            gt,
-            reference=reference_image,
-        )
+        gt_seg_image = segmentation_io.build_segmentation_image(gt, reference=reference_image)
 
-        unique_gt_labels = sorted(
-            int(x) for x in np.unique(gt)
-            if int(x) > 0
-        )
+        unique_gt_labels = sorted(int(x) for x in np.unique(gt) if int(x) > 0)
 
         if len(unique_gt_labels) == 0:
             unique_gt_labels = [1]
 
         for segment_idx, label_value in enumerate(unique_gt_labels):
-            gt_seg_image.SetMetaData(
-                f"Segment{segment_idx}_ID",
-                f"Segment_{label_value}",
-            )
+            gt_seg_image.SetMetaData(f"Segment{segment_idx}_ID", f"Segment_{label_value}")
 
-            gt_seg_image.SetMetaData(
-                f"Segment{segment_idx}_Name",
-                f"GroundTruth_{label_value}",
-            )
+            gt_seg_image.SetMetaData(f"Segment{segment_idx}_Name", f"GroundTruth_{label_value}")
 
-            gt_seg_image.SetMetaData(
-                f"Segment{segment_idx}_Color",
-                segment_color_string(segment_idx),
-            )
+            gt_seg_image.SetMetaData(f"Segment{segment_idx}_Color", segment_color_string(segment_idx))
 
-            gt_seg_image.SetMetaData(
-                f"Segment{segment_idx}_LabelValue",
-                str(label_value),
-            )
+            gt_seg_image.SetMetaData(f"Segment{segment_idx}_LabelValue", str(label_value))
 
-            gt_seg_image.SetMetaData(
-                f"Segment{segment_idx}_Layer",
-                "0",
-            )
+            gt_seg_image.SetMetaData(f"Segment{segment_idx}_Layer", "0")
 
-        gt_seg_image.SetMetaData(
-            "Segmentation_ContainedRepresentationNames",
-            "Binary labelmap",
-        )
+        gt_seg_image.SetMetaData("Segmentation_ContainedRepresentationNames", "Binary labelmap")
 
-        gt_seg_image.SetMetaData(
-            "Segmentation_ConversionParameters",
-            "",
-        )
+        gt_seg_image.SetMetaData("Segmentation_ConversionParameters", "")
 
-        gt_seg_image.SetMetaData(
-            "Segmentation_MasterRepresentation",
-            "Binary labelmap",
-        )
+        gt_seg_image.SetMetaData("Segmentation_MasterRepresentation", "Binary labelmap")
 
-        gt_seg_image.SetMetaData(
-            "Segmentation_ReferenceImageExtentOffset",
-            "0 0 0",
-        )
+        gt_seg_image.SetMetaData("Segmentation_ReferenceImageExtentOffset", "0 0 0")
 
         segmentation_io.write_volume(gt_seg_image, gt_seg_file)
 
@@ -1316,35 +923,29 @@ def write_prediction_case_zip(
 
         visibility = "true" if idx == 0 else "false"
 
-        storage_nodes.append(
-            f'''  <VolumeArchetypeStorage
+        storage_nodes.append(f"""  <VolumeArchetypeStorage
     id="{storage_id}"
     name="{volume_name}Storage"
     fileName="{image_file.name}"
-    useCompression="1"/>'''
-        )
+    useCompression="1"/>""")
 
-        display_nodes.append(
-            f'''  <VolumeDisplay
+        display_nodes.append(f"""  <VolumeDisplay
     id="{display_id}"
     name="{volume_name}Display"
     colorNodeRef="vtkMRMLColorTableNodeGrey"
     interpolate="true"
     autoWindowLevel="false"
     window="{window}"
-    level="{level}"/>'''
-        )
+    level="{level}"/>""")
 
-        volume_nodes.append(
-            f'''  <Volume
+        volume_nodes.append(f"""  <Volume
     id="{volume_id}"
     name="{volume_name}"
     storageNodeRef="{storage_id}"
     displayNodeRef="{display_id}"
     labelMap="0"
     selectable="true"
-    visibility="{visibility}"/>'''
-        )
+    visibility="{visibility}"/>""")
 
         node_idx += 1
 
@@ -1355,35 +956,29 @@ def write_prediction_case_zip(
         volume_id = f"vtkMRMLScalarVolumeNode{node_idx}"
         display_id = f"vtkMRMLScalarVolumeDisplayNode{node_idx}"
 
-        storage_nodes.append(
-            f'''  <VolumeArchetypeStorage
+        storage_nodes.append(f"""  <VolumeArchetypeStorage
     id="{storage_id}"
     name="{volume_name}Storage"
     fileName="{prob_file.name}"
-    useCompression="1"/>'''
-        )
+    useCompression="1"/>""")
 
-        display_nodes.append(
-            f'''  <VolumeDisplay
+        display_nodes.append(f"""  <VolumeDisplay
     id="{display_id}"
     name="{volume_name}Display"
     colorNodeRef="vtkMRMLColorTableNodeFileColdToHotRainbow.txt"
     interpolate="true"
     autoWindowLevel="false"
     window="254.0"
-    level="128.0"/>'''
-        )
+    level="128.0"/>""")
 
-        volume_nodes.append(
-            f'''  <Volume
+        volume_nodes.append(f"""  <Volume
     id="{volume_id}"
     name="{volume_name}"
     storageNodeRef="{storage_id}"
     displayNodeRef="{display_id}"
     labelMap="0"
     selectable="true"
-    visibility="false"/>'''
-        )
+    visibility="false"/>""")
 
         node_idx += 1
 
@@ -1391,15 +986,12 @@ def write_prediction_case_zip(
     seg_id = f"vtkMRMLSegmentationNode{node_idx}"
     display_id = f"vtkMRMLSegmentationDisplayNode{node_idx}"
 
-    storage_nodes.append(
-        f'''  <SegmentationStorage
+    storage_nodes.append(f"""  <SegmentationStorage
     id="{storage_id}"
     name="predictionStorage"
-    fileName="{prediction_seg_file.name}"/>'''
-    )
+    fileName="{prediction_seg_file.name}"/>""")
 
-    display_nodes.append(
-        f'''  <SegmentationDisplay
+    display_nodes.append(f"""  <SegmentationDisplay
     id="{display_id}"
     name="predictionDisplay"
     visibility="true"
@@ -1409,17 +1001,14 @@ def write_prediction_case_zip(
     opacity2DOutline="1"
     visibility2DFill="true"
     visibility2DOutline="true"
-    visibility3D="true"/>'''
-    )
+    visibility3D="true"/>""")
 
-    volume_nodes.append(
-        f'''  <Segmentation
+    volume_nodes.append(f"""  <Segmentation
     id="{seg_id}"
     name="prediction"
     storageNodeRef="{storage_id}"
     displayNodeRef="{display_id}"
-    selectable="true"/>'''
-    )
+    selectable="true"/>""")
 
     node_idx += 1
 
@@ -1428,15 +1017,12 @@ def write_prediction_case_zip(
         seg_id = f"vtkMRMLSegmentationNode{node_idx}"
         display_id = f"vtkMRMLSegmentationDisplayNode{node_idx}"
 
-        storage_nodes.append(
-            f'''  <SegmentationStorage
+        storage_nodes.append(f"""  <SegmentationStorage
     id="{storage_id}"
     name="ground_truthStorage"
-    fileName="{gt_seg_file.name}"/>'''
-        )
+    fileName="{gt_seg_file.name}"/>""")
 
-        display_nodes.append(
-            f'''  <SegmentationDisplay
+        display_nodes.append(f"""  <SegmentationDisplay
     id="{display_id}"
     name="ground_truthDisplay"
     visibility="true"
@@ -1446,25 +1032,22 @@ def write_prediction_case_zip(
     opacity2DOutline="1"
     visibility2DFill="true"
     visibility2DOutline="true"
-    visibility3D="true"/>'''
-        )
+    visibility3D="true"/>""")
 
-        volume_nodes.append(
-            f'''  <Segmentation
+        volume_nodes.append(f"""  <Segmentation
     id="{seg_id}"
     name="ground_truth"
     storageNodeRef="{storage_id}"
     displayNodeRef="{display_id}"
-    selectable="true"/>'''
-        )
+    selectable="true"/>""")
 
-    mrml_text = f'''<?xml version="1.0" encoding="UTF-8"?>
+    mrml_text = f"""<?xml version="1.0" encoding="UTF-8"?>
 <MRML version="Slicer 5.0.0">
 {chr(10).join(storage_nodes)}
 {chr(10).join(display_nodes)}
 {chr(10).join(volume_nodes)}
 </MRML>
-'''
+"""
 
     mrml_file = case_tmp_dir / f"{case_id}.mrml"
 
@@ -1473,25 +1056,13 @@ def write_prediction_case_zip(
 
     written_files.append(mrml_file)
 
-    with zipfile.ZipFile(
-        tmp_zip_file,
-        "w",
-        compression=zipfile.ZIP_DEFLATED,
-    ) as zf:
+    with zipfile.ZipFile(tmp_zip_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for file_path in written_files:
             file_path = Path(file_path)
 
-            zf.write(
-                file_path,
-                arcname=str(
-                    Path(case_id) / file_path.name
-                ),
-            )
+            zf.write(file_path, arcname=str(Path(case_id) / file_path.name))
 
-    os.replace(
-        tmp_zip_file,
-        zip_file,
-    )
+    os.replace(tmp_zip_file, zip_file)
 
     if not keep_temp_folder and case_tmp_dir.exists():
         shutil.rmtree(case_tmp_dir)
@@ -1508,7 +1079,7 @@ def write_submission_prediction(
     configuration_manager,
     convert_to_255=False,
     keep_classes=None,
-    output_format="nii.gz",   # "nii.gz" or "png"
+    output_format="nii.gz",  # "nii.gz" or "png"
     file_ending=".nii.gz",
 ):
     """
@@ -1524,17 +1095,12 @@ def write_submission_prediction(
     case_id = prediction["case_id"]
 
     output_folder = Path(output_folder)
-    output_folder.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    output_folder.mkdir(parents=True, exist_ok=True)
 
     output_format = str(output_format).lower().lstrip(".")
 
     if output_format not in {"nii.gz", "png"}:
-        raise ValueError(
-            f"Unsupported output_format={output_format}. Use 'nii.gz' or 'png'."
-        )
+        raise ValueError(f"Unsupported output_format={output_format}. Use 'nii.gz' or 'png'.")
 
     segmentation = to_numpy(prediction["predicted_segments"])
     segmentation = np.asarray(segmentation)
@@ -1544,18 +1110,10 @@ def write_submission_prediction(
 
     # More than one kept class -> RGB PNG, one color per class.
     # Single kept class (or no filtering) -> single-channel {0, 255}, unchanged.
-    build_rgb = (
-        output_format == "png"
-        and keep_classes is not None
-        and len(keep_classes) > 1
-    )
+    build_rgb = output_format == "png" and keep_classes is not None and len(keep_classes) > 1
 
     if build_rgb:
-        segmentation = np.where(
-            np.isin(segmentation, keep_classes),
-            segmentation,
-            0,
-        ).astype(segmentation.dtype)
+        segmentation = np.where(np.isin(segmentation, keep_classes), segmentation, 0).astype(segmentation.dtype)
     elif keep_classes is not None:
         segmentation = np.isin(segmentation, keep_classes).astype(segmentation.dtype)
 
@@ -1574,31 +1132,21 @@ def write_submission_prediction(
 
             elif segmentation.ndim == 3:
                 if segmentation.shape[0] != 1:
-                    raise ValueError(
-                        f"2D nnU-Net writer expects [1, H, W], got {segmentation.shape}"
-                    )
+                    raise ValueError(f"2D nnU-Net writer expects [1, H, W], got {segmentation.shape}")
 
             else:
-                raise ValueError(
-                    f"2D nnU-Net writer expects [H, W] or [1, H, W], got {segmentation.shape}"
-                )
+                raise ValueError(f"2D nnU-Net writer expects [H, W] or [1, H, W], got {segmentation.shape}")
 
         elif plan_dim == 3:
             if segmentation.ndim != 3:
-                raise ValueError(
-                    f"3D nnU-Net writer expects [D, H, W], got {segmentation.shape}"
-                )
+                raise ValueError(f"3D nnU-Net writer expects [D, H, W], got {segmentation.shape}")
 
         else:
-            raise ValueError(
-                f"Unsupported nnU-Net plan dimension: {configuration_manager.patch_size}"
-            )
+            raise ValueError(f"Unsupported nnU-Net plan dimension: {configuration_manager.patch_size}")
 
         pred_file = output_folder / f"{case_id}-pred{file_ending}"
 
-        tmp_pred_file = output_folder / (
-            f"{case_id}-pred.tmp_{os.getpid()}{file_ending}"
-        )
+        tmp_pred_file = output_folder / (f"{case_id}-pred.tmp_{os.getpid()}{file_ending}")
 
         sitk_stuff = prediction["properties"]["sitk_stuff"]
 
@@ -1612,10 +1160,7 @@ def write_submission_prediction(
             direction=sitk_stuff["direction"],
         )
 
-        os.replace(
-            tmp_pred_file,
-            pred_file,
-        )
+        os.replace(tmp_pred_file, pred_file)
 
         return pred_file
 
@@ -1635,33 +1180,22 @@ def write_submission_prediction(
                 segmentation = segmentation[0]
 
             if segmentation.ndim != 2:
-                raise ValueError(
-                    f"RGB PNG writer expects [H, W], got {segmentation.shape}"
-                )
+                raise ValueError(f"RGB PNG writer expects [H, W], got {segmentation.shape}")
 
             rgb = np.zeros(segmentation.shape + (3,), dtype=np.uint8)
 
             for color_idx, class_value in enumerate(keep_classes):
-                color = SEGMENT_COLOR_PALETTE[
-                    color_idx % len(SEGMENT_COLOR_PALETTE)
-                ]
+                color = SEGMENT_COLOR_PALETTE[color_idx % len(SEGMENT_COLOR_PALETTE)]
 
-                rgb[segmentation == class_value] = tuple(
-                    int(round(c * 255)) for c in color
-                )
+                rgb[segmentation == class_value] = tuple(int(round(c * 255)) for c in color)
 
             pred_file = output_folder / f"{case_id}_label_bin.png"
 
-            tmp_pred_file = output_folder / (
-                f"{case_id}_label_bin.tmp_{os.getpid()}.png"
-            )
+            tmp_pred_file = output_folder / (f"{case_id}_label_bin.tmp_{os.getpid()}.png")
 
             segmentation_io.write_png(rgb, tmp_pred_file)
 
-            os.replace(
-                tmp_pred_file,
-                pred_file,
-            )
+            os.replace(tmp_pred_file, pred_file)
 
             return pred_file
 
@@ -1675,26 +1209,17 @@ def write_submission_prediction(
 
         elif segmentation.ndim == 3:
             if segmentation.shape[0] != 1:
-                raise ValueError(
-                    f"PNG writer expects [H, W] or [1, H, W], got {segmentation.shape}"
-                )
+                raise ValueError(f"PNG writer expects [H, W] or [1, H, W], got {segmentation.shape}")
 
         else:
-            raise ValueError(
-                f"PNG writer expects [H, W] or [1, H, W], got {segmentation.shape}"
-            )
+            raise ValueError(f"PNG writer expects [H, W] or [1, H, W], got {segmentation.shape}")
 
         pred_file = output_folder / f"{case_id}_label_bin.png"
 
-        tmp_pred_file = output_folder / (
-            f"{case_id}_label_bin.tmp_{os.getpid()}.png"
-        )
+        tmp_pred_file = output_folder / (f"{case_id}_label_bin.tmp_{os.getpid()}.png")
 
         segmentation_io.write_png(segmentation[0], tmp_pred_file)
 
-        os.replace(
-            tmp_pred_file,
-            pred_file,
-        )
+        os.replace(tmp_pred_file, pred_file)
 
         return pred_file

@@ -3,15 +3,12 @@ from pathlib import Path
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
-
 CONFIG_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_NAME = "experiment"
 
 
 def build_config(
-    config_name: str = DEFAULT_CONFIG_NAME,
-    overrides: list[str] | None = None,
-    resolve: bool = True,
+    config_name: str = DEFAULT_CONFIG_NAME, overrides: list[str] | None = None, resolve: bool = True
 ) -> DictConfig:
     """
     Build MVAA experiment config using Hydra + OmegaConf.
@@ -32,14 +29,8 @@ def build_config(
     if overrides is None:
         overrides = []
 
-    with initialize_config_dir(
-        version_base=None,
-        config_dir=str(CONFIG_DIR),
-    ):
-        cfg = compose(
-            config_name=config_name,
-            overrides=overrides,
-        )
+    with initialize_config_dir(version_base=None, config_dir=str(CONFIG_DIR)):
+        cfg = compose(config_name=config_name, overrides=overrides)
 
     if resolve:
         OmegaConf.resolve(cfg)
@@ -54,7 +45,4 @@ def print_config(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg, resolve=True))
 
 
-__all__ = [
-    "build_config",
-    "print_config",
-]
+__all__ = ["build_config", "print_config"]

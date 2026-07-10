@@ -29,9 +29,7 @@ from data_preparation.utils import (
     read_labels_from_mask_path,
 )
 
-
 app = typer.Typer(help="Prepare MVAA Task 3 VIDEO dataset in nnU-Net format.")
-
 
 
 DATASET_ID = "Dataset003_MVAA_VIDEO_SSL"
@@ -45,12 +43,7 @@ CASE_SUFFIXES = [".png", ".jpg", ".jpeg", "_png_Label.tar"]
 # highest-support 3-class combination that still co-occurs in the same
 # frame (78/180 frames, 43.3%). All 3 must be present for a case to be
 # kept for training.
-VIDEO_MULTI_CLASS_LABELS = {
-    "background": 0,
-    "class_10": 1,
-    "class_11": 2,
-    "class_2": 3,
-}
+VIDEO_MULTI_CLASS_LABELS = {"background": 0, "class_10": 1, "class_11": 2, "class_2": 3}
 
 VIDEO_LABEL_VALUE_TO_CLASS = {
     int(name.removeprefix("class_")): class_idx
@@ -60,9 +53,8 @@ VIDEO_LABEL_VALUE_TO_CLASS = {
 
 VIDEO_REQUIRED_LABEL_VALUES = set(VIDEO_LABEL_VALUE_TO_CLASS.keys())
 
-VIDEO_EXCLUDED_CASE_NAMES = {
-    "REC_20250322_101917_746A_000130",
-}
+VIDEO_EXCLUDED_CASE_NAMES = {"REC_20250322_101917_746A_000130"}
+
 
 def align_video_spatial_shape(arr, target_format="hw"):
     if target_format not in ("hw", "wh"):
@@ -80,15 +72,12 @@ def align_video_spatial_shape(arr, target_format="hw"):
 def get_dataset_number(dataset_id):
     return int(dataset_id.replace("Dataset", "")[:3])
 
+
 def write_dummy_mask_from_image(image_path, mask_path):
-    img   = nib.load(str(image_path))
+    img = nib.load(str(image_path))
     dummy = np.zeros(img.shape, dtype=np.uint8)
 
-    dummy_nii = nib.Nifti1Image(
-        dummy,
-        affine=img.affine,
-        header=img.header,
-    )
+    dummy_nii = nib.Nifti1Image(dummy, affine=img.affine, header=img.header)
 
     dummy_nii.set_data_dtype(np.uint8)
 
@@ -102,15 +91,7 @@ def run_nnunet_plan_and_preprocess(dataset_id, num_processes):
     exe = shutil.which("nnUNetv2_plan_and_preprocess")
 
     if exe is not None:
-        cmd = [
-            exe,
-            "-d",
-            str(dataset_number),
-            "-np",
-            str(num_processes),
-            "-npfp",
-            str(num_processes),
-        ]
+        cmd = [exe, "-d", str(dataset_number), "-np", str(num_processes), "-npfp", str(num_processes)]
     else:
         cmd = [
             sys.executable,
@@ -132,14 +113,7 @@ def run_nnunet_plan_and_preprocess(dataset_id, num_processes):
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=env,
-    )
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
 
     assert process.stdout is not None
 
@@ -155,7 +129,7 @@ def run_nnunet_plan_and_preprocess(dataset_id, num_processes):
 
 
 def collect_extra_unlabeled_video(data_root):
-    rows      = []
+    rows = []
     data_root = Path(data_root)
     image_dir = data_root / "images"
 
@@ -164,54 +138,33 @@ def collect_extra_unlabeled_video(data_root):
         return rows
 
     image_paths = [
-        p
-        for p in sorted(image_dir.rglob("*"))
-        if p.is_file() and p.name.lower().endswith((".png", ".jpg", ".jpeg"))
+        p for p in sorted(image_dir.rglob("*")) if p.is_file() and p.name.lower().endswith((".png", ".jpg", ".jpeg"))
     ]
 
     for p in image_paths:
         rows.append(
-            {
-                "split": "TrU",
-                "file_type": "image",
-                "case_name": make_case_name(p, CASE_SUFFIXES),
-                "file_path": str(p),
-            }
+            {"split": "TrU", "file_type": "image", "case_name": make_case_name(p, CASE_SUFFIXES), "file_path": str(p)}
         )
 
-    log_ok(
-        f"Extra unlabeled video images: total={len(image_paths)}"
-    )
+    log_ok(f"Extra unlabeled video images: total={len(image_paths)}")
     return rows
 
 
 def filter_video_excluded_cases(rows):
-    excluded_case_names = {
-        r["case_name"] for r in rows
-        if r["case_name"] in VIDEO_EXCLUDED_CASE_NAMES
-    }
+    excluded_case_names = {r["case_name"] for r in rows if r["case_name"] in VIDEO_EXCLUDED_CASE_NAMES}
 
     if excluded_case_names:
-        log_warn(
-            f"Excluding {len(excluded_case_names)} known-bad video case(s): "
-            f"{sorted(excluded_case_names)}"
-        )
+        log_warn(f"Excluding {len(excluded_case_names)} known-bad video case(s): " f"{sorted(excluded_case_names)}")
 
-    return [
-        row for row in rows
-        if row["case_name"] not in VIDEO_EXCLUDED_CASE_NAMES
-    ]
+    return [row for row in rows if row["case_name"] not in VIDEO_EXCLUDED_CASE_NAMES]
 
 
 def filter_video_multiclass_cases(rows):
     required_values = set(VIDEO_REQUIRED_LABEL_VALUES)
 
-    mask_rows = [
-        r for r in rows
-        if r["split"] == "TrL" and r["file_type"] == "mask"
-    ]
+    mask_rows = [r for r in rows if r["split"] == "TrL" and r["file_type"] == "mask"]
 
-    valid_case_names   = set()
+    valid_case_names = set()
     dropped_case_names = set()
 
     for row in mask_rows:
@@ -228,15 +181,12 @@ def filter_video_multiclass_cases(rows):
             f"of labels {sorted(required_values)}: {sorted(dropped_case_names)}"
         )
 
-    return [
-        row for row in rows
-        if not (row["split"] == "TrL" and row["case_name"] not in valid_case_names)
-    ]
+    return [row for row in rows if not (row["split"] == "TrL" and row["case_name"] not in valid_case_names)]
 
 
 def collect_video_files(data_root):
     reference_dir = Path(data_root) / "reference_data"
-    task_dirs     = find_task_dirs(reference_dir, PATTERNS)
+    task_dirs = find_task_dirs(reference_dir, PATTERNS)
 
     rows = []
 
@@ -245,17 +195,17 @@ def collect_video_files(data_root):
 
     for task_dir in task_dirs:
         train_dir = task_dir / "train"
-        test_dir  = task_dir / "val" / "images"
+        test_dir = task_dir / "val" / "images"
 
         for p in sorted(train_dir.glob("*/*.png")):
             parent_name = p.parent.name
 
             rows.append(
                 {
-                    "split":       "TrL",
-                    "file_type":   "image",
-                    "case_name":   f"{make_case_name(p, CASE_SUFFIXES)}",
-                    "file_path":   str(p),
+                    "split": "TrL",
+                    "file_type": "image",
+                    "case_name": f"{make_case_name(p, CASE_SUFFIXES)}",
+                    "file_path": str(p),
                 }
             )
 
@@ -264,32 +214,31 @@ def collect_video_files(data_root):
 
             rows.append(
                 {
-                    "split":       "TrL",
-                    "file_type":   "mask",
-                    "case_name":   f"{make_case_name(p, CASE_SUFFIXES)}",
-                    "file_path":   str(p),
+                    "split": "TrL",
+                    "file_type": "mask",
+                    "case_name": f"{make_case_name(p, CASE_SUFFIXES)}",
+                    "file_path": str(p),
                 }
             )
 
         for p in sorted(test_dir.glob("*/*.png")):
             rows.append(
                 {
-                    "split":       "Ts",
-                    "file_type":   "image",
-                    "case_name":   f"{make_case_name(p, CASE_SUFFIXES)}",
-                    "file_path":   str(p),
+                    "split": "Ts",
+                    "file_type": "image",
+                    "case_name": f"{make_case_name(p, CASE_SUFFIXES)}",
+                    "file_path": str(p),
                 }
             )
 
             rows.append(
                 {
-                    "split":       "TrU",
-                    "file_type":   "image",
-                    "case_name":   f"{make_case_name(p, CASE_SUFFIXES)}",
-                    "file_path":   str(p),
+                    "split": "TrU",
+                    "file_type": "image",
+                    "case_name": f"{make_case_name(p, CASE_SUFFIXES)}",
+                    "file_path": str(p),
                 }
             )
-
 
     rows = filter_video_excluded_cases(rows)
     rows = filter_video_multiclass_cases(rows)
@@ -297,7 +246,6 @@ def collect_video_files(data_root):
     rows.extend(collect_extra_unlabeled_video(data_root))
 
     return rows
-
 
 
 def write_video_rgb_image_as_nnunet_channels(src_path, dst_path):
@@ -336,11 +284,7 @@ def _read_first_nifti_from_tar(tar_path):
     tar_path = Path(tar_path)
 
     with tarfile.open(tar_path, "r:*") as tar:
-        members = [
-            m
-            for m in tar.getmembers()
-            if m.isfile() and m.name.lower().endswith(".nii.gz")
-        ]
+        members = [m for m in tar.getmembers() if m.isfile() and m.name.lower().endswith(".nii.gz")]
 
         if len(members) == 0:
             raise ValueError(f"No .nii.gz found inside tar mask: {tar_path}")
@@ -409,10 +353,7 @@ def prepare_video_dataset(data_root, nnunet_raw, test=False, num_processes=None)
         write_image_fn=write_video_rgb_image_as_nnunet_channels,
         write_real_mask_fn=write_video_multiclass_mask_from_tar,
         write_dummy_mask_fn=write_dummy_mask_from_image,
-        description_extra=(
-            "Task 3 VIDEO RGB multi-class dataset (task labels 10, 11; "
-            "auxiliary label 2)."
-        ),
+        description_extra=("Task 3 VIDEO RGB multi-class dataset (task labels 10, 11; " "auxiliary label 2)."),
         num_processes=num_processes,
     )
 
@@ -431,11 +372,7 @@ def main(
         "--output-dir",
         help="Final nnU-Net root containing nnUNet_raw, nnUNet_preprocessed, and nnUNet_results.",
     ),
-    test: bool = typer.Option(
-        False,
-        "--test",
-        help="Prepare only a few samples per split.",
-    ),
+    test: bool = typer.Option(False, "--test", help="Prepare only a few samples per split."),
     num_processes: int = typer.Option(
         os.cpu_count() or 1,
         "--num-processes",
@@ -464,24 +401,14 @@ def main(
     log_info("keep_nnunet_raw     : True")
     log_info("keep_nnunet_results : True")
 
-    set_nnunet_env(
-        nnunet_raw=nnunet_raw,
-        nnunet_preprocessed=nnunet_preprocessed,
-        nnunet_results=nnunet_results,
-    )
+    set_nnunet_env(nnunet_raw=nnunet_raw, nnunet_preprocessed=nnunet_preprocessed, nnunet_results=nnunet_results)
 
     dataset_dir = prepare_video_dataset(
-        data_root=data_root,
-        nnunet_raw=nnunet_raw,
-        test=test,
-        num_processes=num_processes,
+        data_root=data_root, nnunet_raw=nnunet_raw, test=test, num_processes=num_processes
     )
 
     if dataset_dir is not None:
-        run_nnunet_plan_and_preprocess(
-            dataset_id=DATASET_ID,
-            num_processes=num_processes,
-        )
+        run_nnunet_plan_and_preprocess(dataset_id=DATASET_ID, num_processes=num_processes)
 
     log_ok(f"Raw nnU-Net dataset is in: {nnunet_raw / DATASET_ID}")
     log_ok(f"Preprocessed dataset is in: {nnunet_preprocessed / DATASET_ID}")

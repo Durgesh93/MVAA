@@ -21,9 +21,8 @@ from data_preparation.utils import (
     write_nifti_mask_copy,
     write_dummy_mask_from_image,
     set_nnunet_env,
-    reassign_training_case_names_sequentially
+    reassign_training_case_names_sequentially,
 )
-
 
 app = typer.Typer(help="Prepare MVAA Task 1 CT dataset in nnU-Net format.")
 
@@ -31,8 +30,10 @@ DATASET_ID = "Dataset001_MVAA_CT_SSL"
 PATTERNS = ["t1_ct", "*ct*"]
 CASE_SUFFIXES = ["-seg.nii.gz", ".nii.gz"]
 
+
 def get_dataset_number(dataset_id):
     return int(dataset_id.replace("Dataset", "")[:3])
+
 
 def run_nnunet_plan_and_preprocess(dataset_id, num_processes):
     dataset_number = get_dataset_number(dataset_id)
@@ -40,15 +41,7 @@ def run_nnunet_plan_and_preprocess(dataset_id, num_processes):
     exe = shutil.which("nnUNetv2_plan_and_preprocess")
 
     if exe is not None:
-        cmd = [
-            exe,
-            "-d",
-            str(dataset_number),
-            "-np",
-            str(num_processes),
-            "-npfp",
-            str(num_processes),
-        ]
+        cmd = [exe, "-d", str(dataset_number), "-np", str(num_processes), "-npfp", str(num_processes)]
     else:
         cmd = [
             sys.executable,
@@ -70,14 +63,7 @@ def run_nnunet_plan_and_preprocess(dataset_id, num_processes):
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=env,
-    )
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
 
     assert process.stdout is not None
 
@@ -94,7 +80,7 @@ def run_nnunet_plan_and_preprocess(dataset_id, num_processes):
 
 def collect_ct_files(data_root):
     reference_dir = Path(data_root) / "reference_data"
-    task_dirs     = find_task_dirs(reference_dir, PATTERNS)
+    task_dirs = find_task_dirs(reference_dir, PATTERNS)
 
     rows = []
     if len(task_dirs) == 0:
@@ -141,7 +127,6 @@ def collect_ct_files(data_root):
         for p in sorted(test_unlabeled_image_dir.glob("*.nii.gz")):
             rows.append(
                 {
-
                     "split": "TrU",
                     "file_type": "image",
                     "case_name": make_case_name(p, CASE_SUFFIXES),
@@ -206,11 +191,7 @@ def main(
         "--output-dir",
         help="Final nnU-Net root containing nnUNet_raw, nnUNet_preprocessed, and nnUNet_results.",
     ),
-    test: bool = typer.Option(
-        False,
-        "--test",
-        help="Prepare only a few samples per split.",
-    ),
+    test: bool = typer.Option(False, "--test", help="Prepare only a few samples per split."),
     num_processes: int = typer.Option(
         os.cpu_count() or 1,
         "--num-processes",
@@ -239,24 +220,12 @@ def main(
     log_info("keep_nnunet_raw     : True")
     log_info("keep_nnunet_results : True")
 
-    set_nnunet_env(
-        nnunet_raw=nnunet_raw,
-        nnunet_preprocessed=nnunet_preprocessed,
-        nnunet_results=nnunet_results,
-    )
+    set_nnunet_env(nnunet_raw=nnunet_raw, nnunet_preprocessed=nnunet_preprocessed, nnunet_results=nnunet_results)
 
-    dataset_dir = prepare_ct_dataset(
-        data_root=data_root,
-        nnunet_raw=nnunet_raw,
-        test=test,
-        num_processes=num_processes,
-    )
+    dataset_dir = prepare_ct_dataset(data_root=data_root, nnunet_raw=nnunet_raw, test=test, num_processes=num_processes)
 
     if dataset_dir is not None:
-        run_nnunet_plan_and_preprocess(
-            dataset_id=DATASET_ID,
-            num_processes=num_processes,
-        )
+        run_nnunet_plan_and_preprocess(dataset_id=DATASET_ID, num_processes=num_processes)
 
     log_ok(f"Raw nnU-Net dataset is in: {nnunet_raw / DATASET_ID}")
     log_ok(f"Preprocessed dataset is in: {nnunet_preprocessed / DATASET_ID}")

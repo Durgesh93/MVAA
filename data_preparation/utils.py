@@ -13,7 +13,6 @@ import pandas as pd
 from tqdm import tqdm
 import typer
 
-
 TEST_N = 5
 
 METADATA_COLS = [
@@ -32,6 +31,7 @@ METADATA_COLS = [
 # =============================================================================
 # Typer logging helpers
 # =============================================================================
+
 
 def log_section(title):
     typer.echo()
@@ -75,6 +75,7 @@ def print_group_counts(df, group_cols, title):
 # =============================================================================
 # Common helpers
 # =============================================================================
+
 
 def prepare_output_dirs(output_dir, dataset_id):
     dataset_dir = Path(output_dir) / dataset_id
@@ -151,10 +152,7 @@ def read_labels_from_mask_path(mask_path):
     if str(mask_path).lower().endswith(".tar"):
         try:
             with tarfile.open(mask_path, "r:*") as tar:
-                members = [
-                    m for m in tar.getmembers()
-                    if m.isfile() and m.name.lower().endswith(".nii.gz")
-                ]
+                members = [m for m in tar.getmembers() if m.isfile() and m.name.lower().endswith(".nii.gz")]
 
                 if len(members) == 0:
                     log_warn(f"No .nii.gz found inside tar: {mask_path}")
@@ -201,17 +199,14 @@ def check_mask_foreground(mask_path):
 
 def detect_labels_from_sample_df(sample_df):
     labeled_df = sample_df[
-        (sample_df["split"] == "TrL") &
-        (sample_df["original_mask_path"].notna()) &
-        (sample_df["original_mask_path"].astype(str).str.strip().ne(""))
+        (sample_df["split"] == "TrL")
+        & (sample_df["original_mask_path"].notna())
+        & (sample_df["original_mask_path"].astype(str).str.strip().ne(""))
     ].copy()
 
     if labeled_df.empty:
         log_warn(f"No labeled masks found Falling back to binary labels.")
-        return {
-            "background": 0,
-            "foreground": 1,
-        }
+        return {"background": 0, "foreground": 1}
 
     all_seen_labels = set()
     checked_masks = 0
@@ -220,11 +215,7 @@ def detect_labels_from_sample_df(sample_df):
 
     log_info(f"Scanning all real TrL masks for labels...")
 
-    for _, row in tqdm(
-        labeled_df.iterrows(),
-        total=len(labeled_df),
-        desc=f"Detecting labels",
-    ):
+    for _, row in tqdm(labeled_df.iterrows(), total=len(labeled_df), desc=f"Detecting labels"):
         mask_path = Path(row["original_mask_path"])
 
         if not mask_path.exists():
@@ -273,6 +264,7 @@ def detect_labels_from_sample_df(sample_df):
 
     return labels
 
+
 def build_sample_dataframe(rows):
     file_df = pd.DataFrame(rows)
 
@@ -282,23 +274,11 @@ def build_sample_dataframe(rows):
     image_df = image_df.rename(columns={"file_path": "original_image_path"})
     mask_df = mask_df.rename(columns={"file_path": "original_mask_path"})
 
-    image_cols = [
-        "split",
-        "case_name",
-        "original_image_path",
-    ]
+    image_cols = ["split", "case_name", "original_image_path"]
 
-    mask_cols = [
-        "split",
-        "case_name",
-        "original_mask_path",
-    ]
+    mask_cols = ["split", "case_name", "original_mask_path"]
 
-    sample_df = image_df[image_cols].merge(
-        mask_df[mask_cols],
-        on=["split", "case_name"],
-        how="left",
-    )
+    sample_df = image_df[image_cols].merge(mask_df[mask_cols], on=["split", "case_name"], how="left")
 
     sample_df["original_image_path"] = sample_df["original_image_path"].fillna("")
     sample_df["original_mask_path"] = sample_df["original_mask_path"].fillna("")
@@ -316,36 +296,22 @@ def reassign_training_case_names_sequentially(sample_df):
 
     sample_df = sample_df.copy()
 
-    split_order = {
-        "TrL": 0,
-        "TrU": 1,
-        "Ts":  2,
-    }
+    split_order = {"TrL": 0, "TrU": 1, "Ts": 2}
 
     sample_df["_split_order"] = sample_df["split"].map(split_order)
 
-    sample_df = sample_df.sort_values(
-        ["_split_order", "case_name"]
-    ).reset_index(drop=True)
+    sample_df = sample_df.sort_values(["_split_order", "case_name"]).reset_index(drop=True)
 
     train_mask = sample_df["split"].isin(["TrL", "TrU"])
     n_train = train_mask.sum()
 
-
-    train_case_names = (
-        sample_df.loc[train_mask, "case_name"]
-        .drop_duplicates()
-        .tolist()
-    )
+    train_case_names = sample_df.loc[train_mask, "case_name"].drop_duplicates().tolist()
 
     if len(train_case_names) == 0:
         raise RuntimeError("No TrL/TrU cases found for renaming.")
 
-    sample_df.loc[train_mask, "case_name"] = [
-        f"{i:04d}"
-        for i in range(n_train)
-    ]
-    
+    sample_df.loc[train_mask, "case_name"] = [f"{i:04d}" for i in range(n_train)]
+
     sample_df = sample_df.drop(columns=["_split_order"])
     log_ok(f"Training case names reassigned sequentially.")
     log_info("  TrL first, then TrU.")
@@ -353,18 +319,11 @@ def reassign_training_case_names_sequentially(sample_df):
     return sample_df
 
 
-
 def channel_names(data_type):
     if data_type == "video":
-        return {
-            "0": "red",
-            "1": "green",
-            "2": "blue",
-        }
+        return {"0": "red", "1": "green", "2": "blue"}
 
-    return {
-        "0": "image",
-    }
+    return {"0": "image"}
 
 
 def get_image_paths(dataset_dir, split, case_name, data_type):
@@ -387,7 +346,7 @@ def get_image_paths(dataset_dir, split, case_name, data_type):
 
 
 def fix_mask_shape_if_needed(image_path, mask_path):
-    
+
     if mask_path is None or not Path(mask_path).exists():
         return ""
 
@@ -396,17 +355,14 @@ def fix_mask_shape_if_needed(image_path, mask_path):
 
     image = np.squeeze(np.asanyarray(image_nii.dataobj))
     mask = np.squeeze(np.asanyarray(mask_nii.dataobj))
-   
+
     if image.shape == mask.shape:
         return "x".join(str(x) for x in mask.shape)
 
     swapped_mask = mask.swapaxes(0, 1)
 
     if image.ndim == mask.ndim and image.shape == swapped_mask.shape:
-        log_fix(
-            f"Transposing mask to match image: "
-            f"image={image.shape}, mask={mask.shape}, mask_path={mask_path}"
-        )
+        log_fix(f"Transposing mask to match image: " f"image={image.shape}, mask={mask.shape}, mask_path={mask_path}")
 
         fixed_mask = swapped_mask.astype(mask.dtype)
         fixed_nii = nib.Nifti1Image(fixed_mask, affine=image_nii.affine)
@@ -424,6 +380,7 @@ def fix_mask_shape_if_needed(image_path, mask_path):
 # Generic image/mask writers
 # =============================================================================
 
+
 def write_nifti_image_copy(src_path, dst_path):
     copy_file(src_path, dst_path)
     return dst_path
@@ -438,11 +395,7 @@ def write_dummy_mask_from_image(image_path, mask_path):
     img = nib.load(str(image_path))
     dummy = np.zeros(img.shape, dtype=np.uint8)
 
-    dummy_nii = nib.Nifti1Image(
-        dummy,
-        affine=img.affine,
-        header=img.header,
-    )
+    dummy_nii = nib.Nifti1Image(dummy, affine=img.affine, header=img.header)
 
     dummy_nii.set_data_dtype(np.uint8)
 
@@ -454,32 +407,19 @@ def write_dummy_mask_from_image(image_path, mask_path):
 # Generic dataset writer
 # =============================================================================
 
+
 def write_one_sample(
-    dataid,
-    row,
-    dataset_dir,
-    data_type,
-    write_image_fn,
-    write_real_mask_fn,
-    write_dummy_mask_fn,
-    fixed_labels=None,
+    dataid, row, dataset_dir, data_type, write_image_fn, write_real_mask_fn, write_dummy_mask_fn, fixed_labels=None
 ):
-    split     = row["split"]
+    split = row["split"]
     case_name = row["case_name"]
 
     src_image = Path(row["original_image_path"])
 
-    src_mask = (
-        Path(row["original_mask_path"])
-        if row["original_mask_path"] != ""
-        else None
-    )
+    src_mask = Path(row["original_mask_path"]) if row["original_mask_path"] != "" else None
 
     image_rel, dst_image_for_writer = get_image_paths(
-        dataset_dir=dataset_dir,
-        split=split,
-        case_name=case_name,
-        data_type=data_type,
+        dataset_dir=dataset_dir, split=split, case_name=case_name, data_type=data_type
     )
 
     mask_rel = None
@@ -489,13 +429,10 @@ def write_one_sample(
         mask_rel = Path("labelsTr") / f"{case_name}.nii.gz"
         dst_mask = dataset_dir / mask_rel
 
-    primary_image_path = write_image_fn(
-        src_path=src_image,
-        dst_path=dst_image_for_writer,
-    )
+    primary_image_path = write_image_fn(src_path=src_image, dst_path=dst_image_for_writer)
 
-    image_shape    = nifti_shape(primary_image_path)
-    mask_shape     = ""
+    image_shape = nifti_shape(primary_image_path)
+    mask_shape = ""
     has_foreground = 0
     labels_in_mask = ""
 
@@ -506,29 +443,18 @@ def write_one_sample(
             ok = write_real_mask_fn(src_mask, dst_mask)
 
             if ok:
-                mask_shape = fix_mask_shape_if_needed(
-                    image_path=primary_image_path,
-                    mask_path=dst_mask,
-                )
+                mask_shape = fix_mask_shape_if_needed(image_path=primary_image_path, mask_path=dst_mask)
 
-                has_foreground, labels_in_mask = check_mask_foreground(
-                    dst_mask
-                )
+                has_foreground, labels_in_mask = check_mask_foreground(dst_mask)
 
                 if fixed_labels is not None:
                     allowed_values = set(int(v) for v in fixed_labels.values())
-                    mask_values    = set(
-                        int(v) for v in labels_in_mask.split("|")
-                        if str(v).strip() != ""
-                    )
+                    mask_values = set(int(v) for v in labels_in_mask.split("|") if str(v).strip() != "")
 
                     unknown_values = sorted(mask_values - allowed_values)
 
                     if unknown_values:
-                        log_flag(
-                            f"Mask has labels outside fixed_labels: "
-                            f"{unknown_values}, mask={dst_mask}"
-                        )
+                        log_flag(f"Mask has labels outside fixed_labels: " f"{unknown_values}, mask={dst_mask}")
 
                 if has_foreground == 0:
                     log_flag(f"Background-only TrL mask: {dst_mask}")
@@ -536,10 +462,7 @@ def write_one_sample(
     elif split == "TrU":
         write_dummy_mask_fn(primary_image_path, dst_mask)
 
-        mask_shape = fix_mask_shape_if_needed(
-            image_path=primary_image_path,
-            mask_path=dst_mask,
-        )
+        mask_shape = fix_mask_shape_if_needed(image_path=primary_image_path, mask_path=dst_mask)
 
         has_foreground = 0
         labels_in_mask = "0"
@@ -581,12 +504,7 @@ def write_dataset(
     dataset_dir = prepare_output_dirs(output_dir, dataset_id)
 
     if test:
-        sample_df = (
-            sample_df
-            .groupby("split", group_keys=False)
-            .head(TEST_N)
-            .reset_index(drop=True)
-        )
+        sample_df = sample_df.groupby("split", group_keys=False).head(TEST_N).reset_index(drop=True)
 
     if num_processes is None:
         num_processes = os.cpu_count() or 1
@@ -599,21 +517,15 @@ def write_dataset(
     # Labels
     # ------------------------------------------------------------
     if fixed_labels is None:
-        labels = detect_labels_from_sample_df(
-            sample_df=sample_df
-        )
+        labels = detect_labels_from_sample_df(sample_df=sample_df)
     else:
         labels = fixed_labels
 
-    metadata_rows     = []
+    metadata_rows = []
     rows_for_parallel = list(sample_df.iterrows())
 
     if num_processes == 1:
-        for dataid, row in tqdm(
-            rows_for_parallel,
-            total=len(rows_for_parallel),
-            desc=f"Writing {dataset_id}",
-        ):
+        for dataid, row in tqdm(rows_for_parallel, total=len(rows_for_parallel), desc=f"Writing {dataset_id}"):
             metadata_row = write_one_sample(
                 dataid=dataid,
                 row=row,
@@ -644,11 +556,7 @@ def write_dataset(
                 for dataid, row in rows_for_parallel
             ]
 
-            for future in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc=f"Writing {dataset_id}",
-            ):
+            for future in tqdm(as_completed(futures), total=len(futures), desc=f"Writing {dataset_id}"):
                 metadata_rows.append(future.result())
 
     metadata_df = pd.DataFrame(metadata_rows)
@@ -659,29 +567,17 @@ def write_dataset(
         metadata_df = metadata_df[METADATA_COLS]
         metadata_df = metadata_df.sort_values("dataid").reset_index(drop=True)
 
-    counts = {
-        "TrL": 0,
-        "TrU": 0,
-        "Ts":  0,
-    }
+    counts = {"TrL": 0, "TrU": 0, "Ts": 0}
 
-    ssl_case_ids = {
-        "TrL": [],
-        "TrU": [],
-        "Ts":  [],
-    }
+    ssl_case_ids = {"TrL": [], "TrU": [], "Ts": []}
 
     # ------------------------------------------------------------
     # Count unique cases, not image/mask rows
     # ------------------------------------------------------------
     for split in ["TrL", "TrU", "Ts"]:
-        case_names = (
-            metadata_df.loc[metadata_df["split"] == split, "case_name"]
-            .drop_duplicates()
-            .tolist()
-        )
+        case_names = metadata_df.loc[metadata_df["split"] == split, "case_name"].drop_duplicates().tolist()
 
-        counts[split]       = len(case_names)
+        counts[split] = len(case_names)
         ssl_case_ids[split] = case_names
 
     metadata_df.to_csv(dataset_dir / "metadata.csv", index=False)
@@ -697,16 +593,8 @@ def write_dataset(
             "TrL has real masks. TrU has dummy zero masks. "
             f"{description_extra}"
         ),
-        "ssl_counts": {
-            "TrL": int(counts["TrL"]),
-            "TrU": int(counts["TrU"]),
-            "Ts":  int(counts["Ts"]),
-        },
-        "ssl_case_ids": {
-            "TrL": ssl_case_ids["TrL"],
-            "TrU": ssl_case_ids["TrU"],
-            "Ts":  ssl_case_ids["Ts"],
-        },
+        "ssl_counts": {"TrL": int(counts["TrL"]), "TrU": int(counts["TrU"]), "Ts": int(counts["Ts"])},
+        "ssl_case_ids": {"TrL": ssl_case_ids["TrL"], "TrU": ssl_case_ids["TrU"], "Ts": ssl_case_ids["Ts"]},
     }
 
     with open(dataset_dir / "dataset.json", "w", encoding="utf-8") as f:
@@ -728,7 +616,6 @@ def write_dataset(
     return dataset_dir
 
 
-
 def set_nnunet_env(nnunet_raw, nnunet_preprocessed, nnunet_results):
     nnunet_raw = Path(nnunet_raw).resolve()
     nnunet_preprocessed = Path(nnunet_preprocessed).resolve()
@@ -745,4 +632,3 @@ def set_nnunet_env(nnunet_raw, nnunet_preprocessed, nnunet_results):
     log_info(f"nnUNet_raw          : {os.environ['nnUNet_raw']}")
     log_info(f"nnUNet_preprocessed : {os.environ['nnUNet_preprocessed']}")
     log_info(f"nnUNet_results      : {os.environ['nnUNet_results']}")
-

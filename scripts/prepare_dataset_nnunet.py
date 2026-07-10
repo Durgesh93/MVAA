@@ -5,7 +5,6 @@ import sys
 
 import typer
 
-
 app = typer.Typer(help="Prepare all MVAA datasets in nnU-Net format.")
 
 
@@ -39,11 +38,7 @@ def run_command(cmd, env=None):
     typer.echo(" ".join(str(x) for x in cmd))
     typer.echo()
 
-    subprocess.run(
-        cmd,
-        env=env,
-        check=True,
-    )
+    subprocess.run(cmd, env=env, check=True)
 
 
 @app.command()
@@ -59,21 +54,10 @@ def main(
         help="Final nnU-Net root containing nnUNet_raw, nnUNet_preprocessed, and nnUNet_results.",
     ),
     num_processes: int = typer.Option(
-        64,
-        "--num-processes",
-        "-np",
-        help="Number of workers for raw writing and nnU-Net preprocessing.",
+        64, "--num-processes", "-np", help="Number of workers for raw writing and nnU-Net preprocessing."
     ),
-    test: bool = typer.Option(
-        False,
-        "--test",
-        help="Prepare only a few samples per split.",
-    ),
-    only: str = typer.Option(
-        "all",
-        "--only",
-        help="Which dataset to prepare: all, ct, tee, or video.",
-    ),
+    test: bool = typer.Option(False, "--test", help="Prepare only a few samples per split."),
+    only: str = typer.Option("all", "--only", help="Which dataset to prepare: all, ct, tee, or video."),
 ):
     project_root = PROJECT_ROOT
     data_preparation_dir = DATA_PREPARATION_DIR
@@ -87,10 +71,7 @@ def main(
     env = os.environ.copy()
 
     existing_pythonpath = env.get("PYTHONPATH", "")
-    pythonpath_parts = [
-        str(data_preparation_dir),
-        str(project_root),
-    ]
+    pythonpath_parts = [str(data_preparation_dir), str(project_root)]
 
     if existing_pythonpath:
         pythonpath_parts.append(existing_pythonpath)
@@ -114,9 +95,7 @@ def main(
         only = only.lower()
 
         if only not in TASK_SCRIPTS:
-            raise ValueError(
-                f"Unknown --only value: {only}. Use one of: all, ct, tee, video."
-            )
+            raise ValueError(f"Unknown --only value: {only}. Use one of: all, ct, tee, video.")
 
         selected_tasks = [only]
 
@@ -126,11 +105,9 @@ def main(
         if not script_path.exists():
             raise FileNotFoundError(f"Task script not found: {script_path}")
 
-        task_title = {
-            "ct": "Preparing Task 1 CT",
-            "tee": "Preparing Task 2 TEE",
-            "video": "Preparing Task 3 VIDEO",
-        }[task_name]
+        task_title = {"ct": "Preparing Task 1 CT", "tee": "Preparing Task 2 TEE", "video": "Preparing Task 3 VIDEO"}[
+            task_name
+        ]
 
         log_section(task_title)
 
@@ -142,7 +119,7 @@ def main(
             "--output-dir",
             str(output_dir),
             "-np",
-            str(num_processes)
+            str(num_processes),
         ]
 
         if test:

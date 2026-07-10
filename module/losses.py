@@ -28,6 +28,20 @@ from nnunetv2.training.loss.compound_losses import DC_and_CE_loss
 from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss
 from nnunetv2.utilities.helpers import softmax_helper_dim1
 
+# Worst-case finite stand-in for a NaN/Inf/blown-up loss (e.g. dice/CE
+# exploding on a degenerate batch). nan_to_num first, since plain clamp
+# leaves NaN untouched (NaN compares False to both bounds); clamp after
+# to actually bound merely-huge-but-finite values too, not just
+# literal inf. nan_to_num also zeroes the gradient at the positions it
+# replaces, so a bad step is skipped there rather than corrupting the
+# model weights -- clamp does the same for the values it bounds.
+LOSS_CLIP_VALUE = 1e6
+
+
+def _clip_loss(loss: Tensor) -> Tensor:
+    loss = torch.nan_to_num(loss, nan=LOSS_CLIP_VALUE, posinf=LOSS_CLIP_VALUE, neginf=-LOSS_CLIP_VALUE)
+    return torch.clamp(loss, min=-LOSS_CLIP_VALUE, max=LOSS_CLIP_VALUE)
+
 
 def _onehot_target(x: Tensor, y: Tensor, do_bg: bool) -> Tensor:
     """
@@ -65,10 +79,9 @@ def _signed_distance_map(posmask: np.ndarray) -> np.ndarray:
 
     negmask = ~posmask
 
-    return (
-        distance_transform_edt(negmask) * negmask
-        - (distance_transform_edt(posmask) - 1) * posmask
-    ).astype(np.float32)
+    return (distance_transform_edt(negmask) * negmask - (distance_transform_edt(posmask) - 1) * posmask).astype(
+        np.float32
+    )
 
 
 class BoundaryLoss(nn.Module):
@@ -139,14 +152,7 @@ class CompoundLoss(nn.Module):
     ramps it up over epochs when litmodule.use_boundary is set).
     """
 
-    def __init__(
-        self,
-        batch_dice: bool,
-        ddp: bool,
-        ignore_label=None,
-        boundary_cls=None,
-        boundary_kwargs=None,
-    ):
+    def __init__(self, batch_dice: bool, ddp: bool, ignore_label=None, boundary_cls=None, boundary_kwargs=None):
         super().__init__()
 
         self.ignore_label = ignore_label
@@ -163,7 +169,8 @@ class CompoundLoss(nn.Module):
 
         self.boundary = (
             boundary_cls(apply_nonlin=softmax_helper_dim1, **(boundary_kwargs or {}))
-            if boundary_cls is not None else None
+            if boundary_cls is not None
+            else None
         )
 
     def set_boundary_weight(self, weight: float) -> None:
@@ -177,18 +184,18 @@ class CompoundLoss(nn.Module):
         dice_ce = self.dice_ce(net_output, target)
 
         if self.boundary is None or self.boundary_weight <= 0:
-            return dice_ce
+            return _clip_loss(dice_ce)
 
         if self.ignore_label is not None:
             mask = (target != self.ignore_label).bool()
             target_region = torch.where(mask, target, torch.zeros_like(target))
 
             if mask.sum() == 0:
-                return dice_ce
+                return _clip_loss(dice_ce)
         else:
             mask = None
             target_region = target
 
         boundary = self.boundary(net_output, target_region, loss_mask=mask)
 
-        return (1 - self.boundary_weight) * dice_ce + self.boundary_weight * boundary
+        return _clip_loss((1 - self.boundary_weight) * dice_ce + self.boundary_weight * boundary)

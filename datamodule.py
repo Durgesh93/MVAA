@@ -26,21 +26,11 @@ import lightning as L
 
 from torch.utils.data import Dataset, DataLoader
 
-from batchgenerators.dataloading.single_threaded_augmenter import (
-    SingleThreadedAugmenter,
-)
+from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
 
-from batchgenerators.dataloading.nondet_multi_threaded_augmenter import (
-    NonDetMultiThreadedAugmenter,
-)
+from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
 
-from batchgenerators.utilities.file_and_folder_operations import (
-    join,
-    isfile,
-    load_json,
-    save_json,
-    maybe_mkdir_p,
-)
+from batchgenerators.utilities.file_and_folder_operations import join, isfile, load_json, save_json, maybe_mkdir_p
 
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_raw
 from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
@@ -51,15 +41,12 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 from nnunetv2.utilities.dataset_name_id_conversion import maybe_convert_to_dataset_name
 from nnunetv2.inference.data_iterators import preprocessing_iterator_fromfiles
 
-from utils import (
-    split_by_rank,
-    to_tensor,
-)
-
+from utils import split_by_rank, to_tensor
 
 # =============================================================================
 # Raw case dataset for validation and prediction
 # =============================================================================
+
 
 class nnUNetRawCaseDataset(Dataset):
     """
@@ -103,9 +90,7 @@ class nnUNetRawCaseDataset(Dataset):
             self.label_folder = None
 
         else:
-            raise ValueError(
-                f"Unknown split '{self.split}'. Use 'val' or 'test'."
-            )
+            raise ValueError(f"Unknown split '{self.split}'. Use 'val' or 'test'.")
 
     def __len__(self):
         return len(self.case_ids)
@@ -114,15 +99,10 @@ class nnUNetRawCaseDataset(Dataset):
         image_files = []
 
         for c in range(self.num_channels):
-            image_file = (
-                self.image_folder
-                / f"{case_id}_{c:04d}{self.file_ending}"
-            )
+            image_file = self.image_folder / f"{case_id}_{c:04d}{self.file_ending}"
 
             if not image_file.exists():
-                raise FileNotFoundError(
-                    f"Missing image file for case '{case_id}': {image_file}"
-                )
+                raise FileNotFoundError(f"Missing image file for case '{case_id}': {image_file}")
 
             image_files.append(str(image_file))
 
@@ -159,9 +139,7 @@ class nnUNetRawCaseDataset(Dataset):
         label_file = self.label_folder / f"{case_id}{self.file_ending}"
 
         if not label_file.exists():
-            raise FileNotFoundError(
-                f"Missing label file for case '{case_id}': {label_file}"
-            )
+            raise FileNotFoundError(f"Missing label file for case '{case_id}': {label_file}")
 
         rw = self.pm.image_reader_writer_class()
 
@@ -188,10 +166,7 @@ class nnUNetRawCaseDataset(Dataset):
 
         image_files = self._image_files_for_case(case_id)
 
-        data, properties = self._preprocess_case(
-            image_files=image_files,
-            case_id=case_id,
-        )
+        data, properties = self._preprocess_case(image_files=image_files, case_id=case_id)
 
         gt_data, gt_properties = self._load_gt_for_case(case_id)
 
@@ -224,6 +199,7 @@ def nnunet_raw_case_collate(batch):
 # SSL DataModule
 # =============================================================================
 
+
 class SSLnnUNetDataModule(L.LightningDataModule):
     def __init__(self, datamodule_cfg):
         super().__init__()
@@ -248,32 +224,19 @@ class SSLnnUNetDataModule(L.LightningDataModule):
 
         self.dataset_name = maybe_convert_to_dataset_name(self.dataset_id)
 
-        self.base = join(
-            nnUNet_preprocessed,
-            self.dataset_name,
-        )
+        self.base = join(nnUNet_preprocessed, self.dataset_name)
 
-        self.raw_base = join(
-            nnUNet_raw,
-            self.dataset_name,
-        )
+        self.raw_base = join(nnUNet_raw, self.dataset_name)
 
-        self.plans = load_json(
-            join(self.base, self.plans_identifier + ".json")
-        )
+        self.plans = load_json(join(self.base, self.plans_identifier + ".json"))
 
-        self.dataset_json = load_json(
-            join(self.base, "dataset.json")
-        )
+        self.dataset_json = load_json(join(self.base, "dataset.json"))
 
         self.pm = PlansManager(self.plans)
         self.cm = self.pm.get_configuration(self.configuration)
         self.lm = self.pm.get_label_manager(self.dataset_json)
 
-        self.folder = join(
-            self.base,
-            self.cm.data_identifier,
-        )
+        self.folder = join(self.base, self.cm.data_identifier)
 
         self.batch_size = self.cm.batch_size
         self.ds_scales = self._get_deep_supervision_scales_from_nnunet()
@@ -295,10 +258,7 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         self.trl_all = list(ssl["TrL"])
         self.ts_all = list(ssl["Ts"])
 
-        self.splits_file = join(
-            self.base,
-            "splits_final_TrL.json",
-        )
+        self.splits_file = join(self.base, "splits_final_TrL.json")
 
         self.ds_class = None
 
@@ -327,10 +287,7 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         shim.configuration_manager = self.cm
         shim.print_to_log_file = lambda *a, **k: None
 
-        return (
-            nnUNetTrainer
-            .configure_rotation_dummyDA_mirroring_and_inital_patch_size(shim)
-        )
+        return nnUNetTrainer.configure_rotation_dummyDA_mirroring_and_inital_patch_size(shim)
 
     def _available_cpu_count(self):
         """
@@ -345,10 +302,7 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         except Exception:
             return os.cpu_count() or 1
 
-    def _resolve_augmentation_processes(
-        self,
-        world_size,
-    ):
+    def _resolve_augmentation_processes(self, world_size):
         """
         Automatically choose augmentation workers PER AUGMENTER PER RANK.
 
@@ -367,15 +321,9 @@ class SSLnnUNetDataModule(L.LightningDataModule):
             plus 6 main rank processes.
         """
 
-        cpu_count = max(
-            1,
-            int(self._available_cpu_count()),
-        )
+        cpu_count = max(1, int(self._available_cpu_count()))
 
-        world_size = max(
-            1,
-            int(world_size),
-        )
+        world_size = max(1, int(world_size))
 
         # One train augmenter per rank (labeled only).
         augmenters_per_rank = 1
@@ -386,37 +334,19 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         # - file IO
         # - validation/prediction preprocessing
         # - OS/runtime overhead
-        reserved_cpus = max(
-            world_size,
-            math.ceil(0.20 * cpu_count),
-        )
+        reserved_cpus = max(world_size, math.ceil(0.20 * cpu_count))
 
-        usable_cpus = max(
-            1,
-            cpu_count - reserved_cpus,
-        )
+        usable_cpus = max(1, cpu_count - reserved_cpus)
 
         workers_per_augmenter = usable_cpus // total_augmenters
 
         # Minimum 4 workers per augmenter.
-        workers_per_augmenter = max(
-            4,
-            workers_per_augmenter,
-        )
+        workers_per_augmenter = max(4, workers_per_augmenter)
 
         # Safety cap.
-        workers_per_augmenter = min(
-            workers_per_augmenter,
-            8,
-        )
+        workers_per_augmenter = min(workers_per_augmenter, 8)
 
-        num_cached = max(
-            8,
-            min(
-                16,
-                workers_per_augmenter * 2,
-            ),
-        )
+        num_cached = max(8, min(16, workers_per_augmenter * 2))
 
         return workers_per_augmenter, num_cached
 
@@ -428,15 +358,10 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         """
 
         if self.num_processes is None:
-            raise RuntimeError(
-                "self.num_processes is None. setup() must run before train_dataloader()."
-            )
+            raise RuntimeError("self.num_processes is None. setup() must run before train_dataloader().")
 
         if self.num_processes <= 0:
-            return SingleThreadedAugmenter(
-                loader,
-                None,
-            )
+            return SingleThreadedAugmenter(loader, None)
 
         return NonDetMultiThreadedAugmenter(
             loader,
@@ -455,12 +380,7 @@ class SSLnnUNetDataModule(L.LightningDataModule):
     def prepare_data(self):
         cls = infer_dataset_class(self.folder)
 
-        cls.unpack_dataset(
-            self.folder,
-            overwrite_existing=False,
-            num_processes=1,
-            verify=True,
-        )
+        cls.unpack_dataset(self.folder, overwrite_existing=False, num_processes=1, verify=True)
 
     def setup(self, stage=None):
         """
@@ -481,18 +401,11 @@ class SSLnnUNetDataModule(L.LightningDataModule):
                 "trainer.predict(...)."
             )
 
-        world_size = max(
-            1,
-            int(trainer.world_size),
-        )
+        world_size = max(1, int(trainer.world_size))
 
         global_rank = int(trainer.global_rank)
 
-        self.num_processes, self.num_cached = (
-            self._resolve_augmentation_processes(
-                world_size=world_size,
-            )
-        )
+        self.num_processes, self.num_cached = self._resolve_augmentation_processes(world_size=world_size)
 
         # ------------------------------------------------------------
         # Full TrL train/val split
@@ -512,16 +425,9 @@ class SSLnnUNetDataModule(L.LightningDataModule):
             if not isfile(self.splits_file):
                 maybe_mkdir_p(self.base)
 
-                splits = generate_crossval_split(
-                    list(np.sort(self.trl_all)),
-                    seed=self.seed,
-                    n_splits=5,
-                )
+                splits = generate_crossval_split(list(np.sort(self.trl_all)), seed=self.seed, n_splits=5)
 
-                save_json(
-                    splits,
-                    self.splits_file,
-                )
+                save_json(splits, self.splits_file)
 
             else:
                 splits = load_json(self.splits_file)
@@ -536,23 +442,11 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         # ------------------------------------------------------------
         # Rank-local split
         # ------------------------------------------------------------
-        tr_cases = split_by_rank(
-            full_tr,
-            global_rank=global_rank,
-            world_size=world_size,
-        )
+        tr_cases = split_by_rank(full_tr, global_rank=global_rank, world_size=world_size)
 
-        val_cases = split_by_rank(
-            full_val,
-            global_rank=global_rank,
-            world_size=world_size,
-        )
+        val_cases = split_by_rank(full_val, global_rank=global_rank, world_size=world_size)
 
-        test_cases = split_by_rank(
-            full_test,
-            global_rank=global_rank,
-            world_size=world_size,
-        )
+        test_cases = split_by_rank(full_test, global_rank=global_rank, world_size=world_size)
 
         # ------------------------------------------------------------
         # Train limit for infinite nnU-Net loaders
@@ -560,21 +454,11 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         max_rank_cases = 0
 
         for rank in range(world_size):
-            rank_tr_cases = split_by_rank(
-                full_tr,
-                global_rank=rank,
-                world_size=world_size,
-            )
+            rank_tr_cases = split_by_rank(full_tr, global_rank=rank, world_size=world_size)
 
-            max_rank_cases = max(
-                max_rank_cases,
-                len(rank_tr_cases),
-            )
+            max_rank_cases = max(max_rank_cases, len(rank_tr_cases))
 
-        self.limit_train_batches = max(
-            1,
-            math.ceil(max_rank_cases / self.batch_size),
-        )
+        self.limit_train_batches = max(1, math.ceil(max_rank_cases / self.batch_size))
 
         trainer.limit_train_batches = self.limit_train_batches
 
@@ -608,9 +492,7 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         # Patch-based training datasets
         # ------------------------------------------------------------
         self.dataset_train_labeled = self.ds_class(
-            self.folder,
-            tr_cases,
-            folder_with_segs_from_previous_stage=self.prev_stage_folder,
+            self.folder, tr_cases, folder_with_segs_from_previous_stage=self.prev_stage_folder
         )
 
         # ------------------------------------------------------------
@@ -646,9 +528,7 @@ class SSLnnUNetDataModule(L.LightningDataModule):
 
     def train_dataloader(self):
         if self.dataset_train_labeled is None:
-            raise RuntimeError(
-                "dataset_train_labeled is None. setup() did not run correctly."
-            )
+            raise RuntimeError("dataset_train_labeled is None. setup() did not run correctly.")
 
         rot, dummy_2d, init_ps, mirror = self._get_da_params_from_nnunet()
 
@@ -661,11 +541,7 @@ class SSLnnUNetDataModule(L.LightningDataModule):
             use_mask_for_norm=self.cm.use_mask_for_norm,
             is_cascaded=self.is_cascaded,
             foreground_labels=self.lm.foreground_labels,
-            regions=(
-                self.lm.foreground_regions
-                if self.lm.has_regions
-                else None
-            ),
+            regions=(self.lm.foreground_regions if self.lm.has_regions else None),
             ignore_label=self.lm.ignore_label,
         )
 
@@ -682,22 +558,16 @@ class SSLnnUNetDataModule(L.LightningDataModule):
             transforms=tfm,
         )
 
-        labeled_iter = self._make_augmenter(
-            labeled_loader,
-        )
+        labeled_iter = self._make_augmenter(labeled_loader)
 
         return labeled_iter
 
     def val_dataloader(self):
         if self.raw_dataset_val is None:
-            raise RuntimeError(
-                "raw_dataset_val is None. setup() did not run correctly."
-            )
+            raise RuntimeError("raw_dataset_val is None. setup() did not run correctly.")
 
         if self.raw_dataset_test is None:
-            raise RuntimeError(
-                "raw_dataset_test is None. setup() did not run correctly."
-            )
+            raise RuntimeError("raw_dataset_test is None. setup() did not run correctly.")
 
         val_loader = DataLoader(
             self.raw_dataset_val,
@@ -717,10 +587,7 @@ class SSLnnUNetDataModule(L.LightningDataModule):
             collate_fn=nnunet_raw_case_collate,
         )
 
-        return [
-            val_loader,
-            prediction_loader,
-        ]
+        return [val_loader, prediction_loader]
 
     def test_dataloader(self):
         return self.val_dataloader()

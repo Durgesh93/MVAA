@@ -1,5 +1,5 @@
 """
-NNUnetMixin for SSL nnU-Net.
+NNUnetSetup for SSL nnU-Net.
 
 Loads nnU-Net plans/dataset.json and builds the PlansManager/
 ConfigurationManager/LabelManager, wraps nnU-Net's own trainer static
@@ -7,120 +7,220 @@ methods (network architecture, loss, optimizer/scheduler) behind
 lightweight shim objects, and builds the supervised loss variants
 defined in losses.py.
 
-All methods are prefixed with "nnu" so call sites (self._nnu_...) make
-clear which mixin they come from.
+Standalone component: holds only its own plan/config state and the
+litmodule cfg. Does not touch the LightningModule's `self` -- network
+and loss are built here but owned by the LightningModule (required
+for DDP wrapping, `.to(device)`, checkpointing, and optimizer param
+discovery, all of which need `network`/`loss` as direct LightningModule
+attributes). `network`/`device` are likewise passed into
+predictor.run_prediction() per call rather than stored, for the same
+reason.
+
+Sliding-window inference + writing case zips/submission files live in
+PredictionOps (composed, not mixed in) -- self.predictor. It shares
+NNUnetSetup's own pm/cm/lm/dataset_json by construction, so callers
+never need to pass configuration_manager themselves.
 """
 
 import numpy as np
 
-from batchgenerators.utilities.file_and_folder_operations import (
-    join,
-    load_json,
-)
+from batchgenerators.utilities.file_and_folder_operations import join, load_json
 
 from nnunetv2.paths import nnUNet_preprocessed
 
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 
-from nnunetv2.utilities.dataset_name_id_conversion import (
-    maybe_convert_to_dataset_name,
-)
+from nnunetv2.utilities.dataset_name_id_conversion import maybe_convert_to_dataset_name
 
-from nnunetv2.utilities.label_handling.label_handling import (
-    determine_num_input_channels,
-)
+from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
 
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
-from .losses import (
-    BoundaryLoss,
-    CompoundLoss,
+from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.inference.sliding_window_prediction import compute_gaussian
+from nnunetv2.inference.export_prediction import convert_predicted_logits_to_segmentation_with_correct_shape
+
+from .losses import BoundaryLoss, CompoundLoss
+
+from utils import (
+    write_prediction_case_zip as _write_prediction_case_zip,
+    write_submission_prediction as _write_submission_prediction,
 )
 
 
-class NNUnetMixin:
+class PredictionOps:
+    """
+    Sliding-window inference plus writing case zips/submission files.
 
-    def _nnu_load_plans(self, litmodule_cfg):
-        self.dataset_name = maybe_convert_to_dataset_name(
-            litmodule_cfg.dataset_id
+    Constructed once by NNUnetSetup with its own pm/cm/lm/dataset_json
+    -- no dependency on the LightningModule's `self`. `network`/`device`
+    are passed into run_prediction() per call since those live on the
+    LightningModule (network is trained in place; device can change
+    with `.to()`).
+    """
+
+    def __init__(
+        self, plans_manager, configuration_manager, label_manager, dataset_json, trainer_name, configuration_name
+    ):
+        self.pm = plans_manager
+        self.cm = configuration_manager
+        self.lm = label_manager
+        self.dataset_json = dataset_json
+        self.trainer_name = trainer_name
+        self.configuration_name = configuration_name
+
+    def _unwrap_network(self, network):
+        if hasattr(network, "module"):
+            return network.module
+
+        return network
+
+    def _make_predictor(self, net, device):
+        predictor = nnUNetPredictor(
+            tile_step_size=0.5,
+            use_gaussian=True,
+            use_mirroring=False,
+            perform_everything_on_device=True,
+            device=device,
+            verbose=False,
+            verbose_preprocessing=False,
+            allow_tqdm=False,
         )
 
-        self.base = join(
-            nnUNet_preprocessed,
-            self.dataset_name,
-        )
+        predictor.plans_manager = self.pm
+        predictor.configuration_manager = self.cm
+        predictor.network = net
+        predictor.dataset_json = self.dataset_json
+        predictor.trainer_name = self.trainer_name
+        predictor.allowed_mirroring_axes = tuple(range(len(self.cm.patch_size)))
+        predictor.label_manager = self.lm
+        predictor.list_of_parameters = [net.state_dict()]
 
-        self.plans = load_json(
-            join(
-                self.base,
-                litmodule_cfg.plans_identifier + ".json",
+        return predictor
+
+    def _predict_logits(self, network, device, data):
+        if self.cm.previous_stage_name is not None:
+            raise RuntimeError(
+                f"Configuration {self.configuration_name} is cascaded, "
+                "but this module does not support cascaded inference."
             )
+
+        net = self._unwrap_network(network)
+
+        old_deep_supervision = net.decoder.deep_supervision
+        net.decoder.deep_supervision = False
+
+        predictor = self._make_predictor(net, device)
+
+        try:
+            logits = predictor.predict_sliding_window_return_logits(data)
+        finally:
+            net.decoder.deep_supervision = old_deep_supervision
+            compute_gaussian.cache_clear()
+
+        return logits
+
+    def _restore_prediction_shape(self, logits, properties):
+        predicted_segments, predicted_probs = convert_predicted_logits_to_segmentation_with_correct_shape(
+            predicted_logits=logits.cpu(),
+            plans_manager=self.pm,
+            configuration_manager=self.cm,
+            label_manager=self.lm,
+            properties_dict=properties,
+            return_probabilities=True,
         )
 
-        self.dataset_json = load_json(
-            join(
-                self.base,
-                "dataset.json",
-            )
+        return predicted_segments, predicted_probs
+
+    # =========================================================================
+    # Main prediction entry point
+    # =========================================================================
+    def run_prediction(self, network, device, batch, batch_idx=None):
+        item = batch[0]
+
+        logits = self._predict_logits(network=network, device=device, data=item["data"])
+
+        predicted_segments, predicted_probs = self._restore_prediction_shape(
+            logits=logits, properties=item["properties"]
         )
+
+        item.update({"logits": logits, "predicted_segments": predicted_segments, "predicted_probs": predicted_probs})
+
+        return item
+
+    def write_prediction_case_zip(self, prediction, zip_dir, include_gt, reset_direction=False, keep_temp_folder=False):
+        _write_prediction_case_zip(
+            prediction=prediction,
+            zip_dir=zip_dir,
+            configuration_manager=self.cm,
+            include_gt=include_gt,
+            keep_temp_folder=keep_temp_folder,
+            reset_direction=reset_direction,
+        )
+
+    def write_submission_prediction(
+        self, prediction, output_folder, convert_to_255, keep_classes, submission_output_format
+    ):
+        _write_submission_prediction(
+            prediction=prediction,
+            output_folder=output_folder,
+            configuration_manager=self.cm,
+            convert_to_255=convert_to_255,
+            keep_classes=keep_classes,
+            output_format=submission_output_format,
+        )
+
+
+class NNUnetSetup:
+    def __init__(self, litmodule_cfg, enable_deep_supervision=True, trainer_name="NNUnetSetup"):
+        self.cfg = litmodule_cfg
+        self.enable_deep_supervision = enable_deep_supervision
+
+        self.dataset_name = maybe_convert_to_dataset_name(litmodule_cfg.dataset_id)
+        self.base = join(nnUNet_preprocessed, self.dataset_name)
+        self.plans = load_json(join(self.base, litmodule_cfg.plans_identifier + ".json"))
+        self.dataset_json = load_json(join(self.base, "dataset.json"))
 
         self.pm = PlansManager(self.plans)
+        self.cm = self.pm.get_configuration(litmodule_cfg.configuration)
+        self.lm = self.pm.get_label_manager(self.dataset_json)
 
-        self.cm = self.pm.get_configuration(
-            litmodule_cfg.configuration
+        self.num_input_channels = determine_num_input_channels(self.pm, self.cm, self.dataset_json)
+
+        self.predictor = PredictionOps(
+            plans_manager=self.pm,
+            configuration_manager=self.cm,
+            label_manager=self.lm,
+            dataset_json=self.dataset_json,
+            trainer_name=trainer_name,
+            configuration_name=litmodule_cfg.configuration,
         )
 
-        self.lm = self.pm.get_label_manager(
-            self.dataset_json
-        )
-
-        self.num_input_channels = determine_num_input_channels(
-            self.pm,
-            self.cm,
-            self.dataset_json,
-        )
-
-    def _nnu_ensure_built(self):
-        if self._built:
-            return
-
-        self.network = self._nnu_build_network()
-        self.loss = self._nnu_build_loss()
-
-        self._built = True
-
-    def _nnu_make_trainer_shim(self):
+    def _make_trainer_shim(self, is_ddp):
         shim = type("S", (), {})()
 
         shim.configuration_manager = self.cm
         shim.label_manager = self.lm
         shim.enable_deep_supervision = self.enable_deep_supervision
-        shim.is_ddp = int(self.trainer.world_size) > 1
+        shim.is_ddp = is_ddp
 
-        shim._get_deep_supervision_scales = (
-            lambda: nnUNetTrainer._get_deep_supervision_scales(shim)
-        )
+        shim._get_deep_supervision_scales = lambda: nnUNetTrainer._get_deep_supervision_scales(shim)
 
         shim._do_i_compile = lambda: False
 
         return shim
 
-    def _nnu_build_network(self):
+    def build_network(self):
         return nnUNetTrainer.build_network_architecture(
-            self.pm,
-            self.cm,
-            self.num_input_channels,
-            self.lm.num_segmentation_heads,
-            self.enable_deep_supervision,
+            self.pm, self.cm, self.num_input_channels, self.lm.num_segmentation_heads, self.enable_deep_supervision
         )
 
-    def _nnu_build_loss(self):
-        shim = self._nnu_make_trainer_shim()
+    def build_loss(self, is_ddp):
+        shim = self._make_trainer_shim(is_ddp)
 
         assert not self.lm.has_regions, (
-            "CompoundLoss (DC_and_CE_loss + optional BoundaryLoss) does "
-            "not support region-based labels"
+            "CompoundLoss (DC_and_CE_loss + optional BoundaryLoss) does " "not support region-based labels"
         )
 
         if self.cfg.use_boundary:
@@ -132,7 +232,7 @@ class NNUnetMixin:
 
         loss = CompoundLoss(
             batch_dice=self.cm.batch_dice,
-            ddp=shim.is_ddp,
+            ddp=is_ddp,
             ignore_label=self.lm.ignore_label,
             boundary_cls=boundary_cls,
             boundary_kwargs=boundary_kwargs,
@@ -141,11 +241,9 @@ class NNUnetMixin:
         if self.enable_deep_supervision:
             deep_supervision_scales = shim._get_deep_supervision_scales()
 
-            weights = np.array(
-                [1 / (2**i) for i in range(len(deep_supervision_scales))]
-            )
+            weights = np.array([1 / (2**i) for i in range(len(deep_supervision_scales))])
 
-            if shim.is_ddp:
+            if is_ddp:
                 weights[-1] = 1e-6
             else:
                 weights[-1] = 0
@@ -156,15 +254,13 @@ class NNUnetMixin:
 
         return loss
 
-    def _nnu_compound_loss(self):
+    @staticmethod
+    def _unwrap_compound_loss(loss):
         """The underlying CompoundLoss, unwrapped from DeepSupervisionWrapper if present."""
 
-        return (
-            self.loss.loss
-            if isinstance(self.loss, DeepSupervisionWrapper) else self.loss
-        )
+        return loss.loss if isinstance(loss, DeepSupervisionWrapper) else loss
 
-    def _nnu_update_boundary_weight(self, epoch: int) -> None:
+    def update_boundary_weight(self, loss, epoch: int) -> None:
         """
         Ramps CompoundLoss.boundary_weight linearly from 0 at epoch 0
         to boundary_weight_max at boundary_ramp_epochs (held at max
@@ -181,12 +277,12 @@ class NNUnetMixin:
         ramp_epochs = max(int(self.cfg.boundary_ramp_epochs), 1)
         weight = self.cfg.boundary_weight_max * min(epoch / ramp_epochs, 1.0)
 
-        self._nnu_compound_loss().set_boundary_weight(weight)
+        self._unwrap_compound_loss(loss).set_boundary_weight(weight)
 
-    def _nnu_build_optimizer_and_scheduler(self):
+    def build_optimizer_and_scheduler(self, network):
         shim = type("S", (), {})()
 
-        shim.network = self.network
+        shim.network = network
         shim.initial_lr = self.cfg.initial_lr
         shim.weight_decay = self.cfg.weight_decay
         shim.num_epochs = self.cfg.num_epochs

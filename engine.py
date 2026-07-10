@@ -53,7 +53,6 @@ from utils import (
     resolve_prediction_ckpt,
 )
 
-
 app = typer.Typer()
 
 
@@ -65,16 +64,10 @@ VIDEO_CASE_ID_PATTERN = re.compile(r"^(?P<video_id>.+)_(?P<frame>\d{6})$")
 NIFTI_SUBMISSION_SUFFIX = "-pred.nii.gz"
 
 
-CONFIG_MAP = {
-    "ct": "experiment_CT",
-    "tee": "experiment_TEE",
-    "video": "experiment_video",
-}
+CONFIG_MAP = {"ct": "experiment_CT", "tee": "experiment_TEE", "video": "experiment_video"}
 
 
-def _select_cluster_environment(
-    trainer_cfg,
-):
+def _select_cluster_environment(trainer_cfg):
     """
     This cluster does not launch training via srun, so Lightning's automatic
     cluster-environment detection is unsafe: SLURMEnvironment's constructor
@@ -85,34 +78,22 @@ def _select_cluster_environment(
     for both single-device and DDP training.
     """
 
-    device_count = (
-        torch.cuda.device_count()
-        if torch.cuda.is_available()
-        else 1
-    )
+    device_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
 
     trainer_cfg["num_nodes"] = 1
     trainer_cfg["devices"] = device_count
 
-    strategy = trainer_cfg.get(
-        "strategy",
-        "auto",
-    )
+    strategy = trainer_cfg.get("strategy", "auto")
 
     if strategy == "ddp":
-        trainer_cfg["strategy"] = DDPStrategy(
-            cluster_environment=LightningEnvironment(),
-        )
+        trainer_cfg["strategy"] = DDPStrategy(cluster_environment=LightningEnvironment())
     else:
         trainer_cfg["plugins"] = [LightningEnvironment()]
 
     return trainer_cfg
 
 
-def _build_trainer(
-    cfg,
-    prediction=False,
-):
+def _build_trainer(cfg, prediction=False):
     """
     Build Lightning Trainer.
 
@@ -120,112 +101,58 @@ def _build_trainer(
     For prediction, ckpt='best'/'last' is resolved manually before trainer.test().
     """
 
-    trainer_cfg = OmegaConf.to_container(
-        cfg.trainer,
-        resolve=True,
-    )
+    trainer_cfg = OmegaConf.to_container(cfg.trainer, resolve=True)
 
-    trainer_cfg = _select_cluster_environment(
-        trainer_cfg,
-    )
+    trainer_cfg = _select_cluster_environment(trainer_cfg)
 
     callbacks = []
 
     if trainer_cfg.get("enable_progress_bar", True):
         if "progress_bar" in cfg:
-            callbacks.append(
-                instantiate(cfg.progress_bar)
-            )
+            callbacks.append(instantiate(cfg.progress_bar))
 
     if trainer_cfg.get("enable_checkpointing", True):
-        callbacks.append(
-            instantiate(cfg.checkpoint)
-        )
+        callbacks.append(instantiate(cfg.checkpoint))
 
-    trainer = L.Trainer(
-        **trainer_cfg,
-        callbacks=callbacks,
-    )
+    trainer = L.Trainer(**trainer_cfg, callbacks=callbacks)
 
     return trainer
 
 
-def _build_objects(
-    config_name,
-    prediction=False,
-):
-    cfg = build_config(
-        config_name=config_name,
-        overrides=[
-            f"fold={FOLD_NUM}",
-        ],
-    )
+def _build_objects(config_name, prediction=False):
+    cfg = build_config(config_name=config_name, overrides=[f"fold={FOLD_NUM}"])
 
-    set_nnunet_env(
-        cfg,
-    )
+    set_nnunet_env(cfg)
 
-    L.seed_everything(
-        cfg.seed,
-        workers=True,
-    )
+    L.seed_everything(cfg.seed, workers=True)
 
     from datamodule import SSLnnUNetDataModule
     from module import SSLnnUNetLightningModule
 
-    cfg = resolve_runtime_config(
-        cfg,
-        prediction=prediction,
-    )
+    cfg = resolve_runtime_config(cfg, prediction=prediction)
 
     if not prediction:
-        clear_results(
-            cfg,
-        )
+        clear_results(cfg)
 
-    datamodule = SSLnnUNetDataModule(
-        cfg.datamodule,
-    )
+    datamodule = SSLnnUNetDataModule(cfg.datamodule)
 
-    model = SSLnnUNetLightningModule(
-        cfg.litmodule,
-    )
+    model = SSLnnUNetLightningModule(cfg.litmodule)
 
-    trainer = _build_trainer(
-        cfg,
-        prediction=prediction,
-    )
+    trainer = _build_trainer(cfg, prediction=prediction)
 
     return cfg, datamodule, model, trainer
 
 
-def _run_training(
-    config_name,
-):
-    cfg, datamodule, model, trainer = _build_objects(
-        config_name=config_name,
-        prediction=False,
-    )
+def _run_training(config_name):
+    cfg, datamodule, model, trainer = _build_objects(config_name=config_name, prediction=False)
 
-    trainer.fit(
-        model=model,
-        datamodule=datamodule,
-    )
+    trainer.fit(model=model, datamodule=datamodule)
 
 
-def _run_prediction(
-    config_name,
-    ckpt=CKPT,
-):
-    cfg, datamodule, model, trainer = _build_objects(
-        config_name=config_name,
-        prediction=True,
-    )
+def _run_prediction(config_name, ckpt=CKPT):
+    cfg, datamodule, model, trainer = _build_objects(config_name=config_name, prediction=True)
 
-    resolved_ckpt = resolve_prediction_ckpt(
-        cfg=cfg,
-        ckpt=ckpt,
-    )
+    resolved_ckpt = resolve_prediction_ckpt(cfg=cfg, ckpt=ckpt)
 
     print()
     print("[predict] Using checkpoint:")
@@ -233,16 +160,10 @@ def _run_prediction(
     print(f"  resolved : {resolved_ckpt}")
     print()
 
-    trainer.test(
-        model=model,
-        datamodule=datamodule,
-        ckpt_path=resolved_ckpt,
-    )
+    trainer.test(model=model, datamodule=datamodule, ckpt_path=resolved_ckpt)
 
 
-def _run_prediction_all(
-    ckpt=CKPT,
-):
+def _run_prediction_all(ckpt=CKPT):
     """
     Run prediction for ct, tee, and video.
     """
@@ -269,10 +190,7 @@ def _run_prediction_all(
         print("=" * 80)
         print()
 
-        _run_prediction(
-            config_name=config_name,
-            ckpt=ckpt,
-        )
+        _run_prediction(config_name=config_name, ckpt=ckpt)
 
 
 def clear_results(cfg):
@@ -292,10 +210,7 @@ def clear_results(cfg):
     if fold_output_folder.exists():
         shutil.rmtree(fold_output_folder)
 
-    fold_output_folder.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    fold_output_folder.mkdir(parents=True, exist_ok=True)
 
     print()
     print("[clear-results] Cleared fold output folder:")
@@ -304,21 +219,11 @@ def clear_results(cfg):
 
 
 @app.command()
-def train(
-    experiment: str = typer.Argument(
-        ...,
-        help="Which experiment to train: ct, tee, or video.",
-    ),
-):
+def train(experiment: str = typer.Argument(..., help="Which experiment to train: ct, tee, or video.")):
     try:
-        experiment, config_name = validate_experiment_name(
-            experiment,
-            CONFIG_MAP,
-        )
+        experiment, config_name = validate_experiment_name(experiment, CONFIG_MAP)
     except ValueError as e:
-        raise typer.BadParameter(
-            str(e)
-        )
+        raise typer.BadParameter(str(e))
 
     print()
     print(f"Training experiment: {experiment}")
@@ -326,43 +231,25 @@ def train(
     print(f"Fold: {FOLD_NUM}")
     print()
 
-    _run_training(
-        config_name=config_name,
-    )
+    _run_training(config_name=config_name)
 
 
 @app.command()
 def predict(
-    experiment: str = typer.Argument(
-        ...,
-        help="Which experiment to predict: ct, tee, video, or all.",
-    ),
-    ckpt: str = typer.Option(
-        CKPT,
-        "--ckpt",
-        help="Checkpoint to use: best, last, or full .ckpt path.",
-    ),
+    experiment: str = typer.Argument(..., help="Which experiment to predict: ct, tee, video, or all."),
+    ckpt: str = typer.Option(CKPT, "--ckpt", help="Checkpoint to use: best, last, or full .ckpt path."),
 ):
-    experiment = str(
-        experiment
-    ).lower().strip()
+    experiment = str(experiment).lower().strip()
 
     if experiment == "all":
-        _run_prediction_all(
-            ckpt=ckpt,
-        )
+        _run_prediction_all(ckpt=ckpt)
 
         return
 
     try:
-        experiment, config_name = validate_experiment_name(
-            experiment,
-            CONFIG_MAP,
-        )
+        experiment, config_name = validate_experiment_name(experiment, CONFIG_MAP)
     except ValueError as e:
-        raise typer.BadParameter(
-            str(e)
-        )
+        raise typer.BadParameter(str(e))
 
     print()
     print(f"Predicting experiment: {experiment}")
@@ -371,10 +258,7 @@ def predict(
     print(f"Checkpoint: {ckpt}")
     print()
 
-    _run_prediction(
-        config_name=config_name,
-        ckpt=ckpt,
-    )
+    _run_prediction(config_name=config_name, ckpt=ckpt)
 
 
 @app.command()
@@ -404,29 +288,17 @@ def submit():
     resolved_experiment_name = None
 
     for experiment, config_name in CONFIG_MAP.items():
-        cfg = build_config(
-            config_name=config_name,
-            overrides=[
-                f"fold={FOLD_NUM}",
-            ],
-        )
+        cfg = build_config(config_name=config_name, overrides=[f"fold={FOLD_NUM}"])
 
-        set_nnunet_env(
-            cfg,
-        )
+        set_nnunet_env(cfg)
 
         resolved_experiment_name = str(cfg.experiment_name)
 
-        item = collect_submission_files(
-            cfg=cfg,
-            fold_num=FOLD_NUM,
-        )
+        item = collect_submission_files(cfg=cfg, fold_num=FOLD_NUM)
 
         item["experiment"] = experiment
 
-        all_items.append(
-            item
-        )
+        all_items.append(item)
 
     print()
     print("Creating one submission zip for all experiments")
@@ -434,19 +306,12 @@ def submit():
     print(f"Experiment name: {resolved_experiment_name}")
     print()
 
-    output_zip = (
-        Path(__file__).resolve().parent
-        / f"submission_{resolved_experiment_name}.zip"
-    )
+    output_zip = Path(__file__).resolve().parent / f"submission_{resolved_experiment_name}.zip"
 
     if output_zip.exists():
         output_zip.unlink()
 
-    with zipfile.ZipFile(
-        output_zip,
-        "w",
-        compression=zipfile.ZIP_DEFLATED,
-    ) as zf:
+    with zipfile.ZipFile(output_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for item in all_items:
             prefix = item["prefix"]
             task_id = item["task_id"]
@@ -458,16 +323,13 @@ def submit():
                 relative_path = prediction_file.name
 
                 if prediction_file.name.endswith(VIDEO_SUBMISSION_SUFFIX):
-                    case_id = prediction_file.name[
-                        : -len(VIDEO_SUBMISSION_SUFFIX)
-                    ]
+                    case_id = prediction_file.name[: -len(VIDEO_SUBMISSION_SUFFIX)]
 
                     match = VIDEO_CASE_ID_PATTERN.match(case_id)
 
                     if match is None:
                         raise ValueError(
-                            "Video case_id does not match expected "
-                            f"'<video_id>_<6-digit frame>' pattern: {case_id}"
+                            "Video case_id does not match expected " f"'<video_id>_<6-digit frame>' pattern: {case_id}"
                         )
 
                     video_id = match.group("video_id")
@@ -475,40 +337,20 @@ def submit():
                     relative_path = f"{video_id}/{prediction_file.name}"
 
                 elif prediction_file.name.endswith(NIFTI_SUBMISSION_SUFFIX):
-                    case_id = prediction_file.name[
-                        : -len(NIFTI_SUBMISSION_SUFFIX)
-                    ]
+                    case_id = prediction_file.name[: -len(NIFTI_SUBMISSION_SUFFIX)]
 
                 else:
-                    raise ValueError(
-                        f"Unrecognized submission file name: {prediction_file.name}"
-                    )
+                    raise ValueError(f"Unrecognized submission file name: {prediction_file.name}")
 
-                zf.write(
-                    prediction_file,
-                    arcname=f"{prefix}/{relative_path}",
-                )
+                zf.write(prediction_file, arcname=f"{prefix}/{relative_path}")
 
-                cases.append(
-                    {
-                        "case_id": case_id,
-                        "segmentation": relative_path,
-                    }
-                )
+                cases.append({"case_id": case_id, "segmentation": relative_path})
 
             item["json_name"] = f"{task_id}_predictions.json"
 
             zf.writestr(
                 f"{prefix}/{item['json_name']}",
-                json.dumps(
-                    {
-                        "cases": sorted(
-                            cases,
-                            key=lambda x: x["case_id"],
-                        ),
-                    },
-                    indent=2,
-                ),
+                json.dumps({"cases": sorted(cases, key=lambda x: x["case_id"])}, indent=2),
             )
 
     print()
