@@ -67,7 +67,7 @@ litmodule:
   # CompoundLoss.set_boundary_weight. Weight ramps linearly from 0 at
   # epoch 0 to boundary_weight_max at boundary_ramp_epochs (held at
   # max beyond that); Dice+CE anchors training throughout the ramp.
-  use_boundary: false
+  use_boundary: true
   boundary_weight_max: 0.01
   boundary_ramp_epochs: ${trainer.max_epochs}
 
@@ -76,7 +76,7 @@ litmodule:
 # =============================================================================
 
 trainer:
-  max_epochs: 100
+  max_epochs: 150
   strategy: ${training_strategy}
   precision: 16-mixed
   log_every_n_steps: 1
