@@ -138,15 +138,11 @@ class PredictionOps:
     # =========================================================================
     def run_prediction(self, network, device, batch, batch_idx=None):
         item = batch[0]
-
         logits = self._predict_logits(network=network, device=device, data=item["data"])
-
         predicted_segments, predicted_probs = self._restore_prediction_shape(
             logits=logits, properties=item["properties"]
         )
-
         item.update({"logits": logits, "predicted_segments": predicted_segments, "predicted_probs": predicted_probs})
-
         return item
 
     def write_prediction_case_zip(self, prediction, zip_dir, include_gt, reset_direction=False, keep_temp_folder=False):
@@ -257,7 +253,6 @@ class NNUnetSetup:
     @staticmethod
     def _unwrap_compound_loss(loss):
         """The underlying CompoundLoss, unwrapped from DeepSupervisionWrapper if present."""
-
         return loss.loss if isinstance(loss, DeepSupervisionWrapper) else loss
 
     def update_boundary_weight(self, loss, epoch: int) -> None:
@@ -270,13 +265,10 @@ class NNUnetSetup:
         no-floor-on-its-own boundary term (see BoundaryLoss docstring)
         never dominates early.
         """
-
         if not self.cfg.use_boundary:
             return
-
         ramp_epochs = max(int(self.cfg.boundary_ramp_epochs), 1)
         weight = self.cfg.boundary_weight_max * min(epoch / ramp_epochs, 1.0)
-
         self._unwrap_compound_loss(loss).set_boundary_weight(weight)
 
     def build_optimizer_and_scheduler(self, network):

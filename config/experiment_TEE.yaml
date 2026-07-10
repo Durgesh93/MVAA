@@ -60,13 +60,6 @@ litmodule:
   initial_lr: 0.01
   weight_decay: 0.00003
   num_epochs: ${trainer.max_epochs}
-
-  # Loss is always nnU-Net's default Dice + CE (see module/losses.py
-  # CompoundLoss, built on nnU-Net's own DC_and_CE_loss). Optional
-  # boundary loss (Kervadec et al. 2019) add-on -- BoundaryLoss /
-  # CompoundLoss.set_boundary_weight. Weight ramps linearly from 0 at
-  # epoch 0 to boundary_weight_max at boundary_ramp_epochs (held at
-  # max beyond that); Dice+CE anchors training throughout the ramp.
   use_boundary: true
   boundary_weight_max: 0.01
   boundary_ramp_epochs: ${trainer.max_epochs}

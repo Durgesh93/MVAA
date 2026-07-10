@@ -6,6 +6,10 @@ Usage:
     python engine.py train tee
     python engine.py train ct
 
+    python engine.py retrain video
+    python engine.py retrain tee
+    python engine.py retrain ct
+
     python engine.py predict video
     python engine.py predict tee
     python engine.py predict ct
@@ -24,6 +28,12 @@ Usage:
 
     train always clears the fold's whole output folder first (checkpoints,
     validation, prediction, submission, _rank_outputs).
+
+    retrain resumes from checkpoints/last.ckpt (model weights, optimizer,
+    scheduler, and epoch count) and continues up to whatever num_epochs is
+    currently set in the yaml -- bump it there first if you want more
+    epochs than the original run. Unlike train, retrain does NOT clear
+    the output folder, since it needs the existing checkpoint.
 """
 
 import json
@@ -119,7 +129,13 @@ def _build_trainer(cfg, prediction=False):
     return trainer
 
 
-def _build_objects(config_name, prediction=False):
+def _build_objects(config_name, prediction=False, clear=None):
+    """
+    clear defaults to `not prediction` (train clears, predict doesn't).
+    retrain passes clear=False explicitly -- it's not a prediction run,
+    but it must not wipe the checkpoint it's about to resume from.
+    """
+
     cfg = build_config(config_name=config_name, overrides=[f"fold={FOLD_NUM}"])
 
     set_nnunet_env(cfg)
@@ -131,7 +147,10 @@ def _build_objects(config_name, prediction=False):
 
     cfg = resolve_runtime_config(cfg, prediction=prediction)
 
-    if not prediction:
+    if clear is None:
+        clear = not prediction
+
+    if clear:
         clear_results(cfg)
 
     datamodule = SSLnnUNetDataModule(cfg.datamodule)
@@ -147,6 +166,27 @@ def _run_training(config_name):
     cfg, datamodule, model, trainer = _build_objects(config_name=config_name, prediction=False)
 
     trainer.fit(model=model, datamodule=datamodule)
+
+
+def _run_retraining(config_name):
+    cfg, datamodule, model, trainer = _build_objects(config_name=config_name, prediction=False, clear=False)
+
+    resolved_ckpt = resolve_prediction_ckpt(cfg=cfg, ckpt="last")
+
+    if not Path(resolved_ckpt).is_file():
+        raise FileNotFoundError(
+            f"No checkpoint to resume from: {resolved_ckpt}\n"
+            "retrain needs an existing checkpoints/last.ckpt from a prior "
+            "'train' run -- use 'train' for a fresh run instead."
+        )
+
+    print()
+    print("[retrain] Resuming from checkpoint:")
+    print(f"  {resolved_ckpt}")
+    print(f"  target num_epochs (from current yaml): {trainer.max_epochs}")
+    print()
+
+    trainer.fit(model=model, datamodule=datamodule, ckpt_path=resolved_ckpt)
 
 
 def _run_prediction(config_name, ckpt=CKPT):
@@ -232,6 +272,31 @@ def train(experiment: str = typer.Argument(..., help="Which experiment to train:
     print()
 
     _run_training(config_name=config_name)
+
+
+@app.command()
+def retrain(experiment: str = typer.Argument(..., help="Which experiment to resume training: ct, tee, or video.")):
+    """
+    Resume training from checkpoints/last.ckpt (model, optimizer,
+    scheduler, and epoch count), continuing up to whatever num_epochs is
+    currently set in the yaml. Bump num_epochs in the yaml before running
+    this if you want more epochs than the original run trained for.
+
+    Unlike train, this does not clear the output folder first.
+    """
+
+    try:
+        experiment, config_name = validate_experiment_name(experiment, CONFIG_MAP)
+    except ValueError as e:
+        raise typer.BadParameter(str(e))
+
+    print()
+    print(f"Resuming training for experiment: {experiment}")
+    print(f"Config: {config_name}")
+    print(f"Fold: {FOLD_NUM}")
+    print()
+
+    _run_retraining(config_name=config_name)
 
 
 @app.command()

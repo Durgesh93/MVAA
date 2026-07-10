@@ -5,18 +5,33 @@ Tracks training losses and computes validation segmentation metrics.
 compute_metrics() is called only in validation_step after
 nnunet.run_prediction().
 
-Standalone component: owns its own step_metrics/epoch_metrics state
-plus the label_manager (injected once at construction, since it's
-static for the LightningModule's lifetime like pm/cm/lm are for
-NNUnetSetup). Pure tracking/computation only -- printing, self.log-ing,
-and writing the progress plot to disk are Lightning/IO concerns and
-live directly on SSLnnUNetLightningModule instead (see
-lightning_module.py), which reads this tracker's state via
-compute_step_metrics()/compute_epoch_history().
+nn.Module, registered as self.metrics on SSLnnUNetLightningModule, so
+it moves with the rest of the model whenever Lightning calls .to(device)
+-- step_metrics uses sync_on_compute=True, which runs a cross-rank
+torch.distributed.all_gather inside compute(), and DDP's NCCL backend
+only supports CUDA tensors for that, never CPU. Letting Lightning's own
+device placement handle this (rather than a manual .to(device) call
+before every update) is the same "boring", idiomatic way any other
+torchmetrics-based Metric is wired into a LightningModule.
+
+epoch_metrics is deliberately a plain dict of CatMetric, not a
+MetricCollection: it has no DDP collective (sync_on_compute=False,
+rank-0-only plotting), and a plain dict isn't itself an nn.Module, so
+it's invisible to the auto-registration/.to(device) cascade above --
+it isn't forced onto the model's device the way step_metrics is (it
+follows whatever device update_epoch_metrics happens to hand it, same
+as any other unregistered CatMetric). compute_epoch_history() always
+.cpu()s the result before handing it to matplotlib either way.
+
+Printing, self.log-ing, and writing the progress plot to disk are
+Lightning/IO concerns and live directly on SSLnnUNetLightningModule
+instead (see lightning_module.py), which reads this tracker's state
+via compute_step_metrics()/compute_epoch_history().
 """
 
 import numpy as np
 import torch
+from torch import nn
 
 from torchmetrics import MeanMetric, MetricCollection
 from torchmetrics.aggregation import CatMetric
@@ -24,15 +39,17 @@ from torchmetrics.aggregation import CatMetric
 from utils import safe_binary_segmentation_metrics, to_numpy
 
 
-class MetricsTracker:
+class MetricsTracker(nn.Module):
     def __init__(self, label_manager):
+        super().__init__()
+
         self.lm = label_manager
         self.tracked_metric_keys = ["train_loss", "train_sup_loss", "dice", "asd_mm", "hd_mm", "hd95_mm"]
         self.epoch_metric_keys = ["epoch", *self.tracked_metric_keys]
         self.step_metrics = MetricCollection(
             {key: MeanMetric(sync_on_compute=True) for key in self.tracked_metric_keys}
         )
-        self.epoch_metrics = MetricCollection({key: CatMetric(sync_on_compute=False) for key in self.epoch_metric_keys})
+        self.epoch_metrics = {key: CatMetric(sync_on_compute=False) for key in self.epoch_metric_keys}
 
     def compute_step_metrics(self):
         return self.step_metrics.compute()
@@ -90,10 +107,6 @@ class MetricsTracker:
 
         metric_names = self.tracked_metric_keys[2:]
 
-        # foreground_labels is always non-empty for a real segmentation
-        # config, and classwise[label][metric_name] is always a finite
-        # float (safe_binary_segmentation_metrics uses a fixed penalty
-        # distance instead of None for missed/hallucinated classes).
         foreground_mean = {}
         for metric_name in metric_names:
             values = [classwise[str(label)][metric_name] for label in foreground_labels]
@@ -119,8 +132,9 @@ class MetricsTracker:
     def update_epoch_metrics(self, synced_metrics, current_epoch):
         self.epoch_metrics["epoch"].update(torch.tensor([current_epoch], dtype=torch.float32))
         for key in self.tracked_metric_keys:
-            self.epoch_metrics[key].update(torch.tensor([synced_metrics[key]], dtype=torch.float32))
+            value = synced_metrics[key]
+            self.epoch_metrics[key].update(value)
 
     def compute_epoch_history(self):
-        history = self.epoch_metrics.compute()
+        history = {key: metric.compute() for key, metric in self.epoch_metrics.items()}
         return {key: value.detach().cpu().numpy() for key, value in history.items()}
