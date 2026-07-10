@@ -63,6 +63,15 @@ from utils import (
     resolve_prediction_ckpt,
 )
 
+# The augmenter's background workers are forked, not spawned. If this process
+# ever runs a parallelized CPU op (e.g. torch.load-ing a checkpoint on
+# retrain) before that fork, PyTorch's native intra-op thread pool gets
+# initialized here first -- the fork then hands each worker a thread-pool
+# descriptor pointing at threads that don't exist post-fork, and the
+# worker's first CPU conv/op deadlocks forever waiting on them. Pinning this
+# process to 1 thread means there's no pool to poison in the first place.
+torch.set_num_threads(1)
+
 app = typer.Typer()
 
 
@@ -123,6 +132,7 @@ def _build_trainer(cfg, prediction=False):
 
     if trainer_cfg.get("enable_checkpointing", True):
         callbacks.append(instantiate(cfg.checkpoint))
+        callbacks.append(instantiate(cfg.checkpoint_last))
 
     trainer = L.Trainer(**trainer_cfg, callbacks=callbacks)
 

@@ -69,7 +69,7 @@ litmodule:
 # =============================================================================
 
 trainer:
-  max_epochs: 150
+  max_epochs: 250
   strategy: ${training_strategy}
   precision: 16-mixed
   log_every_n_steps: 1
@@ -101,8 +101,24 @@ checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.nnunet_results}/${dataset_id}/${plans_identifier}__${configuration}/fold_${fold}/checkpoints
   filename: "best-{epoch:03d}-{dice:.4f}"
-  save_last: true
+  save_last: false
   save_top_k: 1
   monitor: "dice"
   mode: "max"
+  auto_insert_metric_name: false
+
+# Lightning only refreshes save_last's file in the SAME step it also saves
+# a new top-k checkpoint (see ModelCheckpoint.on_validation_end -- last is
+# gated behind `_last_global_step_saved == trainer.global_step`, which the
+# monitor-based callback above only bumps when dice hits a new record). Once
+# dice plateaus, last.ckpt silently stops updating even though training
+# keeps progressing. A second, unmonitored callback saves unconditionally
+# every epoch, which keeps its own save_last in sync every time.
+checkpoint_last:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  dirpath: ${paths.nnunet_results}/${dataset_id}/${plans_identifier}__${configuration}/fold_${fold}/checkpoints
+  filename: "_last_tracker"
+  save_last: true
+  save_top_k: 1
+  monitor: null
   auto_insert_metric_name: false
