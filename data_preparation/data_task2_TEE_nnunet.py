@@ -224,7 +224,7 @@ def main(
         help="MVAA root directory containing reference_data/.",
     ),
     output_dir: Path = typer.Option(
-        Path("dirs/data_storage/processed/MVAA_nnUNET"),
+        Path("dirs/data_storage/nnUNet"),
         "--output-dir",
         help="Final nnU-Net root containing nnUNet_raw, nnUNet_preprocessed, and nnUNet_results.",
     ),
