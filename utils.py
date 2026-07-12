@@ -281,9 +281,15 @@ def collect_submission_files(cfg, fold_num):
 # =============================================================================
 
 
-def save_training_progress_plot(history, progress_png_file, dataset_name, fold):
+def save_training_progress_plot(history, progress_png_file, dataset_name, fold, dice_classwise_keys=None):
     """
     Save training_progress.png from already-computed NumPy history.
+
+    dice_classwise_keys: history keys (e.g. ["dice_class_1", "dice_class_2"])
+    each holding one tracked class's dice -- when given, the "Dice" panel
+    plots one line per class instead of the single aggregate "dice" mean,
+    so classwise performance (e.g. the submitted class vs. training-only
+    auxiliary classes) is visible directly in the plot.
     """
 
     if "epoch" not in history:
@@ -317,12 +323,10 @@ def save_training_progress_plot(history, progress_png_file, dataset_name, fold):
     axes = np.asarray(axes).reshape(-1)
 
     for ax, (key, title, best_mode) in zip(axes, plot_keys):
-        values = np.asarray(history[key], dtype=float)
-
-        mask = ~np.isnan(values)
-
-        xs = epochs[mask]
-        ys = values[mask]
+        if key == "dice" and dice_classwise_keys:
+            series = {k.removeprefix("dice_"): np.asarray(history[k], dtype=float) for k in dice_classwise_keys}
+        else:
+            series = {key: np.asarray(history[key], dtype=float)}
 
         ax.set_title(title, fontsize=13)
 
@@ -334,27 +338,44 @@ def save_training_progress_plot(history, progress_png_file, dataset_name, fold):
 
         ax.grid(True, which="minor", linestyle=":", linewidth=0.5, alpha=0.30)
 
-        if len(xs) == 0:
+        all_ys = []
+
+        for series_label, values in series.items():
+            mask = ~np.isnan(values)
+
+            xs = epochs[mask]
+            ys = values[mask]
+
+            if len(xs) == 0:
+                continue
+
+            all_ys.append(ys)
+
+            last_value = ys[-1]
+
+            if best_mode == "min":
+                best_value = ys.min()
+                best_word = "best/min"
+            else:
+                best_value = ys.max()
+                best_word = "best/max"
+
+            label_prefix = f"{series_label}: " if len(series) > 1 else ""
+
+            ax.plot(
+                xs,
+                ys,
+                marker="o",
+                linewidth=1.8,
+                markersize=4,
+                label=(f"{label_prefix}last={last_value:.4f}, " f"{best_word}={best_value:.4f}"),
+            )
+
+        if len(all_ys) == 0:
             ax.text(0.5, 0.5, "No values yet", ha="center", va="center", transform=ax.transAxes)
             continue
 
-        last_value = ys[-1]
-
-        if best_mode == "min":
-            best_value = ys.min()
-            best_word = "best/min"
-        else:
-            best_value = ys.max()
-            best_word = "best/max"
-
-        ax.plot(
-            xs,
-            ys,
-            marker="o",
-            linewidth=1.8,
-            markersize=4,
-            label=(f"last={last_value:.4f}, " f"{best_word}={best_value:.4f}"),
-        )
+        ys = np.concatenate(all_ys)
 
         if key == "dice":
             ymin = max(0.0, float(ys.min()) - 0.02)

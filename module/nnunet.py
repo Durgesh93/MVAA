@@ -60,9 +60,7 @@ class PredictionOps:
     with `.to()`).
     """
 
-    def __init__(
-        self, plans_manager, configuration_manager, label_manager, dataset_json, trainer_name, configuration_name
-    ):
+    def __init__(self, plans_manager, configuration_manager, label_manager, dataset_json, trainer_name, configuration_name):
         self.pm = plans_manager
         self.cm = configuration_manager
         self.lm = label_manager
@@ -73,7 +71,6 @@ class PredictionOps:
     def _unwrap_network(self, network):
         if hasattr(network, "module"):
             return network.module
-
         return network
 
     def _make_predictor(self, net, device):
@@ -87,7 +84,6 @@ class PredictionOps:
             verbose_preprocessing=False,
             allow_tqdm=False,
         )
-
         predictor.plans_manager = self.pm
         predictor.configuration_manager = self.cm
         predictor.network = net
@@ -96,7 +92,6 @@ class PredictionOps:
         predictor.allowed_mirroring_axes = tuple(range(len(self.cm.patch_size)))
         predictor.label_manager = self.lm
         predictor.list_of_parameters = [net.state_dict()]
-
         return predictor
 
     def _predict_logits(self, network, device, data):
@@ -105,20 +100,15 @@ class PredictionOps:
                 f"Configuration {self.configuration_name} is cascaded, "
                 "but this module does not support cascaded inference."
             )
-
         net = self._unwrap_network(network)
-
         old_deep_supervision = net.decoder.deep_supervision
         net.decoder.deep_supervision = False
-
         predictor = self._make_predictor(net, device)
-
         try:
             logits = predictor.predict_sliding_window_return_logits(data)
         finally:
             net.decoder.deep_supervision = old_deep_supervision
             compute_gaussian.cache_clear()
-
         return logits
 
     def _restore_prediction_shape(self, logits, properties):
@@ -130,7 +120,6 @@ class PredictionOps:
             properties_dict=properties,
             return_probabilities=True,
         )
-
         return predicted_segments, predicted_probs
 
     # =========================================================================
@@ -139,9 +128,7 @@ class PredictionOps:
     def run_prediction(self, network, device, batch, batch_idx=None):
         item = batch[0]
         logits = self._predict_logits(network=network, device=device, data=item["data"])
-        predicted_segments, predicted_probs = self._restore_prediction_shape(
-            logits=logits, properties=item["properties"]
-        )
+        predicted_segments, predicted_probs = self._restore_prediction_shape(logits=logits, properties=item["properties"])
         item.update({"logits": logits, "predicted_segments": predicted_segments, "predicted_probs": predicted_probs})
         return item
 
@@ -155,9 +142,7 @@ class PredictionOps:
             reset_direction=reset_direction,
         )
 
-    def write_submission_prediction(
-        self, prediction, output_folder, convert_to_255, keep_classes, submission_output_format
-    ):
+    def write_submission_prediction(self, prediction, output_folder, convert_to_255, keep_classes, submission_output_format):
         _write_submission_prediction(
             prediction=prediction,
             output_folder=output_folder,
@@ -195,16 +180,12 @@ class NNUnetSetup:
 
     def _make_trainer_shim(self, is_ddp):
         shim = type("S", (), {})()
-
         shim.configuration_manager = self.cm
         shim.label_manager = self.lm
         shim.enable_deep_supervision = self.enable_deep_supervision
         shim.is_ddp = is_ddp
-
         shim._get_deep_supervision_scales = lambda: nnUNetTrainer._get_deep_supervision_scales(shim)
-
         shim._do_i_compile = lambda: False
-
         return shim
 
     def build_network(self):

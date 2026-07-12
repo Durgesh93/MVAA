@@ -40,11 +40,30 @@ from utils import safe_binary_segmentation_metrics, to_numpy
 
 
 class MetricsTracker(nn.Module):
-    def __init__(self, label_manager):
+    def __init__(self, tracked_labels):
+        """
+        tracked_labels: list of (label_value, label_name) pairs (e.g.
+        [(1, "class_10")] for video) -- the dice/asd/hd/hd95-relevant
+        classes for this task, read from litmodule_cfg.tracked_labels
+        via lightning_module.py. Every tracked scalar metric (dice,
+        asd_mm, hd_mm, hd95_mm) is a mean over just these classes (e.g.
+        valve-only for video) since that's what checkpoint.monitor
+        selects on; dice_<name> additionally tracks each class
+        individually for the classwise plot.
+        """
         super().__init__()
 
-        self.lm = label_manager
-        self.tracked_metric_keys = ["train_loss", "train_sup_loss", "dice", "asd_mm", "hd_mm", "hd95_mm"]
+        self.tracked_labels = tracked_labels
+        self.dice_keys = [f"dice_{name}" for _, name in tracked_labels]
+        self.tracked_metric_keys = [
+            "train_loss",
+            "train_sup_loss",
+            "dice",
+            *self.dice_keys,
+            "asd_mm",
+            "hd_mm",
+            "hd95_mm",
+        ]
         self.epoch_metric_keys = ["epoch", *self.tracked_metric_keys]
         self.step_metrics = MetricCollection(
             {key: MeanMetric(sync_on_compute=True) for key in self.tracked_metric_keys}
@@ -89,12 +108,10 @@ class MetricsTracker(nn.Module):
         if len(voxel_spacing) != pred.ndim:
             voxel_spacing = voxel_spacing[-pred.ndim :]
 
-        # Overall = background + foreground. Background is normally label 0.
-        foreground_labels = list(self.lm.foreground_labels)
-        all_labels = [0] + foreground_labels
+        tracked_values = [label for label, _ in self.tracked_labels]
 
         classwise = {}
-        for label in all_labels:
+        for label in tracked_values:
             pred_mask = pred == label
             gt_mask = gt == label
             scores = safe_binary_segmentation_metrics(pred_mask=pred_mask, gt_mask=gt_mask, voxel_spacing=voxel_spacing)
@@ -105,13 +122,15 @@ class MetricsTracker(nn.Module):
                 "hd95_mm": scores["HD95_mm"],
             }
 
-        metric_names = self.tracked_metric_keys[2:]
+        tracked_mean = {}
+        for metric_name in ("asd_mm", "hd_mm", "hd95_mm"):
+            values = [classwise[str(label)][metric_name] for label in tracked_values]
+            tracked_mean[metric_name] = float(np.mean(values))
 
-        foreground_mean = {}
-        for metric_name in metric_names:
-            values = [classwise[str(label)][metric_name] for label in foreground_labels]
-            foreground_mean[metric_name] = float(np.mean(values))
-        return {"foreground_mean": foreground_mean}
+        tracked_dice = {name: classwise[str(label)]["dice"] for label, name in self.tracked_labels}
+        dice_mean_tracked = float(np.mean(list(tracked_dice.values())))
+
+        return {"tracked_mean": tracked_mean, "tracked_dice": tracked_dice, "dice_mean_tracked": dice_mean_tracked}
 
     def update_step_training_metrics(self, train_loss, train_sup_loss):
         values = {"train_loss": train_loss, "train_sup_loss": train_sup_loss}
@@ -119,13 +138,16 @@ class MetricsTracker(nn.Module):
             self.step_metrics[key].update(value)
 
     def update_step_val_metrics(self, metrics):
-        main_mean = metrics["foreground_mean"]
+        tracked_mean = metrics["tracked_mean"]
         values = {
-            "dice": main_mean["dice"],
-            "asd_mm": main_mean["asd_mm"],
-            "hd_mm": main_mean["hd_mm"],
-            "hd95_mm": main_mean["hd95_mm"],
+            "dice": metrics["dice_mean_tracked"],
+            "asd_mm": tracked_mean["asd_mm"],
+            "hd_mm": tracked_mean["hd_mm"],
+            "hd95_mm": tracked_mean["hd95_mm"],
         }
+        for name, value in metrics["tracked_dice"].items():
+            values[f"dice_{name}"] = value
+
         for key, value in values.items():
             self.step_metrics[key].update(value)
 

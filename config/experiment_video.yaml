@@ -63,13 +63,14 @@ litmodule:
   use_boundary: true
   boundary_weight_max: 0.01
   boundary_ramp_epochs: ${trainer.max_epochs}
+  tracked_labels: ["class_10"]
 
 # =============================================================================
 # Trainer config
 # =============================================================================
 
 trainer:
-  max_epochs: 250
+  max_epochs: 300
   strategy: ${training_strategy}
   precision: 16-mixed
   log_every_n_steps: 1
@@ -107,18 +108,23 @@ checkpoint:
   mode: "max"
   auto_insert_metric_name: false
 
-# Lightning only refreshes save_last's file in the SAME step it also saves
-# a new top-k checkpoint (see ModelCheckpoint.on_validation_end -- last is
-# gated behind `_last_global_step_saved == trainer.global_step`, which the
-# monitor-based callback above only bumps when dice hits a new record). Once
-# dice plateaus, last.ckpt silently stops updating even though training
-# keeps progressing. A second, unmonitored callback saves unconditionally
-# every epoch, which keeps its own save_last in sync every time.
+# Lightning's built-in save_last only refreshes in the SAME step it also
+# saves a new top-k checkpoint (see ModelCheckpoint.on_validation_end --
+# last is gated behind `_last_global_step_saved == trainer.global_step`,
+# which the monitor-based callback above only bumps when dice hits a new
+# record). Once dice plateaus, that would silently stop updating even
+# though training keeps progressing. This second, unmonitored callback
+# saves unconditionally every epoch instead, to the fixed filename
+# "_last_tracker" -- save_last is off here since it's redundant with that
+# (and, being a separate untracked "last.ckpt" lineage, doesn't survive
+# job restarts cleanly: a resumed process doesn't know about the previous
+# process's last.ckpt and versions off a new last-v1.ckpt instead of
+# reusing it).
 checkpoint_last:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.nnunet_results}/${dataset_id}/${plans_identifier}__${configuration}/fold_${fold}/checkpoints
   filename: "_last_tracker"
-  save_last: true
+  save_last: false
   save_top_k: 1
   monitor: null
   auto_insert_metric_name: false

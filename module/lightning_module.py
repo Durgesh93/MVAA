@@ -32,6 +32,8 @@ class SSLnnUNetLightningModule(L.LightningModule):
         self.dataset_json = self.nnunet.dataset_json
         self.keep_classes = [self.dataset_json["labels"]["class_10"]] if self.is_t3_vid else None
 
+        self.tracked_labels = [(self.dataset_json["labels"][name], name) for name in self.cfg.tracked_labels]
+
         self.actual_validation_output_base = (
             Path(nnUNet_results) / self.dataset_name / (self.cfg.plans_identifier + "__" + self.cfg.configuration)
         )
@@ -43,7 +45,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
         self.progress_png_file = self.fold_output_folder / "training_progress.png"
 
         self.ddp = DDPHelper()
-        self.metrics = MetricsTracker(label_manager=self.nnunet.lm)
+        self.metrics = MetricsTracker(tracked_labels=self.tracked_labels)
 
         self.network = None
         self.loss = None
@@ -127,13 +129,14 @@ class SSLnnUNetLightningModule(L.LightningModule):
             print(f"[{stage}] segmentation metrics")
             print("=" * 80)
 
-        for key, label in [("dice", "dice   "), ("asd_mm", "asd_mm "), ("hd_mm", "hd_mm  "), ("hd95_mm", "hd95_mm")]:
+        metric_keys = ["dice", *self.metrics.dice_keys, "asd_mm", "hd_mm", "hd95_mm"]
+        for key in metric_keys:
             value = synced_metrics[key]
             self.log(
                 key, value, on_step=False, on_epoch=True, prog_bar=True, logger=False, sync_dist=False, batch_size=1
             )
             if do_print:
-                print(f"{label} : {value:.4f}")
+                print(f"{key:<12} : {value:.4f}")
 
         if do_print:
             print("=" * 80)
@@ -145,6 +148,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
                 progress_png_file=self.actual_validation_output_base / "training_progress.png",
                 dataset_name=self.dataset_name,
                 fold=self.cfg.fold,
+                dice_classwise_keys=self.metrics.dice_keys,
             )
         self.metrics.reset_step_metrics()
         self.ddp.merge_rank_outputs(
