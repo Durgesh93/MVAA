@@ -41,7 +41,7 @@ from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.inference.export_prediction import convert_predicted_logits_to_segmentation_with_correct_shape
 
-from .losses import BoundaryLoss, CompoundLoss
+from .losses import BoundaryLoss, CompoundLoss, PseudoLabelLoss, WeakStrongPseudoLabelLoss
 
 from utils import (
     write_prediction_case_zip as _write_prediction_case_zip,
@@ -230,6 +230,11 @@ class NNUnetSetup:
             loss = DeepSupervisionWrapper(loss, weights)
 
         return loss
+
+    def build_pseudo_loss(self):
+        if self.cfg.tru_weak_strong:
+            return WeakStrongPseudoLabelLoss(threshold=self.cfg.pseudo_threshold)
+        return PseudoLabelLoss(threshold=self.cfg.pseudo_threshold)
 
     @staticmethod
     def _unwrap_compound_loss(loss):

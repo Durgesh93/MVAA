@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any, Dict
 
+import torch
 import lightning as L
 
 from nnunetv2.paths import nnUNet_results
@@ -9,7 +10,7 @@ from .metrics import MetricsTracker
 from .ddp import DDPHelper
 from .nnunet import NNUnetSetup
 
-from utils import get_train_batch_data_target
+from utils import get_train_batch_data_target, to_tensor
 from utils import save_training_progress_plot as write_training_progress_plot
 
 
@@ -49,11 +50,13 @@ class SSLnnUNetLightningModule(L.LightningModule):
 
         self.network = None
         self.loss = None
+        self.pseudo_loss_fn = None
 
     def setup(self, stage=None):
         self.network = self.nnunet.build_network()
         is_ddp = int(self.trainer.world_size) > 1
         self.loss = self.nnunet.build_loss(is_ddp=is_ddp)
+        self.pseudo_loss_fn = self.nnunet.build_pseudo_loss()
 
     def forward(self, x):
         return self.network(x)
@@ -62,15 +65,65 @@ class SSLnnUNetLightningModule(L.LightningModule):
         self.nnunet.update_boundary_weight(self.loss, self.current_epoch)
 
     def _supervised_loss(self, batch: Dict[str, Any]):
-        data, target = get_train_batch_data_target(batch, device=self.device)
+        data, target = get_train_batch_data_target(batch["labeled"], device=self.device)
         output = self.network(data)
         loss = self.loss(output, target)
         return loss, output, target
 
+    def _pseudo_loss(self, unlabeled_batch: Dict[str, Any]):
+        """
+        tru_weak_strong=False: single-view self-training (Lee, 2013) --
+        forward-pass the network on its own TrU sample, treat the confident
+        argmax as a pseudo-label, and train against it.
+
+        tru_weak_strong=True: FixMatch-style consistency -- data_views[0] is
+        the weak (geometric-only) view, forwarded under no_grad through the
+        unwrapped network purely to source a pseudo-label/confidence mask
+        (no backward, so DDP gradient sync is untouched by this call).
+        data_views[1:] are strong (weak + intensity aug) views, forwarded
+        with grad through self.network and trained to match that label.
+
+        Deep supervision is toggled off in both modes (mirroring
+        PredictionOps._predict_logits's unwrap/restore pattern) since the
+        pseudo-label only exists at one resolution -- but any forward that
+        needs gradients must go through self.network directly (never the
+        unwrapped `.module`), or DDP gradient sync breaks.
+        """
+        if self.current_epoch < self.cfg.pseudo_warmup_epochs:
+            return torch.zeros((), device=self.device)
+
+        net = self.network.module if hasattr(self.network, "module") else self.network
+        old_deep_supervision = net.decoder.deep_supervision
+        net.decoder.deep_supervision = False
+        try:
+            if self.cfg.tru_weak_strong:
+                weak_data = to_tensor(unlabeled_batch["data_views"][0], device=self.device, dtype=torch.float32)
+                with torch.no_grad():
+                    weak_logits = net(weak_data)
+
+                strong_logits_list = [
+                    self.network(to_tensor(view, device=self.device, dtype=torch.float32))
+                    for view in unlabeled_batch["data_views"][1:]
+                ]
+
+                return self.pseudo_loss_fn(weak_logits, strong_logits_list)
+
+            data = to_tensor(unlabeled_batch["data_views"][0], device=self.device, dtype=torch.float32)
+            logits = self.network(data)
+            return self.pseudo_loss_fn(logits)
+        finally:
+            net.decoder.deep_supervision = old_deep_supervision
+
     def training_step(self, batch, batch_idx):
         sup_loss, _, _ = self._supervised_loss(batch)
-        self.metrics.update_step_training_metrics(train_loss=sup_loss.detach(), train_sup_loss=sup_loss.detach())
-        return sup_loss
+        pseudo_loss = self._pseudo_loss(batch["unlabeled"])
+        total_loss = sup_loss + self.cfg.lambda_pseudo * pseudo_loss
+        self.metrics.update_step_training_metrics(
+            train_loss=total_loss.detach(),
+            train_sup_loss=sup_loss.detach(),
+            train_pseudo_loss=pseudo_loss.detach(),
+        )
+        return total_loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         if self.trainer.sanity_checking:

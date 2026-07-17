@@ -199,3 +199,72 @@ class CompoundLoss(nn.Module):
         boundary = self.boundary(net_output, target_region, loss_mask=mask)
 
         return _clip_loss((1 - self.boundary_weight) * dice_ce + self.boundary_weight * boundary)
+
+
+class PseudoLabelLoss(nn.Module):
+    """
+    Confidence-thresholded pseudo-label cross-entropy (Lee, 2013) for TrU
+    samples. Independent of CompoundLoss/ignore_label (none of the 3 MVAA
+    datasets define one) -- pixels below `threshold` softmax confidence are
+    excluded entirely rather than distilled from a likely-wrong guess.
+
+    logits must be single-scale [B, C, *spatial] (deep supervision OFF for
+    this forward pass -- see SSLnnUNetLightningModule._pseudo_loss).
+    """
+
+    def __init__(self, threshold: float):
+        super().__init__()
+        self.threshold = threshold
+
+    def forward(self, logits: Tensor) -> Tensor:
+        with torch.no_grad():
+            probs = torch.softmax(logits, dim=1)
+            confidence, pseudo_label = probs.max(dim=1)
+            confident_mask = confidence >= self.threshold
+
+        num_confident = confident_mask.sum()
+
+        if num_confident == 0:
+            return torch.zeros((), device=logits.device, dtype=logits.dtype)
+
+        per_pixel_ce = nn.functional.cross_entropy(logits, pseudo_label, reduction="none")
+
+        return (per_pixel_ce * confident_mask).sum() / num_confident
+
+
+class WeakStrongPseudoLabelLoss(nn.Module):
+    """
+    FixMatch-style confidence-thresholded consistency loss for TrU samples.
+
+    Unlike PseudoLabelLoss (single-view self-training), the pseudo-label
+    and confidence mask come from the weak view's own prediction
+    (geometric-only, no intensity aug -- computed under no_grad by the
+    caller), while the loss is the masked CE between that pseudo-label
+    and one or more strong (weak + intensity aug) views' predictions.
+    Two differently-augmented views of the same voxel-aligned patch
+    give a genuine augmentation-invariance signal, rather than a
+    network training to agree with its own single-view guess.
+    """
+
+    def __init__(self, threshold: float):
+        super().__init__()
+        self.threshold = threshold
+
+    def forward(self, weak_logits: Tensor, strong_logits_list) -> Tensor:
+        with torch.no_grad():
+            probs = torch.softmax(weak_logits, dim=1)
+            confidence, pseudo_label = probs.max(dim=1)
+            confident_mask = confidence >= self.threshold
+
+        num_confident = confident_mask.sum()
+
+        if num_confident == 0:
+            return torch.zeros((), device=weak_logits.device, dtype=weak_logits.dtype)
+
+        view_losses = []
+
+        for strong_logits in strong_logits_list:
+            per_pixel_ce = nn.functional.cross_entropy(strong_logits, pseudo_label, reduction="none")
+            view_losses.append((per_pixel_ce * confident_mask).sum() / num_confident)
+
+        return torch.stack(view_losses).mean()

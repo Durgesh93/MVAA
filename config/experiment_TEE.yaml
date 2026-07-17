@@ -4,7 +4,7 @@
 
 seed: 12345
 
-experiment_name: supervised
+experiment_name: ssl
 
 # =============================================================================
 # Runtime / cluster-controlled values
@@ -23,6 +23,7 @@ fold: all
 task_id: 'task2'
 prefix: 't2_tee'
 plans_identifier: nnUNetPlans
+tru_weak_strong: true
 
 # =============================================================================
 # Paths
@@ -44,6 +45,12 @@ datamodule:
   fold: ${fold}
   seed: ${seed}
   plans_identifier: ${plans_identifier}
+  prefix: ${prefix}
+  tru_num_views: 2
+  tru_weak_strong: ${tru_weak_strong}
+  use_spatial_transform_trl: true
+  use_spatial_transform_tru: false
+  use_intensity_transform_tru: true
 
 # =============================================================================
 # LightningModule config
@@ -57,12 +64,16 @@ litmodule:
   fold: ${fold}
   seed: ${seed}
   plans_identifier: ${plans_identifier}
+  tru_weak_strong: ${tru_weak_strong}
   initial_lr: 0.01
   weight_decay: 0.00003
   num_epochs: ${trainer.max_epochs}
   use_boundary: true
   boundary_weight_max: 0.01
   boundary_ramp_epochs: ${trainer.max_epochs}
+  lambda_pseudo: 0.25
+  pseudo_threshold: 0.95
+  pseudo_warmup_epochs: 20
   tracked_labels: ["class_1", "class_2"]
 
 # =============================================================================

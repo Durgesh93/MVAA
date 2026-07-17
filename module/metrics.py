@@ -58,6 +58,7 @@ class MetricsTracker(nn.Module):
         self.tracked_metric_keys = [
             "train_loss",
             "train_sup_loss",
+            "train_pseudo_loss",
             "dice",
             *self.dice_keys,
             "asd_mm",
@@ -132,8 +133,12 @@ class MetricsTracker(nn.Module):
 
         return {"tracked_mean": tracked_mean, "tracked_dice": tracked_dice, "dice_mean_tracked": dice_mean_tracked}
 
-    def update_step_training_metrics(self, train_loss, train_sup_loss):
-        values = {"train_loss": train_loss, "train_sup_loss": train_sup_loss}
+    def update_step_training_metrics(self, train_loss, train_sup_loss, train_pseudo_loss):
+        values = {
+            "train_loss": train_loss,
+            "train_sup_loss": train_sup_loss,
+            "train_pseudo_loss": train_pseudo_loss,
+        }
         for key, value in values.items():
             self.step_metrics[key].update(value)
 

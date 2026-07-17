@@ -1,8 +1,11 @@
 """
-Supervised-only LightningDataModule for nnU-Net.
+Semi-supervised LightningDataModule for SSL nnU-Net.
 
 Train:
-    preprocessed nnUNetDataset + nnUNetDataLoader for TrL.
+    preprocessed nnUNetDataset + nnUNetDataLoader for TrL, plus a
+    MultiViewUnlabeledDataLoader for TrU (K independently-augmented
+    intensity views per sample, sharing one geometric draw -- see
+    multiview_loader.MultiViewUnlabeledDataLoader's docstring).
 
 Validation:
     raw imagesTr + labelsTr.
@@ -16,7 +19,6 @@ All split logic is inside setup(), because setup() has trainer.world_size
 and trainer.global_rank.
 """
 
-from pathlib import Path
 import math
 import os
 
@@ -24,13 +26,14 @@ import numpy as np
 import torch
 import lightning as L
 
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
+from lightning.pytorch.utilities.combined_loader import CombinedLoader
 
 from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
-
 from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
-
 from batchgenerators.utilities.file_and_folder_operations import join, isfile, load_json, save_json, maybe_mkdir_p
+
+from batchgeneratorsv2.transforms.utils.compose import ComposeTransforms
 
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_raw
 from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
@@ -39,168 +42,15 @@ from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.utilities.crossval_split import generate_crossval_split
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 from nnunetv2.utilities.dataset_name_id_conversion import maybe_convert_to_dataset_name
-from nnunetv2.inference.data_iterators import preprocessing_iterator_fromfiles
 
-from utils import split_by_rank, to_tensor
+from utils import split_by_rank
 
-# =============================================================================
-# Raw case dataset for validation and prediction
-# =============================================================================
-
-
-class nnUNetRawCaseDataset(Dataset):
-    """
-    Dataset for raw validation/test cases.
-
-    It prepares one full case:
-        - finds raw image channel files
-        - runs nnU-Net preprocessing
-        - loads GT if available
-    """
-
-    def __init__(
-        self,
-        raw_dataset_folder,
-        case_ids,
-        split,
-        file_ending,
-        num_channels,
-        has_gt,
-        plans_manager,
-        configuration_manager,
-        dataset_json,
-    ):
-        self.raw_dataset_folder = Path(raw_dataset_folder)
-        self.case_ids = list(sorted(case_ids))
-        self.split = split
-        self.file_ending = file_ending
-        self.num_channels = int(num_channels)
-        self.has_gt = bool(has_gt)
-
-        self.pm = plans_manager
-        self.cm = configuration_manager
-        self.dataset_json = dataset_json
-
-        if self.split == "val":
-            self.image_folder = self.raw_dataset_folder / "imagesTr"
-            self.label_folder = self.raw_dataset_folder / "labelsTr"
-
-        elif self.split == "test":
-            self.image_folder = self.raw_dataset_folder / "imagesTs"
-            self.label_folder = None
-
-        else:
-            raise ValueError(f"Unknown split '{self.split}'. Use 'val' or 'test'.")
-
-    def __len__(self):
-        return len(self.case_ids)
-
-    def _image_files_for_case(self, case_id):
-        image_files = []
-
-        for c in range(self.num_channels):
-            image_file = self.image_folder / f"{case_id}_{c:04d}{self.file_ending}"
-
-            if not image_file.exists():
-                raise FileNotFoundError(f"Missing image file for case '{case_id}': {image_file}")
-
-            image_files.append(str(image_file))
-
-        return image_files
-
-    def _preprocess_case(self, image_files, case_id):
-        iterator = preprocessing_iterator_fromfiles(
-            list_of_lists=[image_files],
-            list_of_segs_from_prev_stage_files=None,
-            output_filenames_truncated=[case_id],
-            plans_manager=self.pm,
-            dataset_json=self.dataset_json,
-            configuration_manager=self.cm,
-            num_processes=1,
-            pin_memory=False,
-            verbose=False,
-        )
-
-        item = next(iterator)
-
-        # nnU-Net preprocessing_iterator_fromfiles already returns
-        # item["data"] as torch.Tensor with dtype float32.
-        # Keep it unchanged because nnUNetPredictor expects 4D:
-        #   [C, X, Y, Z]
-        data = item["data"]
-        properties = item["data_properties"]
-
-        return data, properties
-
-    def _load_gt_for_case(self, case_id):
-        if not self.has_gt:
-            return None, None
-
-        label_file = self.label_folder / f"{case_id}{self.file_ending}"
-
-        if not label_file.exists():
-            raise FileNotFoundError(f"Missing label file for case '{case_id}': {label_file}")
-
-        rw = self.pm.image_reader_writer_class()
-
-        gt_data, gt_properties = rw.read_seg(str(label_file))
-
-        # gt_data is a label map (integer class ids), not multi-channel
-        # logits/probabilities -- it was read straight from labelsTr.
-        # rw.read_seg wraps it with a leading dim-1 axis that is just an
-        # I/O convention, not a real class channel:
-        #   3D: (1, D, H, W)
-        #   2D: (1, 1, H, W)
-        #
-        # gt_data[0] removes only that reader-convention axis:
-        #   3D -> [D, H, W]            (clean)
-        #   2D -> [1, H, W]            (still has a leftover singleton,
-        #                               because the 2D slice itself is
-        #                               represented as (1, H, W))
-        gt_data = to_tensor(gt_data[0])
-
-        return gt_data, gt_properties
-
-    def __getitem__(self, index):
-        case_id = self.case_ids[index]
-
-        image_files = self._image_files_for_case(case_id)
-
-        data, properties = self._preprocess_case(image_files=image_files, case_id=case_id)
-
-        gt_data, gt_properties = self._load_gt_for_case(case_id)
-
-        return {
-            "case_id": case_id,
-            "image_files": image_files,
-            "data": data,
-            "properties": properties,
-            "gt_data": gt_data,
-            "gt_properties": gt_properties,
-            "has_gt": self.has_gt,
-            "split": self.split,
-        }
+from .raw_case_dataset import nnUNetRawCaseDataset, nnunet_raw_case_collate
+from .multiview_loader import MultiViewUnlabeledDataLoader
+from .transform_builders import TransformBuilderMixin
 
 
-def nnunet_raw_case_collate(batch):
-    """
-    Keep batch unstacked.
-
-    Lightning receives:
-        batch = [case_dict]
-
-    Use batch_size=1.
-    """
-
-    return batch
-
-
-# =============================================================================
-# SSL DataModule
-# =============================================================================
-
-
-class SSLnnUNetDataModule(L.LightningDataModule):
+class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
     def __init__(self, datamodule_cfg):
         super().__init__()
 
@@ -211,6 +61,18 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         self.fold = self.cfg.fold
         self.seed = self.cfg.seed
         self.plans_identifier = self.cfg.plans_identifier
+        self.prefix = str(self.cfg.prefix)
+        self.tru_num_views = int(self.cfg.tru_num_views)
+        self.tru_weak_strong = bool(self.cfg.tru_weak_strong)
+        self.use_spatial_transform_trl = bool(self.cfg.use_spatial_transform_trl)
+        self.use_spatial_transform_tru = bool(self.cfg.use_spatial_transform_tru)
+        self.use_intensity_transform_tru = bool(self.cfg.use_intensity_transform_tru)
+
+        if self.tru_weak_strong and not self.use_intensity_transform_tru:
+            raise ValueError(
+                "tru_weak_strong requires use_intensity_transform_tru=true -- otherwise the "
+                "'strong' views never diverge from the weak view and the consistency loss is a no-op."
+            )
 
         self.enable_deep_supervision = True
         self.oversample_fg = 0.33
@@ -256,6 +118,7 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         ssl = self.dataset_json["ssl_case_ids"]
 
         self.trl_all = list(ssl["TrL"])
+        self.tru_all = list(ssl["TrU"])
         self.ts_all = list(ssl["Ts"])
 
         self.splits_file = join(self.base, "splits_final_TrL.json")
@@ -263,6 +126,7 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         self.ds_class = None
 
         self.dataset_train_labeled = None
+        self.dataset_train_unlabeled = None
 
         self.raw_dataset_val = None
         self.raw_dataset_test = None
@@ -308,16 +172,17 @@ class SSLnnUNetDataModule(L.LightningDataModule):
 
         This version enforces minimum 4 workers per augmenter.
 
-        In this DataModule each rank creates one augmentation pipeline
-        (labeled only -- no unlabeled/pseudo-label data here).
+        In this DataModule each rank creates two augmentation pipelines:
+            1. labeled (TrL)
+            2. unlabeled (TrU)
 
         Therefore total augmentation workers are approximately:
-            world_size * num_processes
+            world_size * 2 * num_processes
 
         Example:
-            6 GPUs/ranks and num_processes=8
+            6 GPUs/ranks and num_processes=4
 
-            total workers = 6 * 8 = 48
+            total workers = 6 * 2 * 4 = 48
             plus 6 main rank processes.
         """
 
@@ -325,8 +190,8 @@ class SSLnnUNetDataModule(L.LightningDataModule):
 
         world_size = max(1, int(world_size))
 
-        # One train augmenter per rank (labeled only).
-        augmenters_per_rank = 1
+        # Two train augmenters per rank: labeled + unlabeled.
+        augmenters_per_rank = 2
         total_augmenters = world_size * augmenters_per_rank
 
         # Reserve CPUs for:
@@ -379,7 +244,6 @@ class SSLnnUNetDataModule(L.LightningDataModule):
 
     def prepare_data(self):
         cls = infer_dataset_class(self.folder)
-
         cls.unpack_dataset(self.folder, overwrite_existing=False, num_processes=1, verify=True)
 
     def setup(self, stage=None):
@@ -439,6 +303,8 @@ class SSLnnUNetDataModule(L.LightningDataModule):
 
         full_test = list(sorted(self.ts_all))
 
+        full_tru = list(sorted(self.tru_all))
+
         # ------------------------------------------------------------
         # Rank-local split
         # ------------------------------------------------------------
@@ -448,15 +314,21 @@ class SSLnnUNetDataModule(L.LightningDataModule):
 
         test_cases = split_by_rank(full_test, global_rank=global_rank, world_size=world_size)
 
+        tru_cases = split_by_rank(full_tru, global_rank=global_rank, world_size=world_size)
+
         # ------------------------------------------------------------
         # Train limit for infinite nnU-Net loaders
+        #
+        # CombinedLoader(mode="max_size_cycle") cycles the smaller of
+        # TrL/TrU per rank to match the larger, so the epoch length must
+        # account for whichever is bigger -- not just TrL.
         # ------------------------------------------------------------
         max_rank_cases = 0
 
         for rank in range(world_size):
             rank_tr_cases = split_by_rank(full_tr, global_rank=rank, world_size=world_size)
-
-            max_rank_cases = max(max_rank_cases, len(rank_tr_cases))
+            rank_tru_cases = split_by_rank(full_tru, global_rank=rank, world_size=world_size)
+            max_rank_cases = max(max_rank_cases, len(rank_tr_cases), len(rank_tru_cases))
 
         self.limit_train_batches = max(1, math.ceil(max_rank_cases / self.batch_size))
 
@@ -465,6 +337,7 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         print(
             f"\n[rank {global_rank}/{world_size}] "
             f"TrL={len(tr_cases)} | "
+            f"TrU={len(tru_cases)} | "
             f"ValRaw={len(val_cases)} | "
             f"TsRaw={len(test_cases)} | "
             f"limit_train_batches={self.limit_train_batches} | "
@@ -480,6 +353,9 @@ class SSLnnUNetDataModule(L.LightningDataModule):
             print("TrL:")
             print(tr_cases)
 
+            print("TrU:")
+            print(tru_cases)
+
             print("Val raw:")
             print(val_cases)
 
@@ -493,6 +369,10 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         # ------------------------------------------------------------
         self.dataset_train_labeled = self.ds_class(
             self.folder, tr_cases, folder_with_segs_from_previous_stage=self.prev_stage_folder
+        )
+
+        self.dataset_train_unlabeled = self.ds_class(
+            self.folder, tru_cases, folder_with_segs_from_previous_stage=self.prev_stage_folder
         )
 
         # ------------------------------------------------------------
@@ -530,19 +410,19 @@ class SSLnnUNetDataModule(L.LightningDataModule):
         if self.dataset_train_labeled is None:
             raise RuntimeError("dataset_train_labeled is None. setup() did not run correctly.")
 
-        rot, dummy_2d, init_ps, mirror = self._get_da_params_from_nnunet()
+        if self.dataset_train_unlabeled is None:
+            raise RuntimeError("dataset_train_unlabeled is None. setup() did not run correctly.")
 
-        tfm = nnUNetTrainer.get_training_transforms(
-            patch_size=self.cm.patch_size,
-            rotation_for_DA=rot,
-            deep_supervision_scales=self.ds_scales,
-            mirror_axes=mirror,
-            do_dummy_2d_data_aug=dummy_2d,
-            use_mask_for_norm=self.cm.use_mask_for_norm,
-            is_cascaded=self.is_cascaded,
-            foreground_labels=self.lm.foreground_labels,
-            regions=(self.lm.foreground_regions if self.lm.has_regions else None),
-            ignore_label=self.lm.ignore_label,
+        _, _, init_ps, _ = self._get_da_params_from_nnunet()
+
+        # Same split pipeline (geometric + task-specific intensity) for all
+        # three tasks, including CT -- no more bundled
+        # nnUNetTrainer.get_training_transforms() special case.
+        labeled_tfm = ComposeTransforms(
+            [
+                self._build_geometric_transforms(use_spatial_transform=self.use_spatial_transform_trl),
+                self._build_intensity_transforms(),
+            ]
         )
 
         labeled_loader = nnUNetDataLoader(
@@ -555,12 +435,41 @@ class SSLnnUNetDataModule(L.LightningDataModule):
             sampling_probabilities=None,
             pad_sides=None,
             probabilistic_oversampling=False,
-            transforms=tfm,
+            transforms=labeled_tfm,
+        )
+
+        # TrU intensity augmentation is opt-in (default off). In self-training
+        # mode (tru_weak_strong=False) there's no cross-view consistency
+        # check, so augmenting the single view that both generates and
+        # trains against its own pseudo-label buys no invariance benefit,
+        # only confirmation-bias risk. In weak/strong mode (tru_weak_strong=
+        # True) this same flag instead controls the "strong" views 1..K-1 --
+        # it must be on there, or those views never diverge from the weak
+        # view and the consistency loss degenerates to a no-op (enforced in
+        # __init__). ComposeTransforms([]) is a no-op (empty transform
+        # list), so the cloned image passes through unchanged.
+        unlabeled_intensity_tfm = self._build_intensity_transforms() if self.use_intensity_transform_tru else ComposeTransforms([])
+
+        unlabeled_loader = MultiViewUnlabeledDataLoader(
+            data=self.dataset_train_unlabeled,
+            batch_size=self.batch_size,
+            patch_size=init_ps,
+            final_patch_size=self.cm.patch_size,
+            label_manager=self.lm,
+            oversample_foreground_percent=0.0,
+            sampling_probabilities=None,
+            pad_sides=None,
+            probabilistic_oversampling=False,
+            geometric_transforms=self._build_geometric_transforms(use_spatial_transform=self.use_spatial_transform_tru),
+            intensity_transforms=unlabeled_intensity_tfm,
+            num_views=self.tru_num_views,
+            weak_strong=self.tru_weak_strong,
         )
 
         labeled_iter = self._make_augmenter(labeled_loader)
+        unlabeled_iter = self._make_augmenter(unlabeled_loader)
 
-        return labeled_iter
+        return CombinedLoader({"labeled": labeled_iter, "unlabeled": unlabeled_iter}, mode="max_size_cycle")
 
     def val_dataloader(self):
         if self.raw_dataset_val is None:
