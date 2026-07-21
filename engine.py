@@ -34,6 +34,12 @@ Usage:
     currently set in the yaml -- bump it there first if you want more
     epochs than the original run. Unlike train, retrain does NOT clear
     the output folder, since it needs the existing checkpoint.
+
+    predict clears validation/prediction/submission/_rank_outputs before
+    running (but never checkpoints/, which it needs to load from) -- so a
+    predict run always starts from a clean slate instead of leaving stale
+    zips from a previous train/predict run sitting alongside freshly
+    written ones.
 """
 
 import json
@@ -141,9 +147,12 @@ def _build_trainer(cfg, prediction=False):
 
 def _build_objects(config_name, prediction=False, clear=None):
     """
-    clear defaults to `not prediction` (train clears, predict doesn't).
-    retrain passes clear=False explicitly -- it's not a prediction run,
-    but it must not wipe the checkpoint it's about to resume from.
+    clear defaults to True for both train and predict, but clear_results'
+    clear_checkpoints flag differs: train clears checkpoints too (fresh
+    run), predict doesn't (it needs the existing checkpoint to still be
+    there when resolve_prediction_ckpt runs right after this). retrain
+    passes clear=False explicitly -- it's not a prediction run, but it
+    must not wipe the checkpoint it's about to resume from either.
     """
 
     cfg = build_config(config_name=config_name, overrides=[f"fold={FOLD_NUM}"])
@@ -158,10 +167,10 @@ def _build_objects(config_name, prediction=False, clear=None):
     cfg = resolve_runtime_config(cfg, prediction=prediction)
 
     if clear is None:
-        clear = not prediction
+        clear = True
 
     if clear:
-        clear_results(cfg)
+        clear_results(cfg, clear_checkpoints=not prediction)
 
     datamodule = SSLnnUNetDataModule(cfg.datamodule)
 
@@ -243,11 +252,20 @@ def _run_prediction_all(ckpt=CKPT):
         _run_prediction(config_name=config_name, ckpt=ckpt)
 
 
-def clear_results(cfg):
+def clear_results(cfg, clear_checkpoints=True):
     """
-    Clear the entire fold output folder for one experiment:
-    checkpoints, validation, prediction, submission, and any
-    leftover _rank_outputs.
+    Clear this experiment's fold output folder: validation, prediction,
+    submission, and any leftover _rank_outputs -- plus checkpoints/ when
+    clear_checkpoints=True (the default, passed explicitly True for a
+    fresh train run).
+
+    predict passes clear_checkpoints=False: it needs the existing
+    checkpoint to still be there when resolve_prediction_ckpt runs right
+    after this call. Without clearing at all, a predict run would reuse
+    whatever zips are already sitting in validation/prediction/submission
+    from a prior train/predict run -- write_prediction_case_zip replaces
+    each {case_id}.zip in place, but any case_id not produced this run
+    (or written by older code before a naming change) lingers untouched.
     """
 
     fold_output_folder = (
@@ -257,13 +275,25 @@ def clear_results(cfg):
         / f"fold_{cfg.fold}"
     )
 
-    if fold_output_folder.exists():
-        shutil.rmtree(fold_output_folder)
+    subfolders = ["validation", "prediction", "submission", "_rank_outputs"]
+
+    if clear_checkpoints:
+        subfolders.append("checkpoints")
+
+    for subfolder in subfolders:
+        target = fold_output_folder / subfolder
+
+        if target.exists():
+            shutil.rmtree(target)
 
     fold_output_folder.mkdir(parents=True, exist_ok=True)
 
     print()
-    print("[clear-results] Cleared fold output folder:")
+    print(
+        "[clear-results] Cleared fold output folder"
+        + ("" if clear_checkpoints else " (checkpoints preserved)")
+        + ":"
+    )
     print(f"  {fold_output_folder}")
     print()
 
