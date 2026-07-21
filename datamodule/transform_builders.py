@@ -6,8 +6,15 @@ transforms (task-specific) are built separately so that:
   - TrU's MultiViewUnlabeledDataLoader can run geometric once and
     intensity independently K times per sample (see that class's
     docstring for why the geometric draw must be shared).
-  - TrL (all 3 tasks, including CT) reuses the exact same per-task
-    intensity pipeline as TrU, just with a single draw (K=1).
+  - TrL (all 3 tasks, including CT) uses the same per-task pool of
+    intensity ops as TrU, but a different composition: each op
+    independently rolls its own apply_probability
+    (_build_intensity_transforms). TrU's strong view instead always
+    selects and applies exactly STRONG_AUG_NUM_OPS of them
+    (_build_intensity_transforms_strong) -- see that method's docstring
+    for why independent per-op probabilities are the wrong tool for a
+    view that must diverge from another view, not just from the
+    original.
 
 All three tasks -- CT included -- go through this split, not nnU-Net's
 own bundled nnUNetTrainer.get_training_transforms(). One known,
@@ -49,7 +56,15 @@ from batchgeneratorsv2.transforms.utils.pseudo2d import Convert3DTo2DTransform, 
 from batchgeneratorsv2.transforms.utils.random import RandomTransform
 from batchgeneratorsv2.transforms.utils.remove_label import RemoveLabelTansform
 
-from .transforms import RicianNoiseTransform, SmokeHazeTransform, BleedingBlobTransform
+from .transforms import RicianNoiseTransform, SmokeHazeTransform, BleedingBlobTransform, PickNTransforms
+
+# Number of ops always selected (without replacement) and applied for
+# TrU's strong view, across all 3 tasks -- see
+# TransformBuilderMixin._build_intensity_transforms_strong. Matches
+# SegMatch (arxiv 2308.05232, semi-supervised surgical instrument
+# segmentation via FixMatch-style weak/strong consistency), the closest
+# literature match to this codebase's own weak/strong TrU setup.
+STRONG_AUG_NUM_OPS = 3
 
 
 class TransformBuilderMixin:
@@ -147,75 +162,79 @@ class TransformBuilderMixin:
 
         return ComposeTransforms(geometric)
 
-    def _build_intensity_transforms_ct(self):
-        """nnU-Net's default intensity transform list, unchanged."""
+    def _intensity_recipe_ct(self):
+        """
+        nnU-Net's default intensity op pool, unchanged: a list of
+        (transform, apply_probability) pairs -- the probability is only
+        used by _build_intensity_transforms (TrL); _build_intensity_
+        transforms_strong (TrU strong view) uses the same transform
+        instances but ignores the stored probability entirely.
+        """
 
-        return ComposeTransforms(
-            [
-                RandomTransform(
-                    GaussianNoiseTransform(noise_variance=(0, 0.1), p_per_channel=1, synchronize_channels=True),
-                    apply_probability=0.1,
+        return [
+            (
+                GaussianNoiseTransform(noise_variance=(0, 0.1), p_per_channel=1, synchronize_channels=True),
+                0.1,
+            ),
+            (
+                GaussianBlurTransform(
+                    blur_sigma=(0.5, 1.0),
+                    synchronize_channels=False,
+                    synchronize_axes=False,
+                    p_per_channel=0.5,
+                    benchmark=True,
                 ),
-                RandomTransform(
-                    GaussianBlurTransform(
-                        blur_sigma=(0.5, 1.0),
-                        synchronize_channels=False,
-                        synchronize_axes=False,
-                        p_per_channel=0.5,
-                        benchmark=True,
-                    ),
-                    apply_probability=0.2,
+                0.2,
+            ),
+            (
+                MultiplicativeBrightnessTransform(
+                    multiplier_range=BGContrast((0.75, 1.25)), synchronize_channels=False, p_per_channel=1
                 ),
-                RandomTransform(
-                    MultiplicativeBrightnessTransform(
-                        multiplier_range=BGContrast((0.75, 1.25)), synchronize_channels=False, p_per_channel=1
-                    ),
-                    apply_probability=0.15,
+                0.15,
+            ),
+            (
+                ContrastTransform(
+                    contrast_range=BGContrast((0.75, 1.25)),
+                    preserve_range=True,
+                    synchronize_channels=False,
+                    p_per_channel=1,
                 ),
-                RandomTransform(
-                    ContrastTransform(
-                        contrast_range=BGContrast((0.75, 1.25)),
-                        preserve_range=True,
-                        synchronize_channels=False,
-                        p_per_channel=1,
-                    ),
-                    apply_probability=0.15,
+                0.15,
+            ),
+            (
+                SimulateLowResolutionTransform(
+                    scale=(0.5, 1),
+                    synchronize_channels=False,
+                    synchronize_axes=True,
+                    ignore_axes=None,
+                    allowed_channels=None,
+                    p_per_channel=0.5,
                 ),
-                RandomTransform(
-                    SimulateLowResolutionTransform(
-                        scale=(0.5, 1),
-                        synchronize_channels=False,
-                        synchronize_axes=True,
-                        ignore_axes=None,
-                        allowed_channels=None,
-                        p_per_channel=0.5,
-                    ),
-                    apply_probability=0.25,
+                0.25,
+            ),
+            (
+                GammaTransform(
+                    gamma=BGContrast((0.7, 1.5)),
+                    p_invert_image=1,
+                    synchronize_channels=False,
+                    p_per_channel=1,
+                    p_retain_stats=1,
                 ),
-                RandomTransform(
-                    GammaTransform(
-                        gamma=BGContrast((0.7, 1.5)),
-                        p_invert_image=1,
-                        synchronize_channels=False,
-                        p_per_channel=1,
-                        p_retain_stats=1,
-                    ),
-                    apply_probability=0.1,
+                0.1,
+            ),
+            (
+                GammaTransform(
+                    gamma=BGContrast((0.7, 1.5)),
+                    p_invert_image=0,
+                    synchronize_channels=False,
+                    p_per_channel=1,
+                    p_retain_stats=1,
                 ),
-                RandomTransform(
-                    GammaTransform(
-                        gamma=BGContrast((0.7, 1.5)),
-                        p_invert_image=0,
-                        synchronize_channels=False,
-                        p_per_channel=1,
-                        p_retain_stats=1,
-                    ),
-                    apply_probability=0.3,
-                ),
-            ]
-        )
+                0.3,
+            ),
+        ]
 
-    def _build_intensity_transforms_tee(self):
+    def _intensity_recipe_tee(self):
         """
         Detuned version of the CT default, per EAGT (arxiv 2605.16427):
         strong brightness/contrast/gamma actively hurt echocardiography
@@ -227,115 +246,139 @@ class TransformBuilderMixin:
         falloff, a genuine ultrasound-specific artifact.
         """
 
-        return ComposeTransforms(
-            [
-                RandomTransform(
-                    RicianNoiseTransform(noise_variance=(0, 0.05)),
-                    apply_probability=0.1,
+        return [
+            (RicianNoiseTransform(noise_variance=(0, 0.05)), 0.1),
+            (
+                GaussianBlurTransform(
+                    blur_sigma=(0.5, 1.0),
+                    synchronize_channels=False,
+                    synchronize_axes=False,
+                    p_per_channel=0.5,
+                    benchmark=True,
                 ),
-                RandomTransform(
-                    GaussianBlurTransform(
-                        blur_sigma=(0.5, 1.0),
-                        synchronize_channels=False,
-                        synchronize_axes=False,
-                        p_per_channel=0.5,
-                        benchmark=True,
-                    ),
-                    apply_probability=0.2,
+                0.2,
+            ),
+            (
+                MultiplicativeBrightnessTransform(
+                    multiplier_range=BGContrast((0.85, 1.15)), synchronize_channels=False, p_per_channel=1
                 ),
-                RandomTransform(
-                    MultiplicativeBrightnessTransform(
-                        multiplier_range=BGContrast((0.85, 1.15)), synchronize_channels=False, p_per_channel=1
-                    ),
-                    apply_probability=0.10,
+                0.10,
+            ),
+            (
+                ContrastTransform(
+                    contrast_range=BGContrast((0.85, 1.15)),
+                    preserve_range=True,
+                    synchronize_channels=False,
+                    p_per_channel=1,
                 ),
-                RandomTransform(
-                    ContrastTransform(
-                        contrast_range=BGContrast((0.85, 1.15)),
-                        preserve_range=True,
-                        synchronize_channels=False,
-                        p_per_channel=1,
-                    ),
-                    apply_probability=0.10,
+                0.10,
+            ),
+            (
+                SimulateLowResolutionTransform(
+                    scale=(0.5, 1),
+                    synchronize_channels=False,
+                    synchronize_axes=True,
+                    ignore_axes=None,
+                    allowed_channels=None,
+                    p_per_channel=0.5,
                 ),
-                RandomTransform(
-                    SimulateLowResolutionTransform(
-                        scale=(0.5, 1),
-                        synchronize_channels=False,
-                        synchronize_axes=True,
-                        ignore_axes=None,
-                        allowed_channels=None,
-                        p_per_channel=0.5,
-                    ),
-                    apply_probability=0.25,
+                0.25,
+            ),
+            (
+                GammaTransform(
+                    gamma=BGContrast((0.85, 1.2)),
+                    p_invert_image=1,
+                    synchronize_channels=False,
+                    p_per_channel=1,
+                    p_retain_stats=1,
                 ),
-                RandomTransform(
-                    GammaTransform(
-                        gamma=BGContrast((0.85, 1.2)),
-                        p_invert_image=1,
-                        synchronize_channels=False,
-                        p_per_channel=1,
-                        p_retain_stats=1,
-                    ),
-                    apply_probability=0.05,
+                0.05,
+            ),
+            (
+                GammaTransform(
+                    gamma=BGContrast((0.85, 1.2)),
+                    p_invert_image=0,
+                    synchronize_channels=False,
+                    p_per_channel=1,
+                    p_retain_stats=1,
                 ),
-                RandomTransform(
-                    GammaTransform(
-                        gamma=BGContrast((0.85, 1.2)),
-                        p_invert_image=0,
-                        synchronize_channels=False,
-                        p_per_channel=1,
-                        p_retain_stats=1,
-                    ),
-                    apply_probability=0.15,
+                0.15,
+            ),
+            (
+                BrightnessGradientAdditiveTransform(
+                    scale=(20, 60), max_strength=(0.05, 0.15), same_for_all_channels=True, mean_centered=True
                 ),
-                RandomTransform(
-                    BrightnessGradientAdditiveTransform(
-                        scale=(20, 60), max_strength=(0.05, 0.15), same_for_all_channels=True, mean_centered=True
-                    ),
-                    apply_probability=0.15,
-                ),
-            ]
-        )
+                0.15,
+            ),
+        ]
 
-    def _build_intensity_transforms_video(self):
+    def _intensity_recipe_video(self):
         """
-        CT's default intensity list (video is RGB camera footage, closer
-        to natural-image domain than CT/TEE) plus transforms targeting
+        CT's default intensity op pool (video is RGB camera footage,
+        closer to natural-image domain than CT/TEE) plus ops targeting
         the three corruption modes SegSTRONG-C (arxiv 2407.11906) found
         dominant in real surgical video: a darker-biased brightness draw
         for low-brightness, and SmokeHazeTransform/BleedingBlobTransform
         (custom, see transforms.py) for smoke and bleeding.
         """
 
-        base = self._build_intensity_transforms_ct()
-
-        extra = ComposeTransforms(
-            [
-                RandomTransform(
-                    MultiplicativeBrightnessTransform(
-                        multiplier_range=BGContrast((0.5, 0.85)), synchronize_channels=False, p_per_channel=1
-                    ),
-                    apply_probability=0.1,
+        return self._intensity_recipe_ct() + [
+            (
+                MultiplicativeBrightnessTransform(
+                    multiplier_range=BGContrast((0.5, 0.85)), synchronize_channels=False, p_per_channel=1
                 ),
-                RandomTransform(SmokeHazeTransform(alpha_range=(0.1, 0.4), light_offset=2.0), apply_probability=0.1),
-                RandomTransform(
-                    BleedingBlobTransform(
-                        scale=(20, 80), loc=(-0.2, 1.2), max_strength=(0.3, 0.8), channel_bias=(1.0, -0.4, -0.4)
-                    ),
-                    apply_probability=0.1,
+                0.1,
+            ),
+            (SmokeHazeTransform(alpha_range=(0.1, 0.4), light_offset=2.0), 0.1),
+            (
+                BleedingBlobTransform(
+                    scale=(20, 80), loc=(-0.2, 1.2), max_strength=(0.3, 0.8), channel_bias=(1.0, -0.4, -0.4)
                 ),
-            ]
-        )
+                0.1,
+            ),
+        ]
 
-        return ComposeTransforms([base, extra])
-
-    def _build_intensity_transforms(self):
+    def _intensity_recipe(self):
         if self.prefix == "t1_ct":
-            return self._build_intensity_transforms_ct()
+            return self._intensity_recipe_ct()
         if self.prefix == "t2_tee":
-            return self._build_intensity_transforms_tee()
+            return self._intensity_recipe_tee()
         if self.prefix == "t3_vid":
-            return self._build_intensity_transforms_video()
+            return self._intensity_recipe_video()
 
         raise ValueError(f"Unknown prefix '{self.prefix}' -- expected one of t1_ct, t2_tee, t3_vid.")
+
+    def _build_intensity_transforms(self):
+        """
+        TrL's intensity pipeline: each op in the task's recipe
+        independently rolls its own apply_probability (RandomTransform),
+        so anywhere from 0 to all of them can fire on a given call. Fine
+        for TrL -- it's real ground truth, so a harder (or occasionally
+        unaugmented) example is never actively harmful, only more or
+        less useful.
+        """
+
+        recipe = self._intensity_recipe()
+
+        return ComposeTransforms([RandomTransform(transform, apply_probability=p) for transform, p in recipe])
+
+    def _build_intensity_transforms_strong(self, n=STRONG_AUG_NUM_OPS):
+        """
+        TrU strong view's intensity pipeline: always selects and applies
+        exactly n ops from the task's recipe (PickNTransforms), ignoring
+        the recipe's stored per-op probabilities entirely.
+
+        Independent per-op probabilities (as used by
+        _build_intensity_transforms, above) are the wrong tool here: they
+        were designed for supervised training, where an occasional
+        unaugmented sample is harmless. TrU's strong view instead must
+        diverge from the weak view for the consistency loss to mean
+        anything -- an unlucky draw where every op happens to skip
+        produces a strong view identical to the weak view, silently
+        wasting that training step. See PickNTransforms' docstring
+        (transforms.py) for the literature this mirrors.
+        """
+
+        recipe = self._intensity_recipe()
+
+        return PickNTransforms([transform for transform, _ in recipe], n=n)

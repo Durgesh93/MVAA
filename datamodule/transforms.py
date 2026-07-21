@@ -16,6 +16,10 @@ MultiplicativeBrightnessTransform already covers by biasing its range
 down -- see datamodule.py's video intensity builder). Both compute their
 reference intensity relative to the sample's own mean/std rather than an
 absolute constant, since these datasets are Z-score normalized.
+
+PickNTransforms is a generic composition container (not task-specific)
+used to build TrU's strong-view intensity pipeline -- see its own
+docstring and transform_builders.py's _build_intensity_transforms_strong.
 """
 
 from typing import Tuple
@@ -23,7 +27,7 @@ from typing import Tuple
 import numpy as np
 import torch
 
-from batchgeneratorsv2.transforms.base.basic_transform import ImageOnlyTransform
+from batchgeneratorsv2.transforms.base.basic_transform import BasicTransform, ImageOnlyTransform
 from batchgeneratorsv2.transforms.local.local_transform import LocalTransform
 from batchgeneratorsv2.helpers.scalar_type import RandomScalar, sample_scalar
 
@@ -141,3 +145,40 @@ class BleedingBlobTransform(ImageOnlyTransform, LocalTransform):
             img[c] = img[c] + kernel_tensor * bias * strength
 
         return img
+
+
+class PickNTransforms(BasicTransform):
+    """
+    Always selects exactly n transforms (without replacement) from the
+    given pool and applies all of them unconditionally -- unlike
+    RandomTransform-wrapped independent per-op probabilities (nnU-Net's
+    own supervised-training convention), there is no chance of a no-op
+    draw, since selection itself is the only gate.
+
+    That matters specifically for TrU's strong view in weak/strong
+    consistency training: an independent-probability pipeline can (and,
+    empirically, does at a non-trivial rate -- see the datamodule's
+    verification scripts) produce a strong view identical to the weak
+    view, wasting that training step's consistency signal entirely. This
+    mirrors the strong-augmentation convention used by RandAugment/
+    FixMatch and, more directly, SegMatch (arxiv 2308.05232,
+    semi-supervised surgical instrument segmentation via FixMatch-style
+    weak/strong consistency), which always applies exactly 3 selected
+    photometric ops rather than gating each one by its own probability.
+    """
+
+    def __init__(self, transforms, n):
+        super().__init__()
+        self.transforms = list(transforms)
+        self.n = int(n)
+
+        if self.n < 1 or self.n > len(self.transforms):
+            raise ValueError(f"n must be between 1 and {len(self.transforms)}, got {self.n}")
+
+    def apply(self, data_dict, **params):
+        chosen = np.random.choice(len(self.transforms), size=self.n, replace=False)
+
+        for i in chosen:
+            data_dict = self.transforms[i](**data_dict)
+
+        return data_dict

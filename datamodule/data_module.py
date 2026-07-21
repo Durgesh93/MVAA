@@ -440,7 +440,7 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
             pad_sides=None,
             probabilistic_oversampling=False,
             geometric_transforms=self._build_geometric_transforms(use_spatial_transform=self.transform_geometric),
-            intensity_transforms=self._build_intensity_transforms(),
+            intensity_transforms=self._build_intensity_transforms_strong(),
             num_views=self.K,
         )
 
