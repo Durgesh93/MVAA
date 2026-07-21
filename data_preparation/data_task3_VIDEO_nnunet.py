@@ -38,12 +38,19 @@ CASE_SUFFIXES = [".png", ".jpg", ".jpeg", "_png_Label.tar"]
 
 # Raw annotation tool labels 17 classes per frame. Only class_10
 # (mitral valve) is kept in the final submission (see keep_classes /
-# lightning_module.py's is_t3_vid filtering); class_11 (ventricle) and
-# class_2 (separating forceps) are training-only. {10, 11, 2} is the
-# highest-support 3-class combination that still co-occurs in the same
-# frame (78/180 frames, 43.3%). All 3 must be present for a case to be
-# kept for training.
-VIDEO_MULTI_CLASS_LABELS = {"background": 0, "class_10": 1, "class_11": 2, "class_2": 3}
+# lightning_module.py's is_t3_vid filtering); class_11 (ventricle),
+# class_2 (separating forceps), class_7 (suture thread), and class_1
+# (atrial retractor) are training-only. Matches VIDEO_ANY_OF_LABEL_VALUES
+# below -- every class used to select a frame for training is also a
+# real segmentation target.
+VIDEO_MULTI_CLASS_LABELS = {
+    "background": 0,
+    "class_10": 1,
+    "class_11": 2,
+    "class_2": 3,
+    "class_7": 4,
+    "class_1": 5,
+}
 
 VIDEO_LABEL_VALUE_TO_CLASS = {
     int(name.removeprefix("class_")): class_idx
@@ -51,7 +58,14 @@ VIDEO_LABEL_VALUE_TO_CLASS = {
     if name != "background"
 }
 
-VIDEO_REQUIRED_LABEL_VALUES = set(VIDEO_LABEL_VALUE_TO_CLASS.keys())
+# Case-selection filter: a TrL frame is kept only if class_10 (mitral
+# valve annulus, the task class) is present, AND at least one auxiliary
+# class is also present -- ventricle (11), suture thread (7), atrial
+# retractor (1), or separating forceps (2) -- as some signal of a
+# busier/more-complete annotation.
+VIDEO_REQUIRED_LABEL_VALUES = {10}
+
+VIDEO_ANY_OF_LABEL_VALUES = {11, 7, 1, 2}  # ventricle, suture thread, atrial retractor, separating forceps
 
 VIDEO_EXCLUDED_CASE_NAMES = {"REC_20250322_101917_746A_000130"}
 
@@ -161,6 +175,7 @@ def filter_video_excluded_cases(rows):
 
 def filter_video_multiclass_cases(rows):
     required_values = set(VIDEO_REQUIRED_LABEL_VALUES)
+    any_of_values = set(VIDEO_ANY_OF_LABEL_VALUES)
 
     mask_rows = [r for r in rows if r["split"] == "TrL" and r["file_type"] == "mask"]
 
@@ -170,15 +185,16 @@ def filter_video_multiclass_cases(rows):
     for row in mask_rows:
         labels_in_mask = set(read_labels_from_mask_path(row["file_path"]))
 
-        if required_values.issubset(labels_in_mask):
+        if required_values.issubset(labels_in_mask) and (any_of_values & labels_in_mask):
             valid_case_names.add(row["case_name"])
         else:
             dropped_case_names.add(row["case_name"])
 
     if dropped_case_names:
         log_warn(
-            f"Dropping {len(dropped_case_names)} TrL video case(s) missing one "
-            f"of labels {sorted(required_values)}: {sorted(dropped_case_names)}"
+            f"Dropping {len(dropped_case_names)} TrL video case(s) missing "
+            f"one of {sorted(required_values)} or all of {sorted(any_of_values)}: "
+            f"{sorted(dropped_case_names)}"
         )
 
     return [row for row in rows if not (row["split"] == "TrL" and row["case_name"] not in valid_case_names)]
