@@ -64,8 +64,7 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
         self.prefix = str(self.cfg.prefix)
         self.tru_num_views = int(self.cfg.tru_num_views)
         self.tru_weak_strong = bool(self.cfg.tru_weak_strong)
-        self.use_spatial_transform_trl = bool(self.cfg.use_spatial_transform_trl)
-        self.use_spatial_transform_tru = bool(self.cfg.use_spatial_transform_tru)
+        self.transform_geometric = bool(self.cfg.transform_geometric)
         self.use_intensity_transform_tru = bool(self.cfg.use_intensity_transform_tru)
 
         if self.tru_weak_strong and not self.use_intensity_transform_tru:
@@ -420,7 +419,7 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
         # nnUNetTrainer.get_training_transforms() special case.
         labeled_tfm = ComposeTransforms(
             [
-                self._build_geometric_transforms(use_spatial_transform=self.use_spatial_transform_trl),
+                self._build_geometric_transforms(use_spatial_transform=self.transform_geometric),
                 self._build_intensity_transforms(),
             ]
         )
@@ -460,7 +459,7 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
             sampling_probabilities=None,
             pad_sides=None,
             probabilistic_oversampling=False,
-            geometric_transforms=self._build_geometric_transforms(use_spatial_transform=self.use_spatial_transform_tru),
+            geometric_transforms=self._build_geometric_transforms(use_spatial_transform=self.transform_geometric),
             intensity_transforms=unlabeled_intensity_tfm,
             num_views=self.tru_num_views,
             weak_strong=self.tru_weak_strong,

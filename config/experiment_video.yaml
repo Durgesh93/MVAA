@@ -48,8 +48,7 @@ datamodule:
   prefix: ${prefix}
   tru_num_views: 2
   tru_weak_strong: ${tru_weak_strong}
-  use_spatial_transform_trl: true
-  use_spatial_transform_tru: false
+  transform_geometric: true
   use_intensity_transform_tru: true
 
 # =============================================================================

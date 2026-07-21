@@ -77,18 +77,21 @@ class TransformBuilderMixin:
         (init_ps, enlarged by _get_da_params_from_nnunet specifically to
         leave rotation margin) down to the real patch_size the network
         expects -- omitting the transform entirely leaves samples at the
-        wrong (oversized) shape. Controlled per labeled/unlabeled branch
-        via datamodule.use_spatial_transform_trl/_tru in the yaml -- see
-        data_module.py's train_dataloader(). Rotation/scaling is a real
-        generalization aid for TrL (target is always real ground truth,
-        so a harder augmented example just makes training harder, never
-        teaches something false). For TrU's self-training pseudo-labels
-        it's a pure risk with no offsetting benefit here: this datamodule
-        does single-view entropy minimization (no cross-view consistency
-        check), so an unusual rotation/scale can push the network into a
-        confidently-wrong guess that then gets reinforced as its own
-        training target -- the classic self-training confirmation-bias
-        failure mode.
+        wrong (oversized) shape. Controlled by the single
+        datamodule.transform_geometric flag in the yaml, shared by both
+        TrL and TrU -- see data_module.py's train_dataloader(). Rotation/
+        scaling is a straightforward generalization aid for TrL (target
+        is always real ground truth, so a harder augmented example just
+        makes training harder, never teaches something false). For TrU it
+        was previously forced off by a separate flag over concern that an
+        unusual rotation/scale on a self-trained pseudo-label could push
+        the network into a confidently-wrong guess that then gets
+        reinforced as its own training target. That risk is specific to
+        single-view self-training; under the current weak/strong
+        consistency scheme (tru_weak_strong=True) the strong view's
+        prediction is checked against the weak view's pseudo-label rather
+        than blindly trusted, so the two branches were unified onto one
+        flag, shipped default True (rotation/scaling on for both).
 
         Cascade (is_cascaded) and region-based (self.lm.has_regions)
         branches of get_training_transforms are intentionally omitted:

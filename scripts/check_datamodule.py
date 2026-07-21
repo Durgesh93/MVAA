@@ -84,11 +84,12 @@ def check_task(task_name, config_name, tru_num_views_override=3):
 def check_shipped_defaults_are_weak_strong(task_name, config_name):
     """
     Shipped defaults: tru_weak_strong=True, tru_num_views=2,
-    use_spatial_transform_tru=False, use_intensity_transform_tru=True --
-    data_views[0] is the weak (geometric-only) view, data_views[1] is the
-    strong (weak + real intensity aug) view. Confirms the two diverge
-    (proving the strong view's intensity draw actually ran) rather than
-    silently collapsing to the pre-weak/strong self-training behavior.
+    transform_geometric=True, use_intensity_transform_tru=True --
+    data_views[0] is the weak (geometric-only, including rotation/
+    scaling) view, data_views[1] is the strong (weak + real intensity
+    aug) view. Confirms the two diverge (proving the strong view's
+    intensity draw actually ran) rather than silently collapsing to the
+    pre-weak/strong self-training behavior.
     """
     print(f"\n{'=' * 80}\n[{task_name}] shipped defaults (weak/strong TrU)\n{'=' * 80}")
 
@@ -100,7 +101,7 @@ def check_shipped_defaults_are_weak_strong(task_name, config_name):
     dm.setup()
 
     assert dm.tru_weak_strong is True
-    assert dm.use_spatial_transform_tru is False
+    assert dm.transform_geometric is True
     assert dm.use_intensity_transform_tru is True
     assert dm.tru_num_views == 2
 
