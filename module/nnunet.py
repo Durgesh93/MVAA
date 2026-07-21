@@ -232,7 +232,11 @@ class NNUnetSetup:
         return loss
 
     def build_pseudo_loss(self):
-        return WeakStrongPseudoLabelLoss(threshold=self.cfg.pseudo_threshold)
+        return WeakStrongPseudoLabelLoss(
+            threshold=self.cfg.pseudo_threshold,
+            adaptive=self.cfg.pseudo_threshold_adaptive,
+            adaptive_momentum=self.cfg.pseudo_threshold_momentum,
+        )
 
     @staticmethod
     def _unwrap_compound_loss(loss):

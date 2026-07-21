@@ -86,7 +86,8 @@ class SSLnnUNetLightningModule(L.LightningModule):
         unwrapped `.module`), or DDP gradient sync breaks.
         """
         if self.current_epoch < self.cfg.pseudo_warmup_epochs:
-            return torch.zeros((), device=self.device)
+            zero = torch.zeros((), device=self.device)
+            return zero, zero
 
         net = self.network.module if hasattr(self.network, "module") else self.network
         old_deep_supervision = net.decoder.deep_supervision
@@ -107,12 +108,13 @@ class SSLnnUNetLightningModule(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         sup_loss, _, _ = self._supervised_loss(batch["labeled"])
-        pseudo_loss = self._pseudo_loss(batch["unlabeled"])
+        pseudo_loss, pseudo_confident_frac = self._pseudo_loss(batch["unlabeled"])
         total_loss = sup_loss + self.cfg.lambda_pseudo * pseudo_loss
         self.metrics.update_step_training_metrics(
             train_loss=total_loss.detach(),
             train_sup_loss=sup_loss.detach(),
             train_pseudo_loss=pseudo_loss.detach(),
+            train_pseudo_confident_frac=pseudo_confident_frac.detach(),
         )
         return total_loss
 

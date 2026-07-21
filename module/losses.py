@@ -201,6 +201,60 @@ class CompoundLoss(nn.Module):
         return _clip_loss((1 - self.boundary_weight) * dice_ce + self.boundary_weight * boundary)
 
 
+class AdaptiveConfidenceThreshold(nn.Module):
+    """
+    FreeMatch-style (Wang et al. 2023, arxiv 2205.07246) self-adaptive
+    per-class confidence threshold, replacing a single flat cutoff.
+
+    Maintains a global EMA of the batch's mean max-confidence (regardless
+    of predicted class) and a per-class EMA of confidence conditioned on
+    argmax == c, both updated from the *entire* unlabeled batch every step
+    -- not just pixels that already cleared some bar -- since the point is
+    to track how confidence is trending even for classes not clearing it
+    yet. The per-class threshold is the global EMA scaled by that class's
+    confidence relative to the best-tracked class (MaxNorm): a class the
+    network is relatively unsure about gets a lower bar than a flat
+    threshold would give it, while never exceeding the global EMA. Both
+    EMAs start at 1/num_classes (uniform-prior confidence), so thresholds
+    start low and rise as the network's real confidence rises -- this
+    supplements rather than replaces the hard `pseudo_warmup_epochs` gate
+    in lightning_module.py, which still fully zeroes the loss early on.
+
+    Buffers are lazily (re)initialized on first use / on a class-count
+    change so this doesn't need num_classes at construction time.
+    """
+
+    def __init__(self, momentum: float = 0.999):
+        super().__init__()
+        self.momentum = momentum
+        self.register_buffer("global_ema", torch.zeros(()))
+        self.register_buffer("class_ema", torch.zeros(0))
+
+    def _maybe_init(self, num_classes, device, dtype):
+        if self.class_ema.numel() != num_classes:
+            init_value = 1.0 / num_classes
+            self.global_ema = torch.full((), init_value, device=device, dtype=dtype)
+            self.class_ema = torch.full((num_classes,), init_value, device=device, dtype=dtype)
+
+    @torch.no_grad()
+    def update(self, confidence: Tensor, pseudo_label: Tensor, num_classes: int):
+        self._maybe_init(num_classes, confidence.device, confidence.dtype)
+
+        m = self.momentum
+        self.global_ema.mul_(m).add_(confidence.mean(), alpha=1 - m)
+
+        for c in range(num_classes):
+            class_mask = pseudo_label == c
+
+            if class_mask.any():
+                self.class_ema[c].mul_(m).add_(confidence[class_mask].mean(), alpha=1 - m)
+
+    def per_class_threshold(self, num_classes: int) -> Tensor:
+        self._maybe_init(num_classes, self.class_ema.device, self.class_ema.dtype)
+        normalized = self.class_ema / self.class_ema.max().clamp_min(1e-12)
+        return self.global_ema * normalized
+
+
 class WeakStrongPseudoLabelLoss(nn.Module):
     """
     FixMatch-style confidence-thresholded consistency loss for TrU samples.
@@ -215,24 +269,50 @@ class WeakStrongPseudoLabelLoss(nn.Module):
     patch give a genuine augmentation-invariance signal, rather than a
     network training to agree with its own single-view guess. Independent
     of CompoundLoss/ignore_label (none of the 3 MVAA datasets define one) --
-    pixels below `threshold` softmax confidence are excluded entirely rather
-    than distilled from a likely-wrong guess.
+    pixels below the confidence threshold are excluded entirely rather than
+    distilled from a likely-wrong guess.
+
+    threshold: flat cutoff, used only when adaptive=False.
+    adaptive: when True, threshold is replaced by AdaptiveConfidenceThreshold
+    (per-class, EMA-tracked) instead of the flat scalar -- see that class's
+    docstring.
     """
 
-    def __init__(self, threshold: float):
+    def __init__(self, threshold: float, adaptive: bool = False, adaptive_momentum: float = 0.999):
         super().__init__()
         self.threshold = threshold
+        self.adaptive = adaptive
+        self.adaptive_threshold = AdaptiveConfidenceThreshold(momentum=adaptive_momentum) if adaptive else None
 
-    def forward(self, weak_logits: Tensor, strong_logits_list) -> Tensor:
+    def forward(self, weak_logits: Tensor, strong_logits_list):
+        """
+        Returns (loss, confident_frac) -- confident_frac is the fraction of
+        weak-view pixels that cleared the threshold (num_confident /
+        confident_mask.numel()), so callers can log it alongside the loss.
+        It's the direct diagnostic for whether a flat/tiny loss reflects a
+        healthy confident-pixel population or a threshold admitting almost
+        no pixels at all -- see lightning_module.py's _pseudo_loss.
+        """
+
         with torch.no_grad():
             probs = torch.softmax(weak_logits, dim=1)
             confidence, pseudo_label = probs.max(dim=1)
-            confident_mask = confidence >= self.threshold
+
+            if self.adaptive:
+                num_classes = weak_logits.shape[1]
+                self.adaptive_threshold.update(confidence, pseudo_label, num_classes)
+                per_class_threshold = self.adaptive_threshold.per_class_threshold(num_classes)
+                threshold = per_class_threshold[pseudo_label]
+            else:
+                threshold = self.threshold
+
+            confident_mask = confidence >= threshold
 
         num_confident = confident_mask.sum()
+        confident_frac = num_confident.float() / confident_mask.numel()
 
         if num_confident == 0:
-            return torch.zeros((), device=weak_logits.device, dtype=weak_logits.dtype)
+            return torch.zeros((), device=weak_logits.device, dtype=weak_logits.dtype), confident_frac
 
         view_losses = []
 
@@ -240,4 +320,4 @@ class WeakStrongPseudoLabelLoss(nn.Module):
             per_pixel_ce = nn.functional.cross_entropy(strong_logits, pseudo_label, reduction="none")
             view_losses.append((per_pixel_ce * confident_mask).sum() / num_confident)
 
-        return torch.stack(view_losses).mean()
+        return torch.stack(view_losses).mean(), confident_frac

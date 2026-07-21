@@ -68,6 +68,8 @@ litmodule:
   boundary_ramp_epochs: ${trainer.max_epochs}
   lambda_pseudo: 0.20
   pseudo_threshold: 0.95
+  pseudo_threshold_adaptive: true
+  pseudo_threshold_momentum: 0.999
   pseudo_warmup_epochs: 5
   tracked_labels: ["class_10"]
 
