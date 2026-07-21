@@ -62,16 +62,8 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
         self.seed = self.cfg.seed
         self.plans_identifier = self.cfg.plans_identifier
         self.prefix = str(self.cfg.prefix)
-        self.tru_num_views = int(self.cfg.tru_num_views)
-        self.tru_weak_strong = bool(self.cfg.tru_weak_strong)
+        self.K = int(self.cfg.K)
         self.transform_geometric = bool(self.cfg.transform_geometric)
-        self.use_intensity_transform_tru = bool(self.cfg.use_intensity_transform_tru)
-
-        if self.tru_weak_strong and not self.use_intensity_transform_tru:
-            raise ValueError(
-                "tru_weak_strong requires use_intensity_transform_tru=true -- otherwise the "
-                "'strong' views never diverge from the weak view and the consistency loss is a no-op."
-            )
 
         self.enable_deep_supervision = True
         self.oversample_fg = 0.33
@@ -437,18 +429,6 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
             transforms=labeled_tfm,
         )
 
-        # TrU intensity augmentation is opt-in (default off). In self-training
-        # mode (tru_weak_strong=False) there's no cross-view consistency
-        # check, so augmenting the single view that both generates and
-        # trains against its own pseudo-label buys no invariance benefit,
-        # only confirmation-bias risk. In weak/strong mode (tru_weak_strong=
-        # True) this same flag instead controls the "strong" views 1..K-1 --
-        # it must be on there, or those views never diverge from the weak
-        # view and the consistency loss degenerates to a no-op (enforced in
-        # __init__). ComposeTransforms([]) is a no-op (empty transform
-        # list), so the cloned image passes through unchanged.
-        unlabeled_intensity_tfm = self._build_intensity_transforms() if self.use_intensity_transform_tru else ComposeTransforms([])
-
         unlabeled_loader = MultiViewUnlabeledDataLoader(
             data=self.dataset_train_unlabeled,
             batch_size=self.batch_size,
@@ -460,9 +440,8 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
             pad_sides=None,
             probabilistic_oversampling=False,
             geometric_transforms=self._build_geometric_transforms(use_spatial_transform=self.transform_geometric),
-            intensity_transforms=unlabeled_intensity_tfm,
-            num_views=self.tru_num_views,
-            weak_strong=self.tru_weak_strong,
+            intensity_transforms=self._build_intensity_transforms(),
+            num_views=self.K,
         )
 
         labeled_iter = self._make_augmenter(labeled_loader)

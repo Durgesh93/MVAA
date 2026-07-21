@@ -20,21 +20,14 @@ from datamodule import SSLnnUNetDataModule
 CONFIG_MAP = {"ct": "experiment_CT", "tee": "experiment_TEE", "video": "experiment_video"}
 
 
-def check_task(task_name, config_name, tru_num_views_override=3):
+def check_task(task_name, config_name, k_override=3):
     print(f"\n{'=' * 80}\n[{task_name}] config={config_name}\n{'=' * 80}")
 
-    # use_intensity_transform_tru is off by default (see
-    # config/experiment_*.yaml) -- with it off AND spatial transform off,
-    # all K views are identical clones by design (nothing left to
-    # independently randomize). Force it on here specifically to exercise
-    # the "K independently-drawn views" mechanism itself, separate from
-    # what today's shipped defaults are.
     cfg = build_config(
         config_name=config_name,
         overrides=[
             "fold=all",
-            f"datamodule.tru_num_views={tru_num_views_override}",
-            "datamodule.use_intensity_transform_tru=true",
+            f"datamodule.K={k_override}",
         ],
     )
     set_nnunet_env(cfg)
@@ -61,7 +54,7 @@ def check_task(task_name, config_name, tru_num_views_override=3):
     assert "data_views" in unlabeled, f"unlabeled batch missing 'data_views' key, got {list(unlabeled.keys())}"
     data_views = unlabeled["data_views"]
     assert isinstance(data_views, list), f"data_views should be a list, got {type(data_views)}"
-    assert len(data_views) == dm.tru_num_views, f"expected {dm.tru_num_views} views, got {len(data_views)}"
+    assert len(data_views) == dm.K, f"expected {dm.K} views, got {len(data_views)}"
 
     for v, view in enumerate(data_views):
         print(f"unlabeled['data_views'][{v}].shape = {tuple(view.shape)}")
@@ -69,7 +62,7 @@ def check_task(task_name, config_name, tru_num_views_override=3):
         assert not torch.isnan(view).any(), f"view {v} contains NaN"
         assert not torch.isinf(view).any(), f"view {v} contains Inf"
 
-    if dm.tru_num_views >= 2:
+    if dm.K >= 2:
         assert not torch.equal(data_views[0], data_views[1]), (
             "view 0 and view 1 are identical -- intensity draws should differ "
             "independently even though they share one geometric draw"
@@ -78,18 +71,17 @@ def check_task(task_name, config_name, tru_num_views_override=3):
     assert not torch.isnan(labeled_data).any(), "labeled data contains NaN"
     assert not torch.isinf(labeled_data).any(), "labeled data contains Inf"
 
-    print(f"[{task_name}] OK -- TrL={len(dm.trl_all)} TrU={len(dm.tru_all)} tru_num_views={dm.tru_num_views}")
+    print(f"[{task_name}] OK -- TrL={len(dm.trl_all)} TrU={len(dm.tru_all)} K={dm.K}")
 
 
 def check_shipped_defaults_are_weak_strong(task_name, config_name):
     """
-    Shipped defaults: tru_weak_strong=True, tru_num_views=2,
-    transform_geometric=True, use_intensity_transform_tru=True --
-    data_views[0] is the weak (geometric-only, including rotation/
-    scaling) view, data_views[1] is the strong (weak + real intensity
-    aug) view. Confirms the two diverge (proving the strong view's
-    intensity draw actually ran) rather than silently collapsing to the
-    pre-weak/strong self-training behavior.
+    Shipped defaults: K=2, transform_geometric=True -- TrU intensity
+    augmentation and the weak/strong split are both unconditional now
+    (single-view self-training was removed). data_views[0] is the weak
+    (geometric-only, including rotation/scaling) view, data_views[1] is
+    the strong (weak + real intensity aug) view. Confirms the two diverge
+    (proving the strong view's intensity draw actually ran).
     """
     print(f"\n{'=' * 80}\n[{task_name}] shipped defaults (weak/strong TrU)\n{'=' * 80}")
 
@@ -100,10 +92,8 @@ def check_shipped_defaults_are_weak_strong(task_name, config_name):
     dm.trainer = SimpleNamespace(world_size=1, global_rank=0, limit_train_batches=None)
     dm.setup()
 
-    assert dm.tru_weak_strong is True
     assert dm.transform_geometric is True
-    assert dm.use_intensity_transform_tru is True
-    assert dm.tru_num_views == 2
+    assert dm.K == 2
 
     loader = dm.train_dataloader()
     batch, batch_idx, dataloader_idx = next(iter(loader))

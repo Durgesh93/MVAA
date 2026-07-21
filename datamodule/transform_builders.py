@@ -49,7 +49,7 @@ from batchgeneratorsv2.transforms.utils.pseudo2d import Convert3DTo2DTransform, 
 from batchgeneratorsv2.transforms.utils.random import RandomTransform
 from batchgeneratorsv2.transforms.utils.remove_label import RemoveLabelTansform
 
-from transforms import RicianNoiseTransform, SmokeHazeTransform, BleedingBlobTransform
+from .transforms import RicianNoiseTransform, SmokeHazeTransform, BleedingBlobTransform
 
 
 class TransformBuilderMixin:
@@ -87,8 +87,8 @@ class TransformBuilderMixin:
         unusual rotation/scale on a self-trained pseudo-label could push
         the network into a confidently-wrong guess that then gets
         reinforced as its own training target. That risk is specific to
-        single-view self-training; under the current weak/strong
-        consistency scheme (tru_weak_strong=True) the strong view's
+        single-view self-training (now removed); under the weak/strong
+        consistency scheme training always runs, the strong view's
         prediction is checked against the weak view's pseudo-label rather
         than blindly trusted, so the two branches were unified onto one
         flag, shipped default True (rotation/scaling on for both).

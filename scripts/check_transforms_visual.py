@@ -19,7 +19,7 @@ from PIL import Image
 from config import build_config
 from utils import set_nnunet_env
 from datamodule import SSLnnUNetDataModule
-from transforms import RicianNoiseTransform, SmokeHazeTransform, BleedingBlobTransform
+from datamodule.transforms import RicianNoiseTransform, SmokeHazeTransform, BleedingBlobTransform
 
 OUT_DIR = Path(
     "/cluster/work/projects/nn8104k/dsi014/tmp/claude-240131/"

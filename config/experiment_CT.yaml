@@ -23,7 +23,6 @@ fold: all
 task_id: 'task1'
 prefix: 't1_ct'
 plans_identifier: nnUNetPlans
-tru_weak_strong: true
 
 # =============================================================================
 # Paths
@@ -46,10 +45,8 @@ datamodule:
   seed: ${seed}
   plans_identifier: ${plans_identifier}
   prefix: ${prefix}
-  tru_num_views: 2
-  tru_weak_strong: ${tru_weak_strong}
+  K: 2
   transform_geometric: true
-  use_intensity_transform_tru: true
 
 # =============================================================================
 # LightningModule config
@@ -63,7 +60,6 @@ litmodule:
   fold: ${fold}
   seed: ${seed}
   plans_identifier: ${plans_identifier}
-  tru_weak_strong: ${tru_weak_strong}
   initial_lr: 0.01
   weight_decay: 0.00003
   num_epochs: ${trainer.max_epochs}

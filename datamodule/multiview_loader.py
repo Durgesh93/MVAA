@@ -29,29 +29,23 @@ class MultiViewUnlabeledDataLoader(nnUNetDataLoader):
     Running the geometric transform once and branching afterward keeps all
     views voxel-aligned, differing only in intensity.
 
-    weak_strong=True (requires num_views >= 2) forces view 0 to always be
-    the weak view -- geometric-only, intensity_transforms skipped entirely
-    -- while views 1..num_views-1 ("strong") independently draw from
-    intensity_transforms. This is the FixMatch split: index 0 is meant to
-    generate a pseudo-label/confidence mask, the rest are meant to be
-    trained against it. weak_strong=False (default) keeps the legacy
-    behavior where every view, including index 0, draws from
-    intensity_transforms.
+    View 0 is always the weak view -- geometric-only, intensity_transforms
+    skipped entirely -- while views 1..num_views-1 ("strong") independently
+    draw from intensity_transforms. This is the FixMatch split: index 0 is
+    meant to generate a pseudo-label/confidence mask, the rest are meant to
+    be trained against it. Requires num_views >= 2 (at least one weak and
+    one strong view).
     """
 
-    def __init__(self, *args, geometric_transforms, intensity_transforms, num_views, weak_strong=False, **kwargs):
+    def __init__(self, *args, geometric_transforms, intensity_transforms, num_views, **kwargs):
         super().__init__(*args, transforms=None, **kwargs)
 
         self.geometric_transforms = geometric_transforms
         self.intensity_transforms = intensity_transforms
         self.num_views = int(num_views)
-        self.weak_strong = bool(weak_strong)
 
-        if self.num_views < 1:
-            raise ValueError(f"num_views must be >= 1, got {self.num_views}")
-
-        if self.weak_strong and self.num_views < 2:
-            raise ValueError(f"weak_strong requires num_views >= 2, got {self.num_views}")
+        if self.num_views < 2:
+            raise ValueError(f"num_views must be >= 2 (weak + at least one strong view), got {self.num_views}")
 
     def generate_train_batch(self):
         selected_keys = self.get_indices()
@@ -80,7 +74,7 @@ class MultiViewUnlabeledDataLoader(nnUNetDataLoader):
                     seg_sample = weak["segmentation"]
 
                     for v in range(self.num_views):
-                        if self.weak_strong and v == 0:
+                        if v == 0:
                             view_sample = weak["image"].clone()
                         else:
                             view = self.intensity_transforms(image=weak["image"].clone(), segmentation=seg_sample)

@@ -65,25 +65,21 @@ class SSLnnUNetLightningModule(L.LightningModule):
         self.nnunet.update_boundary_weight(self.loss, self.current_epoch)
 
     def _supervised_loss(self, batch: Dict[str, Any]):
-        data, target = get_train_batch_data_target(batch["labeled"], device=self.device)
+        data, target = get_train_batch_data_target(batch, device=self.device)
         output = self.network(data)
         loss = self.loss(output, target)
         return loss, output, target
 
     def _pseudo_loss(self, unlabeled_batch: Dict[str, Any]):
         """
-        tru_weak_strong=False: single-view self-training (Lee, 2013) --
-        forward-pass the network on its own TrU sample, treat the confident
-        argmax as a pseudo-label, and train against it.
-
-        tru_weak_strong=True: FixMatch-style consistency -- data_views[0] is
-        the weak (geometric-only) view, forwarded under no_grad through the
+        FixMatch-style consistency loss: data_views[0] is the weak
+        (geometric-only) view, forwarded under no_grad through the
         unwrapped network purely to source a pseudo-label/confidence mask
         (no backward, so DDP gradient sync is untouched by this call).
         data_views[1:] are strong (weak + intensity aug) views, forwarded
         with grad through self.network and trained to match that label.
 
-        Deep supervision is toggled off in both modes (mirroring
+        Deep supervision is toggled off (mirroring
         PredictionOps._predict_logits's unwrap/restore pattern) since the
         pseudo-label only exists at one resolution -- but any forward that
         needs gradients must go through self.network directly (never the
@@ -96,26 +92,21 @@ class SSLnnUNetLightningModule(L.LightningModule):
         old_deep_supervision = net.decoder.deep_supervision
         net.decoder.deep_supervision = False
         try:
-            if self.cfg.tru_weak_strong:
-                weak_data = to_tensor(unlabeled_batch["data_views"][0], device=self.device, dtype=torch.float32)
-                with torch.no_grad():
-                    weak_logits = net(weak_data)
+            weak_data = to_tensor(unlabeled_batch["data_views"][0], device=self.device, dtype=torch.float32)
+            with torch.no_grad():
+                weak_logits = net(weak_data)
 
-                strong_logits_list = [
-                    self.network(to_tensor(view, device=self.device, dtype=torch.float32))
-                    for view in unlabeled_batch["data_views"][1:]
-                ]
+            strong_logits_list = [
+                self.network(to_tensor(view, device=self.device, dtype=torch.float32))
+                for view in unlabeled_batch["data_views"][1:]
+            ]
 
-                return self.pseudo_loss_fn(weak_logits, strong_logits_list)
-
-            data = to_tensor(unlabeled_batch["data_views"][0], device=self.device, dtype=torch.float32)
-            logits = self.network(data)
-            return self.pseudo_loss_fn(logits)
+            return self.pseudo_loss_fn(weak_logits, strong_logits_list)
         finally:
             net.decoder.deep_supervision = old_deep_supervision
 
     def training_step(self, batch, batch_idx):
-        sup_loss, _, _ = self._supervised_loss(batch)
+        sup_loss, _, _ = self._supervised_loss(batch["labeled"])
         pseudo_loss = self._pseudo_loss(batch["unlabeled"])
         total_loss = sup_loss + self.cfg.lambda_pseudo * pseudo_loss
         self.metrics.update_step_training_metrics(
