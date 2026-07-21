@@ -656,9 +656,15 @@ SEGMENT_COLOR_PALETTE = [
     (1.0, 0.5, 0.0),  # orange
 ]
 
+# Complement of SEGMENT_COLOR_PALETTE (1 - r, 1 - g, 1 - b), so ground
+# truth is never the same color as a prediction at the same segment_idx --
+# they need to be visually distinguishable when overlaid in the same
+# scene, not just correct per-segment.
+GT_COLOR_PALETTE = [tuple(1.0 - c for c in rgb) for rgb in SEGMENT_COLOR_PALETTE]
 
-def segment_color_string(segment_idx):
-    r, g, b = SEGMENT_COLOR_PALETTE[segment_idx % len(SEGMENT_COLOR_PALETTE)]
+
+def segment_color_string(segment_idx, palette=SEGMENT_COLOR_PALETTE):
+    r, g, b = palette[segment_idx % len(palette)]
     return f"{r} {g} {b}"
 
 
@@ -774,7 +780,7 @@ def write_prediction_case_zip(
         if not src.exists():
             raise FileNotFoundError(f"Raw image file not found: {src}")
 
-        dst = case_tmp_dir / f"image_view_{idx:04d}.nii.gz"
+        dst = case_tmp_dir / f"{case_id}_image_view_{idx:04d}.nii.gz"
 
         # reset_direction=True only for tasks whose raw nii.gz direction is
         # a placeholder artifact (e.g. task3 video: nibabel writes with an
@@ -816,7 +822,7 @@ def write_prediction_case_zip(
 
             prob_img = segmentation_io.build_segmentation_image(prob_display, reference=reference_image)
 
-            prob_file = case_tmp_dir / f"probability_{c:04d}.nii.gz"
+            prob_file = case_tmp_dir / f"{case_id}_probability_{c:04d}.nii.gz"
 
             segmentation_io.write_volume(prob_img, prob_file)
 
@@ -829,7 +835,7 @@ def write_prediction_case_zip(
     if segmentation.ndim >= 3 and segmentation.shape[0] == 1:
         segmentation = segmentation[0]
 
-    prediction_seg_file = case_tmp_dir / "prediction.seg.nrrd"
+    prediction_seg_file = case_tmp_dir / f"{case_id}_prediction.seg.nrrd"
 
     prediction_seg_image = segmentation_io.build_segmentation_image(segmentation, reference=reference_image)
 
@@ -870,7 +876,7 @@ def write_prediction_case_zip(
         if gt.ndim >= 3 and gt.shape[0] == 1:
             gt = gt[0]
 
-        gt_seg_file = case_tmp_dir / "gt.seg.nrrd"
+        gt_seg_file = case_tmp_dir / f"{case_id}_gt.seg.nrrd"
 
         gt_seg_image = segmentation_io.build_segmentation_image(gt, reference=reference_image)
 
@@ -884,7 +890,7 @@ def write_prediction_case_zip(
 
             gt_seg_image.SetMetaData(f"Segment{segment_idx}_Name", f"GroundTruth_{label_value}")
 
-            gt_seg_image.SetMetaData(f"Segment{segment_idx}_Color", segment_color_string(segment_idx))
+            gt_seg_image.SetMetaData(f"Segment{segment_idx}_Color", segment_color_string(segment_idx, palette=GT_COLOR_PALETTE))
 
             gt_seg_image.SetMetaData(f"Segment{segment_idx}_LabelValue", str(label_value))
 
@@ -909,7 +915,7 @@ def write_prediction_case_zip(
     node_idx = 1
 
     for idx, image_file in enumerate(display_image_files):
-        volume_name = f"image_view_channel_{idx:04d}"
+        volume_name = f"{case_id}_image_view_channel_{idx:04d}"
 
         storage_id = f"vtkMRMLVolumeArchetypeStorageNode{node_idx}"
         volume_id = f"vtkMRMLScalarVolumeNode{node_idx}"
@@ -972,7 +978,7 @@ def write_prediction_case_zip(
         node_idx += 1
 
     for idx, prob_file in enumerate(probability_files):
-        volume_name = f"probability_channel_{idx:04d}"
+        volume_name = f"{case_id}_probability_channel_{idx:04d}"
 
         storage_id = f"vtkMRMLVolumeArchetypeStorageNode{node_idx}"
         volume_id = f"vtkMRMLScalarVolumeNode{node_idx}"
@@ -1010,12 +1016,12 @@ def write_prediction_case_zip(
 
     storage_nodes.append(f"""  <SegmentationStorage
     id="{storage_id}"
-    name="predictionStorage"
+    name="{case_id}_predictionStorage"
     fileName="{prediction_seg_file.name}"/>""")
 
     display_nodes.append(f"""  <SegmentationDisplay
     id="{display_id}"
-    name="predictionDisplay"
+    name="{case_id}_predictionDisplay"
     visibility="true"
     opacity="0.5"
     opacity3D="0.5"
@@ -1027,7 +1033,7 @@ def write_prediction_case_zip(
 
     volume_nodes.append(f"""  <Segmentation
     id="{seg_id}"
-    name="prediction"
+    name="{case_id}_prediction"
     storageNodeRef="{storage_id}"
     displayNodeRef="{display_id}"
     selectable="true"/>""")
@@ -1041,12 +1047,12 @@ def write_prediction_case_zip(
 
         storage_nodes.append(f"""  <SegmentationStorage
     id="{storage_id}"
-    name="ground_truthStorage"
+    name="{case_id}_ground_truthStorage"
     fileName="{gt_seg_file.name}"/>""")
 
         display_nodes.append(f"""  <SegmentationDisplay
     id="{display_id}"
-    name="ground_truthDisplay"
+    name="{case_id}_ground_truthDisplay"
     visibility="true"
     opacity="0.35"
     opacity3D="0.35"
@@ -1058,7 +1064,7 @@ def write_prediction_case_zip(
 
         volume_nodes.append(f"""  <Segmentation
     id="{seg_id}"
-    name="ground_truth"
+    name="{case_id}_ground_truth"
     storageNodeRef="{storage_id}"
     displayNodeRef="{display_id}"
     selectable="true"/>""")
