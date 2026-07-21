@@ -780,7 +780,7 @@ def write_prediction_case_zip(
         if not src.exists():
             raise FileNotFoundError(f"Raw image file not found: {src}")
 
-        dst = case_tmp_dir / f"{case_id}_image_view_{idx:04d}.nii.gz"
+        dst = case_tmp_dir / f"{case_id}_image_view_channel_{idx:04d}.nii.gz"
 
         # reset_direction=True only for tasks whose raw nii.gz direction is
         # a placeholder artifact (e.g. task3 video: nibabel writes with an
@@ -822,7 +822,7 @@ def write_prediction_case_zip(
 
             prob_img = segmentation_io.build_segmentation_image(prob_display, reference=reference_image)
 
-            prob_file = case_tmp_dir / f"{case_id}_probability_{c:04d}.nii.gz"
+            prob_file = case_tmp_dir / f"{case_id}_probability_channel_{c:04d}.nii.gz"
 
             segmentation_io.write_volume(prob_img, prob_file)
 
@@ -845,9 +845,9 @@ def write_prediction_case_zip(
         unique_labels = [1]
 
     for segment_idx, label_value in enumerate(unique_labels):
-        prediction_seg_image.SetMetaData(f"Segment{segment_idx}_ID", f"Segment_{label_value}")
+        prediction_seg_image.SetMetaData(f"Segment{segment_idx}_ID", f"{case_id}_prediction_{label_value}")
 
-        prediction_seg_image.SetMetaData(f"Segment{segment_idx}_Name", f"Prediction_{label_value}")
+        prediction_seg_image.SetMetaData(f"Segment{segment_idx}_Name", f"{case_id}_prediction_{label_value}")
 
         prediction_seg_image.SetMetaData(f"Segment{segment_idx}_Color", segment_color_string(segment_idx))
 
@@ -886,9 +886,9 @@ def write_prediction_case_zip(
             unique_gt_labels = [1]
 
         for segment_idx, label_value in enumerate(unique_gt_labels):
-            gt_seg_image.SetMetaData(f"Segment{segment_idx}_ID", f"Segment_{label_value}")
+            gt_seg_image.SetMetaData(f"Segment{segment_idx}_ID", f"{case_id}_ground_truth_{label_value}")
 
-            gt_seg_image.SetMetaData(f"Segment{segment_idx}_Name", f"GroundTruth_{label_value}")
+            gt_seg_image.SetMetaData(f"Segment{segment_idx}_Name", f"{case_id}_ground_truth_{label_value}")
 
             gt_seg_image.SetMetaData(f"Segment{segment_idx}_Color", segment_color_string(segment_idx, palette=GT_COLOR_PALETTE))
 
