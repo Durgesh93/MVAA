@@ -37,25 +37,47 @@ PATTERNS = ["t3_vid", "*vid*", "*video*"]
 CASE_SUFFIXES = [".png", ".jpg", ".jpeg", "_png_Label.tar"]
 
 # Raw annotation tool labels 17 classes per frame. Only class_10
-# (mitral valve) is kept in the final submission (see keep_classes /
-# lightning_module.py's is_t3_vid filtering); class_11 (ventricle),
-# class_2 (separating forceps), class_7 (suture thread), and class_1
-# (atrial retractor) are training-only. Matches VIDEO_ANY_OF_LABEL_VALUES
-# below -- every class used to select a frame for training is also a
-# real segmentation target.
+# (mitral valve annulus) is kept in the final submission (see
+# keep_classes / lightning_module.py's is_t3_vid filtering); class_11
+# (LV cavity/ventricle) is training-only, as its own class. Every other
+# raw class -- surgical tools/materials (retractor, forceps, suture
+# thread, pledget, needle, needle holder, scissors, valve sizer, pointed
+# knife, line organizer), the prosthetic valve, "atrial inner surface",
+# and "irrelevant frame" -- is collapsed into one "equipment" class
+# rather than kept as separate fine-grained classes: individually most
+# have low frame support (many under 15%) and the exact identity of each
+# matters far less than distinguishing equipment/other from the two real
+# anatomical targets, so merging gives the network fewer, better-
+# supported classes to learn instead of many classes that are both rare
+# and easy to confuse with each other.
 VIDEO_MULTI_CLASS_LABELS = {
     "background": 0,
     "class_10": 1,
     "class_11": 2,
-    "class_2": 3,
-    "class_7": 4,
-    "class_1": 5,
+    "equipment": 3,
+}
+
+# Raw annotation values merged into the "equipment" class.
+VIDEO_EQUIPMENT_RAW_VALUES = {
+    1,  # atrial retractor
+    2,  # separating forceps
+    3,  # scissors
+    4,  # needle holder
+    5,  # pointed knife
+    6,  # line organizer
+    7,  # suture thread
+    8,  # needle
+    9,  # atrial inner surface
+    13,  # irrelevant frame
+    14,  # prosthetic valve
+    16,  # pledget
+    17,  # valve sizer
 }
 
 VIDEO_LABEL_VALUE_TO_CLASS = {
-    int(name.removeprefix("class_")): class_idx
-    for name, class_idx in VIDEO_MULTI_CLASS_LABELS.items()
-    if name != "background"
+    10: 1,
+    11: 2,
+    **{raw_value: 3 for raw_value in VIDEO_EQUIPMENT_RAW_VALUES},
 }
 
 # Case-selection filter: a TrL frame is kept only if class_10 (mitral
