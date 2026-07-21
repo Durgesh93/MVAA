@@ -45,7 +45,7 @@ datamodule:
   seed: ${seed}
   plans_identifier: ${plans_identifier}
   prefix: ${prefix}
-  K: 2
+  K: 5
   transform_geometric: true
 
 # =============================================================================
@@ -64,11 +64,11 @@ litmodule:
   weight_decay: 0.00003
   num_epochs: ${trainer.max_epochs}
   use_boundary: true
-  boundary_weight_max: 0.01
+  boundary_weight_max: 0.20
   boundary_ramp_epochs: ${trainer.max_epochs}
-  lambda_pseudo: 0.25
+  lambda_pseudo: 0.20
   pseudo_threshold: 0.95
-  pseudo_warmup_epochs: 20
+  pseudo_warmup_epochs: 5
   tracked_labels: ["class_1", "class_2"]
 
 # =============================================================================
