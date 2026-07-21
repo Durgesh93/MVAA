@@ -37,4 +37,7 @@ Thumbs.db
 # Task3 prepared data (usually regenerated locally)
 task3/data/
 
+# check_transforms_visual.py output
+scripts/transform_check/
+
 dirs/
