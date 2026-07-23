@@ -202,7 +202,7 @@ def resolve_prediction_ckpt(cfg, ckpt):
     )
 
     if ckpt == "last":
-        return str(checkpoint_dir / "last.ckpt")
+        return str(checkpoint_dir / "_last_tracker.ckpt")
 
     if ckpt == "best":
         best_ckpts = sorted(checkpoint_dir.glob("best-*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)

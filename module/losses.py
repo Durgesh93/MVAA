@@ -236,6 +236,22 @@ class AdaptiveConfidenceThreshold(nn.Module):
             self.global_ema = torch.full((), init_value, device=device, dtype=dtype)
             self.class_ema = torch.full((num_classes,), init_value, device=device, dtype=dtype)
 
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # class_ema/global_ema are lazily shaped by num_classes (see
+        # _maybe_init), so a freshly constructed module -- e.g. for
+        # predict/retrain, which load a checkpoint before any unlabeled batch
+        # has run -- still has them at their construction-time shape. Resize
+        # to whatever shape the checkpoint has *before* the default load
+        # logic runs its shape check, so the real EMA values get restored
+        # instead of tripping a size mismatch.
+        class_key, global_key = prefix + "class_ema", prefix + "global_ema"
+
+        if class_key in state_dict and state_dict[class_key].shape != self.class_ema.shape:
+            self.class_ema = torch.empty_like(state_dict[class_key])
+            self.global_ema = torch.empty_like(state_dict[global_key])
+
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     @torch.no_grad()
     def update(self, confidence: Tensor, pseudo_label: Tensor, num_classes: int):
         self._maybe_init(num_classes, confidence.device, confidence.dtype)
@@ -272,17 +288,13 @@ class WeakStrongPseudoLabelLoss(nn.Module):
     pixels below the confidence threshold are excluded entirely rather than
     distilled from a likely-wrong guess.
 
-    threshold: flat cutoff, used only when adaptive=False.
-    adaptive: when True, threshold is replaced by AdaptiveConfidenceThreshold
-    (per-class, EMA-tracked) instead of the flat scalar -- see that class's
-    docstring.
+    Confidence threshold is per-class and EMA-tracked via
+    AdaptiveConfidenceThreshold -- see that class's docstring.
     """
 
-    def __init__(self, threshold: float, adaptive: bool = False, adaptive_momentum: float = 0.999):
+    def __init__(self, adaptive_momentum: float = 0.999):
         super().__init__()
-        self.threshold = threshold
-        self.adaptive = adaptive
-        self.adaptive_threshold = AdaptiveConfidenceThreshold(momentum=adaptive_momentum) if adaptive else None
+        self.adaptive_threshold = AdaptiveConfidenceThreshold(momentum=adaptive_momentum)
 
     def forward(self, weak_logits: Tensor, strong_logits_list):
         """
@@ -298,13 +310,10 @@ class WeakStrongPseudoLabelLoss(nn.Module):
             probs = torch.softmax(weak_logits, dim=1)
             confidence, pseudo_label = probs.max(dim=1)
 
-            if self.adaptive:
-                num_classes = weak_logits.shape[1]
-                self.adaptive_threshold.update(confidence, pseudo_label, num_classes)
-                per_class_threshold = self.adaptive_threshold.per_class_threshold(num_classes)
-                threshold = per_class_threshold[pseudo_label]
-            else:
-                threshold = self.threshold
+            num_classes = weak_logits.shape[1]
+            self.adaptive_threshold.update(confidence, pseudo_label, num_classes)
+            per_class_threshold = self.adaptive_threshold.per_class_threshold(num_classes)
+            threshold = per_class_threshold[pseudo_label]
 
             confident_mask = confidence >= threshold
 

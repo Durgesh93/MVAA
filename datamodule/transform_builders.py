@@ -34,10 +34,13 @@ TEE/video intensity design is grounded in real research, not guesses:
     RicianNoiseTransform (signal-dependent, closer to ultrasound speckle
     than additive Gaussian) and a brightness-gradient transform for
     depth/gain falloff.
-  - Video: SegSTRONG-C (arxiv 2407.11906) found smoke, bleeding, and low
-    brightness are the dominant real-world surgical video corruptions --
-    handled via a darker-biased brightness draw plus the custom
-    SmokeHazeTransform/BleedingBlobTransform (see transforms.py).
+  - Video: own base pool of natural-image-standard ops (noise, blur,
+    brightness/contrast, low-res, sharpen), not CT's -- gamma is dropped
+    since it specifically models scanner windowing, not a natural-image
+    artifact. SegSTRONG-C (arxiv 2407.11906) found smoke, bleeding, and
+    low brightness are the dominant real-world surgical video
+    corruptions -- handled via a darker-biased brightness draw plus the
+    custom SmokeHazeTransform/BleedingBlobTransform (see transforms.py).
 """
 
 from batchgeneratorsv2.transforms.intensity.brightness import MultiplicativeBrightnessTransform
@@ -45,6 +48,7 @@ from batchgeneratorsv2.transforms.intensity.contrast import ContrastTransform, B
 from batchgeneratorsv2.transforms.intensity.gamma import GammaTransform
 from batchgeneratorsv2.transforms.intensity.gaussian_noise import GaussianNoiseTransform
 from batchgeneratorsv2.transforms.noise.gaussian_blur import GaussianBlurTransform
+from batchgeneratorsv2.transforms.noise.sharpen import SharpeningTransform
 from batchgeneratorsv2.transforms.spatial.low_resolution import SimulateLowResolutionTransform
 from batchgeneratorsv2.transforms.local.brightness_gradient import BrightnessGradientAdditiveTransform
 from batchgeneratorsv2.transforms.spatial.mirroring import MirrorTransform
@@ -314,15 +318,73 @@ class TransformBuilderMixin:
 
     def _intensity_recipe_video(self):
         """
-        CT's default intensity op pool (video is RGB camera footage,
-        closer to natural-image domain than CT/TEE) plus ops targeting
-        the three corruption modes SegSTRONG-C (arxiv 2407.11906) found
-        dominant in real surgical video: a darker-biased brightness draw
-        for low-brightness, and SmokeHazeTransform/BleedingBlobTransform
-        (custom, see transforms.py) for smoke and bleeding.
+        Own base pool, not CT's -- video is RGB camera footage, not
+        CT/MRI intensity data, so this no longer inherits
+        _intensity_recipe_ct(). Base ops are the generic building blocks
+        used across natural-image segmentation augmentation pipelines
+        (sensor noise, blur, brightness/contrast jitter, low-res/
+        compression-robustness simulation, sharpening) -- CT's two
+        GammaTransform entries are dropped since gamma here specifically
+        models scanner/windowing nonlinearity, not a natural-image
+        artifact. batchgeneratorsv2 has no true hue/saturation transform
+        (it's built for per-modality medical channels, not RGB), and its
+        BlankRectangleTransform samples an independent rectangle position
+        per channel -- fine for uncorrelated MRI modalities, but it would
+        misalign the occlusion patch across R/G/B here, so it's
+        intentionally left out rather than shipped broken.
+
+        On top of that base: the three ops targeting the corruption modes
+        SegSTRONG-C (arxiv 2407.11906) found dominant in real surgical
+        video -- a darker-biased brightness draw for low-brightness, and
+        SmokeHazeTransform/BleedingBlobTransform (custom, see
+        transforms.py) for smoke and bleeding.
         """
 
-        return self._intensity_recipe_ct() + [
+        return [
+            (
+                GaussianNoiseTransform(noise_variance=(0, 0.1), p_per_channel=1, synchronize_channels=True),
+                0.15,
+            ),
+            (
+                GaussianBlurTransform(
+                    blur_sigma=(0.5, 1.0),
+                    synchronize_channels=False,
+                    synchronize_axes=False,
+                    p_per_channel=0.5,
+                    benchmark=True,
+                ),
+                0.2,
+            ),
+            (
+                MultiplicativeBrightnessTransform(
+                    multiplier_range=BGContrast((0.75, 1.25)), synchronize_channels=False, p_per_channel=1
+                ),
+                0.15,
+            ),
+            (
+                ContrastTransform(
+                    contrast_range=BGContrast((0.75, 1.25)),
+                    preserve_range=True,
+                    synchronize_channels=False,
+                    p_per_channel=1,
+                ),
+                0.15,
+            ),
+            (
+                SimulateLowResolutionTransform(
+                    scale=(0.5, 1),
+                    synchronize_channels=False,
+                    synchronize_axes=True,
+                    ignore_axes=None,
+                    allowed_channels=None,
+                    p_per_channel=0.5,
+                ),
+                0.2,
+            ),
+            (
+                SharpeningTransform(strength=(0.1, 0.3), p_same_for_each_channel=1.0, p_per_channel=1.0),
+                0.1,
+            ),
             (
                 MultiplicativeBrightnessTransform(
                     multiplier_range=BGContrast((0.5, 0.85)), synchronize_channels=False, p_per_channel=1

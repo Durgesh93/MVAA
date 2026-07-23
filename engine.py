@@ -49,6 +49,7 @@ from pathlib import Path
 import zipfile
 
 import torch
+import torch.distributed as dist
 import typer
 import lightning as L
 
@@ -266,7 +267,22 @@ def clear_results(cfg, clear_checkpoints=True):
     from a prior train/predict run -- write_prediction_case_zip replaces
     each {case_id}.zip in place, but any case_id not produced this run
     (or written by older code before a naming change) lingers untouched.
+
+    `predict all` re-enters this function once per experiment (ct, tee,
+    video) inside the same DDP-launched processes, with no barrier
+    between experiments once the first .test() call has joined the
+    process group -- every rank would otherwise call shutil.rmtree() on
+    the same shared folder concurrently, racing each other's unlink calls
+    (FileNotFoundError). Only rank 0 clears; every rank (rank 0 included)
+    waits on a barrier afterwards so no rank touches the folder before
+    the clear is done. Before the first .test() call the process group
+    isn't initialized yet, so every rank is trivially "rank 0" -- safe
+    here only because process spawn ordering guarantees the parent's
+    clear for that first experiment completes before the child process
+    that would redundantly repeat it even exists.
     """
+
+    is_rank_zero = not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
     fold_output_folder = (
         Path(cfg.paths.nnunet_results)
@@ -275,27 +291,31 @@ def clear_results(cfg, clear_checkpoints=True):
         / f"fold_{cfg.fold}"
     )
 
-    subfolders = ["validation", "prediction", "submission", "_rank_outputs"]
+    if is_rank_zero:
+        subfolders = ["validation", "prediction", "submission", "_rank_outputs"]
 
-    if clear_checkpoints:
-        subfolders.append("checkpoints")
+        if clear_checkpoints:
+            subfolders.append("checkpoints")
 
-    for subfolder in subfolders:
-        target = fold_output_folder / subfolder
+        for subfolder in subfolders:
+            target = fold_output_folder / subfolder
 
-        if target.exists():
-            shutil.rmtree(target)
+            if target.exists():
+                shutil.rmtree(target)
 
-    fold_output_folder.mkdir(parents=True, exist_ok=True)
+        fold_output_folder.mkdir(parents=True, exist_ok=True)
 
-    print()
-    print(
-        "[clear-results] Cleared fold output folder"
-        + ("" if clear_checkpoints else " (checkpoints preserved)")
-        + ":"
-    )
-    print(f"  {fold_output_folder}")
-    print()
+        print()
+        print(
+            "[clear-results] Cleared fold output folder"
+            + ("" if clear_checkpoints else " (checkpoints preserved)")
+            + ":"
+        )
+        print(f"  {fold_output_folder}")
+        print()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
 
 @app.command()
