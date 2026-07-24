@@ -34,6 +34,9 @@ class SSLnnUNetLightningModule(L.LightningModule):
         self.keep_classes = [self.dataset_json["labels"]["class_10"]] if self.is_t3_vid else None
 
         self.tracked_labels = [(self.dataset_json["labels"][name], name) for name in self.cfg.tracked_labels]
+        self.all_labels = sorted(
+            ((label_id, name) for name, label_id in self.dataset_json["labels"].items()), key=lambda item: item[0]
+        )
 
         self.actual_validation_output_base = (
             Path(nnUNet_results) / self.dataset_name / (self.cfg.plans_identifier + "__" + self.cfg.configuration)
@@ -46,7 +49,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
         self.progress_png_file = self.fold_output_folder / "training_progress.png"
 
         self.ddp = DDPHelper()
-        self.metrics = MetricsTracker(tracked_labels=self.tracked_labels)
+        self.metrics = MetricsTracker(tracked_labels=self.tracked_labels, all_labels=self.all_labels)
 
         self.network = None
         self.loss = None
@@ -87,7 +90,8 @@ class SSLnnUNetLightningModule(L.LightningModule):
         """
         if self.current_epoch < self.cfg.pseudo_warmup_epochs:
             zero = torch.zeros((), device=self.device)
-            return zero, zero
+            nan_per_class = torch.full((len(self.all_labels),), float("nan"), device=self.device)
+            return zero, zero, nan_per_class
 
         net = self.network.module if hasattr(self.network, "module") else self.network
         old_deep_supervision = net.decoder.deep_supervision
@@ -108,13 +112,14 @@ class SSLnnUNetLightningModule(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         sup_loss, _, _ = self._supervised_loss(batch["labeled"])
-        pseudo_loss, pseudo_confident_frac = self._pseudo_loss(batch["unlabeled"])
+        pseudo_loss, pseudo_confident_frac, pseudo_confident_frac_per_class = self._pseudo_loss(batch["unlabeled"])
         total_loss = sup_loss + self.cfg.lambda_pseudo * pseudo_loss
         self.metrics.update_step_training_metrics(
             train_loss=total_loss.detach(),
             train_sup_loss=sup_loss.detach(),
             train_pseudo_loss=pseudo_loss.detach(),
             train_pseudo_confident_frac=pseudo_confident_frac.detach(),
+            train_pseudo_confident_frac_per_class=pseudo_confident_frac_per_class.detach(),
         )
         return total_loss
 
@@ -195,6 +200,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
                 dataset_name=self.dataset_name,
                 fold=self.cfg.fold,
                 dice_classwise_keys=self.metrics.dice_keys,
+                pseudo_confident_frac_classwise_keys=self.metrics.pseudo_confident_frac_keys,
             )
         self.metrics.reset_step_metrics()
         self.ddp.merge_rank_outputs(

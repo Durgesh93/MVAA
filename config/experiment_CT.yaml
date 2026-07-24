@@ -4,7 +4,7 @@
 
 seed: 12345
 
-experiment_name: ssl
+experiment_name: ssl_pretrain
 
 # =============================================================================
 # Runtime / cluster-controlled values
@@ -47,6 +47,7 @@ datamodule:
   prefix: ${prefix}
   K: 5
   transform_geometric: true
+  oversample_fg: 0.33
 
 # =============================================================================
 # LightningModule config
@@ -69,7 +70,10 @@ litmodule:
   lambda_pseudo: 0.20
   pseudo_threshold_momentum: 0.999
   pseudo_warmup_epochs: 5
+  foreground_weight: 10.0
   tracked_labels: ["class_1"]
+  postprocess_keep_largest_component: true
+  pretrained_ckpt: null
 
 # =============================================================================
 # Trainer config
@@ -132,3 +136,26 @@ checkpoint_last:
   save_top_k: 1
   monitor: null
   auto_insert_metric_name: false
+
+# =============================================================================
+# Stochastic Weight Averaging
+#
+# Targets the noisy/oscillating Dice-HD plateau observed in training_
+# progress.png (bounces within a band rather than smoothly settling)
+# rather than trying to escape it -- averages weights over the last 20%
+# of training into a flatter, less noisy minimum. swa_lrs=0.002
+# approximates where PolyLRScheduler's decay already is at epoch 240/300
+# ((1-240/300)**0.9 * 0.01 ~= 0.0024), so entering the SWA phase doesn't
+# jolt the LR back up. No BatchNorm in this network (InstanceNorm3d
+# only, verified directly), so none of SWA's usual running-stats
+# recalibration applies. See engine.py's _run_training docstring for why
+# an extra explicit validate() + separate swa.ckpt are needed -- the
+# averaged weights only get swapped into the model at on_train_end,
+# after the last per-epoch checkpoint has already been written.
+# =============================================================================
+swa:
+  _target_: lightning.pytorch.callbacks.StochasticWeightAveraging
+  swa_lrs: 0.002
+  swa_epoch_start: 0.8
+  annealing_epochs: 10
+  annealing_strategy: cos

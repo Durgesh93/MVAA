@@ -1,10 +1,11 @@
 # =============================================================================
-# MVAA SSL nnU-Net experiment config
+# MVAA stage-1 pretraining config (CT) -- masked-volume reconstruction
+# on TrL + TrU pooled together (no labels used).
 # =============================================================================
 
 seed: 12345
 
-experiment_name: ssl_pretrain
+experiment_name: ssl_pretrain_stage1
 
 # =============================================================================
 # Runtime / cluster-controlled values
@@ -17,15 +18,20 @@ training_strategy: ???
 # Dataset / nnU-Net setup
 # =============================================================================
 
-dataset_id: Dataset003_MVAA_VIDEO_SSL
-configuration: 2d
+dataset_id: Dataset001_MVAA_CT_SSL
+configuration: 3d_fullres
 fold: all
-task_id: 'task3'
-prefix: 't3_vid'
+prefix: 't1_ct'
 plans_identifier: nnUNetPlans
 
 # =============================================================================
 # Paths
+#
+# experiment_name is ssl_pretrain_stage1 here (not ssl_pretrain, stage
+# 2's name) so this stage's checkpoints/ live in their own folder --
+# stage 2's `train` command clears its own fold_output_folder on every
+# fresh run, which would otherwise delete the very checkpoint stage 2
+# needs to load from.
 # =============================================================================
 
 paths:
@@ -45,40 +51,30 @@ datamodule:
   seed: ${seed}
   plans_identifier: ${plans_identifier}
   prefix: ${prefix}
-  K: 5
   transform_geometric: true
-  oversample_fg: 0.33
+  num_val_cases: 10
 
 # =============================================================================
 # LightningModule config
 # =============================================================================
 
 litmodule:
-  task_id: ${task_id}
-  prefix: ${prefix}
   dataset_id: ${dataset_id}
   configuration: ${configuration}
   fold: ${fold}
-  seed: ${seed}
   plans_identifier: ${plans_identifier}
   initial_lr: 0.01
   weight_decay: 0.00003
   num_epochs: ${trainer.max_epochs}
-  use_boundary: true
-  boundary_weight_max: 0.20
-  boundary_ramp_epochs: ${trainer.max_epochs}
-  lambda_pseudo: 0.20
-  pseudo_threshold_momentum: 0.999
-  pseudo_warmup_epochs: 5
-  tracked_labels: ["class_10"]
-  postprocess_keep_largest_component: false
+  mask_ratio: 0.4
+  mask_block_size: 16
 
 # =============================================================================
 # Trainer config
 # =============================================================================
 
 trainer:
-  max_epochs: 300
+  max_epochs: 150
   strategy: ${training_strategy}
   precision: 16-mixed
   log_every_n_steps: 1
@@ -105,29 +101,16 @@ progress_bar:
 # Checkpointer config
 # =============================================================================
 
-
 checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.nnunet_results}/${dataset_id}/${plans_identifier}__${configuration}/fold_${fold}/checkpoints
-  filename: "best-{epoch:03d}-{dice:.4f}"
+  filename: "best-{epoch:03d}-{val_loss:.4f}"
   save_last: false
   save_top_k: 1
-  monitor: "dice"
-  mode: "max"
+  monitor: "val_loss"
+  mode: "min"
   auto_insert_metric_name: false
 
-# Lightning's built-in save_last only refreshes in the SAME step it also
-# saves a new top-k checkpoint (see ModelCheckpoint.on_validation_end --
-# last is gated behind `_last_global_step_saved == trainer.global_step`,
-# which the monitor-based callback above only bumps when dice hits a new
-# record). Once dice plateaus, that would silently stop updating even
-# though training keeps progressing. This second, unmonitored callback
-# saves unconditionally every epoch instead, to the fixed filename
-# "_last_tracker" -- save_last is off here since it's redundant with that
-# (and, being a separate untracked "last.ckpt" lineage, doesn't survive
-# job restarts cleanly: a resumed process doesn't know about the previous
-# process's last.ckpt and versions off a new last-v1.ckpt instead of
-# reusing it).
 checkpoint_last:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.nnunet_results}/${dataset_id}/${plans_identifier}__${configuration}/fold_${fold}/checkpoints

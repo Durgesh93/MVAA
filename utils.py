@@ -26,6 +26,7 @@ from matplotlib.ticker import MultipleLocator, MaxNLocator
 from medpy.metric.binary import dc, asd, hd, hd95
 from skimage.io import imsave as skimage_imsave
 import SimpleITK as sitk
+from scipy import ndimage
 
 # =============================================================================
 # Basic shared helpers
@@ -281,7 +282,9 @@ def collect_submission_files(cfg, fold_num):
 # =============================================================================
 
 
-def save_training_progress_plot(history, progress_png_file, dataset_name, fold, dice_classwise_keys=None):
+def save_training_progress_plot(
+    history, progress_png_file, dataset_name, fold, dice_classwise_keys=None, pseudo_confident_frac_classwise_keys=None
+):
     """
     Save training_progress.png from already-computed NumPy history.
 
@@ -290,6 +293,14 @@ def save_training_progress_plot(history, progress_png_file, dataset_name, fold, 
     plots one line per class instead of the single aggregate "dice" mean,
     so classwise performance (e.g. the submitted class vs. training-only
     auxiliary classes) is visible directly in the plot.
+
+    pseudo_confident_frac_classwise_keys: same idea for the "Pseudo
+    confident pixel frac" panel, but covering every class (background and
+    auxiliary classes included, not just tracked_labels) -- the aggregate
+    confident_frac is computed over every pixel regardless of class, so a
+    class occupying only a couple percent of a volume can be silently
+    filtered out (or not) with almost no visible effect on the aggregate,
+    which stays dominated by whatever the majority class is.
     """
 
     if "epoch" not in history:
@@ -327,6 +338,11 @@ def save_training_progress_plot(history, progress_png_file, dataset_name, fold, 
     for ax, (key, title, best_mode) in zip(axes, plot_keys):
         if key == "dice" and dice_classwise_keys:
             series = {k.removeprefix("dice_"): np.asarray(history[k], dtype=float) for k in dice_classwise_keys}
+        elif key == "train_pseudo_confident_frac" and pseudo_confident_frac_classwise_keys:
+            series = {
+                k.removeprefix("train_pseudo_confident_frac_"): np.asarray(history[k], dtype=float)
+                for k in pseudo_confident_frac_classwise_keys
+            }
         else:
             series = {key: np.asarray(history[key], dtype=float)}
 
@@ -442,6 +458,68 @@ def save_training_progress_plot(history, progress_png_file, dataset_name, fold, 
 
     fig.savefig(progress_png_file, dpi=180)
 
+    plt.close(fig)
+
+
+def save_pretrain_progress_plot(history, progress_png_file, dataset_name, fold):
+    """
+    Save training_progress.png for stage-1 masked-reconstruction
+    pretraining: just train_loss/val_loss over epochs -- there's no
+    segmentation metric during this stage, so save_training_progress_plot's
+    dice/hd/asd panels don't apply here.
+    """
+
+    if "epoch" not in history:
+        return
+
+    epochs = np.asarray(history["epoch"])
+
+    if epochs.size == 0:
+        return
+
+    plot_keys = [("train_loss", "Train reconstruction loss"), ("val_loss", "Val reconstruction loss")]
+
+    plot_keys = [item for item in plot_keys if item[0] in history]
+
+    if len(plot_keys) == 0:
+        return
+
+    fig, axes = plt.subplots(1, len(plot_keys), figsize=(13 * len(plot_keys), 11))
+
+    axes = np.asarray(axes).reshape(-1)
+
+    for ax, (key, title) in zip(axes, plot_keys):
+        values = np.asarray(history[key], dtype=float)
+        mask = ~np.isnan(values)
+
+        xs = epochs[mask]
+        ys = values[mask]
+
+        ax.set_title(title, fontsize=13)
+        ax.set_xlabel("Epoch")
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.grid(True, which="major", linestyle="-", linewidth=0.7, alpha=0.45)
+        ax.grid(True, which="minor", linestyle=":", linewidth=0.5, alpha=0.30)
+
+        if len(xs) == 0:
+            ax.text(0.5, 0.5, "No values yet", ha="center", va="center", transform=ax.transAxes)
+            continue
+
+        ax.plot(xs, ys, marker="o", linewidth=1.8, markersize=4, label=f"last={ys[-1]:.4f}, best/min={ys.min():.4f}")
+
+        ymin, ymax = float(ys.min()), float(ys.max())
+        margin = 0.05 * max(abs(ymax - ymin), 1e-6)
+        ax.set_ylim(ymin - margin, ymax + margin)
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=8))
+        ax.yaxis.set_minor_locator(MaxNLocator(nbins=16))
+        ax.legend(loc="best", fontsize=10)
+
+    progress_png_file = Path(progress_png_file)
+    progress_png_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fig.suptitle(f"Stage-1 pretraining progress | {dataset_name} | fold {fold}", fontsize=16)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(progress_png_file, dpi=180)
     plt.close(fig)
 
 
@@ -636,12 +714,66 @@ def merge_rank_folders(fold_output_folder, task_id, overwrite=True):
 
 
 # =============================================================================
+# Stage-1 pretrained-weight loading (stage 2)
+# =============================================================================
+def load_pretrained_weights(network, ckpt_path):
+    """
+    Load a stage-1 pretraining checkpoint into a stage-2 segmentation
+    network, skipping any tensor whose shape doesn't match (the final
+    decoder.seg_layers.* heads: stage 1 regresses num_input_channels,
+    stage 2 predicts num_segmentation_heads -- everything else in the
+    shared encoder/decoder body matches by construction, since both
+    networks are built from the same plans/configuration).
+
+    Returns (loaded_keys, skipped_keys) for the caller to log.
+    """
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+    state_dict = {k[len("network.") :]: v for k, v in state_dict.items() if k.startswith("network.")}
+
+    model_state = network.state_dict()
+    compatible = {k: v for k, v in state_dict.items() if k in model_state and model_state[k].shape == v.shape}
+    skipped = sorted(set(state_dict) - set(compatible))
+
+    network.load_state_dict(compatible, strict=False)
+
+    return sorted(compatible.keys()), skipped
+
+
+# =============================================================================
 # Segmentation -> 0/255 conversion
 # =============================================================================
 def convert_segmentation_to_255(segmentation):
     # Matches the Codabench baseline scripts' convention: binary mask as
     # plain 0/255 uint8.
     return (segmentation > 0).astype(np.uint8) * 255
+
+
+# =============================================================================
+# Keep-largest-component postprocessing
+# =============================================================================
+def keep_largest_component(segmentation, foreground_labels):
+    """
+    For each foreground label, zero out every connected component of that
+    label's binary mask except the largest one. Only appropriate for
+    labels whose anatomy is a single structure (e.g. CT/TEE valves) --
+    not for classes with legitimately multi-component ground truth (e.g.
+    video's equipment class, see the commit that removed this postprocessing
+    for video).
+    """
+    out = segmentation.copy()
+    for label in foreground_labels:
+        mask = segmentation == label
+        if not mask.any():
+            continue
+        components, num_components = ndimage.label(mask)
+        if num_components <= 1:
+            continue
+        sizes = np.bincount(components.ravel())
+        sizes[0] = 0
+        largest_component = sizes.argmax()
+        out[mask & (components != largest_component)] = 0
+    return out
 
 
 # =============================================================================

@@ -2,9 +2,11 @@
 Training / prediction / submission engine for SSL nnU-Net experiments.
 
 Usage:
-    python engine.py train video
-    python engine.py train tee
-    python engine.py train ct
+    python engine.py train ct       # runs stage 1 (pretrain) THEN stage 2, chained
+    python engine.py train tee      # no pretrain config yet -- stage 2 only
+    python engine.py train video    # no pretrain config yet -- stage 2 only
+
+    python engine.py pretrain ct    # stage 1 only, if you want it standalone
 
     python engine.py retrain video
     python engine.py retrain tee
@@ -40,6 +42,16 @@ Usage:
     predict run always starts from a clean slate instead of leaving stale
     zips from a previous train/predict run sitting alongside freshly
     written ones.
+
+    For any experiment with a stage-1 config (currently only ct, see
+    CONFIG_MAP_PRETRAIN), `train` always runs stage 1 (masked-volume
+    reconstruction on TrL+TrU pooled, no labels) fresh first, under its
+    own experiment_name (ssl_pretrain_stage1) so its checkpoints/ never
+    collide with stage 2's -- then resolves stage 1's best checkpoint
+    and passes it into stage 2 as a hydra override
+    (litmodule.pretrained_ckpt), no yaml edit needed. `pretrain` is also
+    exposed standalone (stage 1 only) if you want to inspect/reuse a
+    checkpoint without immediately re-running stage 2.
 """
 
 import json
@@ -58,6 +70,7 @@ from omegaconf import OmegaConf
 
 from lightning.pytorch.strategies import DDPStrategy
 from lightning.fabric.plugins.environments import LightningEnvironment
+from lightning.pytorch.callbacks import Callback
 
 
 from config import build_config
@@ -91,9 +104,57 @@ NIFTI_SUBMISSION_SUFFIX = "-pred.nii.gz"
 
 
 CONFIG_MAP = {"ct": "experiment_CT", "tee": "experiment_TEE", "video": "experiment_video"}
+CONFIG_MAP_PRETRAIN = {"ct": "pretrain_CT"}
 
 
-def _select_cluster_environment(trainer_cfg):
+def _swa_checkpoint_path(cfg):
+    return (
+        Path(cfg.paths.nnunet_results)
+        / cfg.dataset_id
+        / f"{cfg.plans_identifier}__{cfg.configuration}"
+        / f"fold_{cfg.fold}"
+        / "checkpoints"
+        / "swa.ckpt"
+    )
+
+
+class _SWACheckpointCallback(Callback):
+    """
+    Saves the SWA running average's current weights to a fixed swa.ckpt
+    path every epoch once the SWA phase starts, not just once at the very
+    end. StochasticWeightAveraging itself only transfers/exposes the
+    average into pl_module at on_train_end -- if the job crashes partway
+    through the SWA phase, all that averaging work would otherwise be
+    lost with nothing saved to show for it.
+
+    Reads swa_callback's own running average directly (_average_model,
+    n_averaged) rather than re-implementing averaging -- both are lightning
+    private attributes, but this is a widely used pattern for exactly this
+    gap (Lightning's built-in callback has no periodic-checkpoint hook of
+    its own). Safe to read at on_train_epoch_end: _average_model is only
+    ever updated once per epoch, at on_train_epoch_start, so its value is
+    stable for the rest of that epoch.
+    """
+
+    def __init__(self, swa_callback, ckpt_path):
+        self.swa_callback = swa_callback
+        self.ckpt_path = Path(ckpt_path)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if not trainer.is_global_zero:
+            return
+
+        average_model = self.swa_callback._average_model
+        n_averaged = self.swa_callback.n_averaged
+
+        if average_model is None or n_averaged is None or int(n_averaged) == 0:
+            return
+
+        self.ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"state_dict": average_model.state_dict()}, self.ckpt_path)
+
+
+def _select_cluster_environment(trainer_cfg, find_unused_parameters=False):
     """
     This cluster does not launch training via srun, so Lightning's automatic
     cluster-environment detection is unsafe: SLURMEnvironment's constructor
@@ -102,6 +163,15 @@ def _select_cluster_environment(trainer_cfg):
     regardless of accelerator/strategy. Force Lightning's unmanaged
     environment and pin topology explicitly so that detection never runs,
     for both single-device and DDP training.
+
+    find_unused_parameters: only PretrainLightningModule needs this (see
+    _build_pretrain_objects) -- its network is built with
+    enable_deep_supervision=False, but nnU-Net's decoder still
+    instantiates all deep-supervision-scale decoder.seg_layers.* heads
+    regardless of that flag; only the finest-resolution one is actually
+    used in forward() when deep supervision is off, so the other heads
+    are legitimately-unused parameters under DDP. Stage 2 always trains
+    with deep supervision on and uses every head, so it never needs this.
     """
 
     device_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
@@ -112,14 +182,16 @@ def _select_cluster_environment(trainer_cfg):
     strategy = trainer_cfg.get("strategy", "auto")
 
     if strategy == "ddp":
-        trainer_cfg["strategy"] = DDPStrategy(cluster_environment=LightningEnvironment())
+        trainer_cfg["strategy"] = DDPStrategy(
+            cluster_environment=LightningEnvironment(), find_unused_parameters=find_unused_parameters
+        )
     else:
         trainer_cfg["plugins"] = [LightningEnvironment()]
 
     return trainer_cfg
 
 
-def _build_trainer(cfg, prediction=False):
+def _build_trainer(cfg, prediction=False, find_unused_parameters=False):
     """
     Build Lightning Trainer.
 
@@ -129,7 +201,7 @@ def _build_trainer(cfg, prediction=False):
 
     trainer_cfg = OmegaConf.to_container(cfg.trainer, resolve=True)
 
-    trainer_cfg = _select_cluster_environment(trainer_cfg)
+    trainer_cfg = _select_cluster_environment(trainer_cfg, find_unused_parameters=find_unused_parameters)
 
     callbacks = []
 
@@ -141,12 +213,17 @@ def _build_trainer(cfg, prediction=False):
         callbacks.append(instantiate(cfg.checkpoint))
         callbacks.append(instantiate(cfg.checkpoint_last))
 
+    if "swa" in cfg:
+        swa_callback = instantiate(cfg.swa)
+        callbacks.append(swa_callback)
+        callbacks.append(_SWACheckpointCallback(swa_callback, _swa_checkpoint_path(cfg)))
+
     trainer = L.Trainer(**trainer_cfg, callbacks=callbacks)
 
     return trainer
 
 
-def _build_objects(config_name, prediction=False, clear=None):
+def _build_objects(config_name, prediction=False, clear=None, extra_overrides=None):
     """
     clear defaults to True for both train and predict, but clear_results'
     clear_checkpoints flag differs: train clears checkpoints too (fresh
@@ -154,9 +231,15 @@ def _build_objects(config_name, prediction=False, clear=None):
     there when resolve_prediction_ckpt runs right after this). retrain
     passes clear=False explicitly -- it's not a prediction run, but it
     must not wipe the checkpoint it's about to resume from either.
+
+    extra_overrides: additional hydra overrides (e.g.
+    "litmodule.pretrained_ckpt=/path/to.ckpt") -- used by `train` to wire
+    in stage 1's resolved best checkpoint without editing the yaml.
     """
 
-    cfg = build_config(config_name=config_name, overrides=[f"fold={FOLD_NUM}"])
+    overrides = [f"fold={FOLD_NUM}", *(extra_overrides or [])]
+
+    cfg = build_config(config_name=config_name, overrides=overrides)
 
     set_nnunet_env(cfg)
 
@@ -182,10 +265,105 @@ def _build_objects(config_name, prediction=False, clear=None):
     return cfg, datamodule, model, trainer
 
 
-def _run_training(config_name):
-    cfg, datamodule, model, trainer = _build_objects(config_name=config_name, prediction=False)
+def _build_pretrain_objects(config_name):
+    cfg = build_config(config_name=config_name, overrides=[f"fold={FOLD_NUM}"])
+
+    set_nnunet_env(cfg)
+
+    L.seed_everything(cfg.seed, workers=True)
+
+    from datamodule import PretrainDataModule
+    from module import PretrainLightningModule
+
+    cfg = resolve_runtime_config(cfg, prediction=False)
+
+    clear_results(cfg, clear_checkpoints=True)
+
+    datamodule = PretrainDataModule(cfg.datamodule)
+
+    model = PretrainLightningModule(cfg.litmodule)
+
+    trainer = _build_trainer(cfg, prediction=False, find_unused_parameters=True)
+
+    return cfg, datamodule, model, trainer
+
+
+def _run_pretraining(config_name):
+    cfg, datamodule, model, trainer = _build_pretrain_objects(config_name=config_name)
 
     trainer.fit(model=model, datamodule=datamodule)
+
+
+def _run_training(config_name, pretrain_config_name=None):
+    """
+    pretrain_config_name: when set (only "ct" has one so far, via
+    CONFIG_MAP_PRETRAIN), stage 1 runs first in this same process, then
+    its resolved best checkpoint is wired into stage 2 as a hydra
+    override -- one `train` call does both stages, no manual copying of
+    a checkpoint path into the yaml.
+    """
+
+    extra_overrides = []
+
+    if pretrain_config_name is not None:
+        print()
+        print("=" * 80)
+        print("[train] Stage 1: pretraining")
+        print("=" * 80)
+        print()
+
+        _run_pretraining(config_name=pretrain_config_name)
+
+        pretrain_cfg = build_config(config_name=pretrain_config_name, overrides=[f"fold={FOLD_NUM}"])
+        set_nnunet_env(pretrain_cfg)
+
+        best_ckpt = resolve_prediction_ckpt(cfg=pretrain_cfg, ckpt="best")
+
+        if not Path(best_ckpt).is_file():
+            raise FileNotFoundError(
+                f"Stage 1 (pretraining) finished but no best checkpoint was found at: {best_ckpt}"
+            )
+
+        print()
+        print("[train] Stage 1 complete. Best checkpoint:")
+        print(f"  {best_ckpt}")
+        print()
+        print("=" * 80)
+        print("[train] Stage 2: segmentation training (pretrained init)")
+        print("=" * 80)
+        print()
+
+        extra_overrides = [f"litmodule.pretrained_ckpt={best_ckpt}"]
+
+    cfg, datamodule, model, trainer = _build_objects(
+        config_name=config_name, prediction=False, extra_overrides=extra_overrides
+    )
+
+    trainer.fit(model=model, datamodule=datamodule)
+
+    if "swa" in cfg:
+        # _SWACheckpointCallback (registered in _build_trainer) already keeps
+        # checkpoints/swa.ckpt updated every epoch during the SWA phase, so a
+        # mid-run crash doesn't lose that averaging work. This is the "clean
+        # finish" case: StochasticWeightAveraging swaps the averaged weights
+        # into the in-memory model at on_train_end (after the fit loop has
+        # already finished, so no per-epoch validation/checkpoint ever saw
+        # them), so we run one more explicit validation pass here to print
+        # real metrics for the final average, and overwrite swa.ckpt with
+        # that exact end state.
+        print()
+        print("[train] SWA: validating averaged weights (swapped in at on_train_end)")
+        print()
+
+        trainer.validate(model=model, datamodule=datamodule)
+
+        swa_ckpt_path = _swa_checkpoint_path(cfg)
+        trainer.save_checkpoint(swa_ckpt_path)
+
+        print()
+        print("[train] SWA checkpoint saved:")
+        print(f"  {swa_ckpt_path}")
+        print("  Use `predict ct --ckpt <this path>` to generate predictions from the SWA-averaged model.")
 
 
 def _run_retraining(config_name):
@@ -319,19 +497,55 @@ def clear_results(cfg, clear_checkpoints=True):
 
 
 @app.command()
+def pretrain(experiment: str = typer.Argument(..., help="Which experiment to pretrain (stage 1): ct.")):
+    """
+    Stage-1 masked-volume reconstruction on TrL+TrU pooled together (no
+    labels used). Writes checkpoints under its own experiment_name
+    (ssl_pretrain_stage1), separate from stage 2's, so a later `train`
+    run never clears the checkpoint this stage produced.
+    """
+
+    try:
+        experiment, config_name = validate_experiment_name(experiment, CONFIG_MAP_PRETRAIN)
+    except ValueError as e:
+        raise typer.BadParameter(str(e))
+
+    print()
+    print(f"Pretraining (stage 1) experiment: {experiment}")
+    print(f"Config: {config_name}")
+    print(f"Fold: {FOLD_NUM}")
+    print()
+
+    _run_pretraining(config_name=config_name)
+
+
+@app.command()
 def train(experiment: str = typer.Argument(..., help="Which experiment to train: ct, tee, or video.")):
+    """
+    For experiments with a stage-1 pretrain config (currently only ct,
+    via CONFIG_MAP_PRETRAIN), this runs BOTH stages in one call: stage 1
+    (masked-volume reconstruction) always runs first, fresh, then its
+    resolved best checkpoint is automatically wired into stage 2 -- no
+    separate `pretrain` call or manual yaml edit needed. tee/video have
+    no pretrain config yet, so they train exactly as before.
+    """
+
     try:
         experiment, config_name = validate_experiment_name(experiment, CONFIG_MAP)
     except ValueError as e:
         raise typer.BadParameter(str(e))
 
+    pretrain_config_name = CONFIG_MAP_PRETRAIN.get(experiment)
+
     print()
     print(f"Training experiment: {experiment}")
     print(f"Config: {config_name}")
+    if pretrain_config_name:
+        print(f"Stage-1 pretrain config: {pretrain_config_name} (runs first, auto-chained)")
     print(f"Fold: {FOLD_NUM}")
     print()
 
-    _run_training(config_name=config_name)
+    _run_training(config_name=config_name, pretrain_config_name=pretrain_config_name)
 
 
 @app.command()

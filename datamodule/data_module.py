@@ -66,7 +66,7 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
         self.transform_geometric = bool(self.cfg.transform_geometric)
 
         self.enable_deep_supervision = True
-        self.oversample_fg = 0.33
+        self.oversample_fg = float(self.cfg.oversample_fg)
         self.print_case_ids = True
 
         # These are resolved automatically in setup(),
