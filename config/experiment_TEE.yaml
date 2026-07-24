@@ -47,6 +47,7 @@ datamodule:
   prefix: ${prefix}
   K: 5
   transform_geometric: true
+  oversample_fg: 0.33
 
 # =============================================================================
 # LightningModule config
@@ -69,7 +70,9 @@ litmodule:
   lambda_pseudo: 0.20
   pseudo_threshold_momentum: 0.999
   pseudo_warmup_epochs: 5
+  foreground_weight: 10.0
   tracked_labels: ["class_1", "class_2"]
+  postprocess_keep_largest_component: true
 
 # =============================================================================
 # Trainer config

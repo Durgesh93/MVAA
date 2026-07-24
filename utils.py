@@ -26,6 +26,7 @@ from matplotlib.ticker import MultipleLocator, MaxNLocator
 from medpy.metric.binary import dc, asd, hd, hd95
 from skimage.io import imsave as skimage_imsave
 import SimpleITK as sitk
+from scipy import ndimage
 
 # =============================================================================
 # Basic shared helpers
@@ -281,7 +282,9 @@ def collect_submission_files(cfg, fold_num):
 # =============================================================================
 
 
-def save_training_progress_plot(history, progress_png_file, dataset_name, fold, dice_classwise_keys=None):
+def save_training_progress_plot(
+    history, progress_png_file, dataset_name, fold, dice_classwise_keys=None, pseudo_confident_frac_classwise_keys=None
+):
     """
     Save training_progress.png from already-computed NumPy history.
 
@@ -290,6 +293,14 @@ def save_training_progress_plot(history, progress_png_file, dataset_name, fold, 
     plots one line per class instead of the single aggregate "dice" mean,
     so classwise performance (e.g. the submitted class vs. training-only
     auxiliary classes) is visible directly in the plot.
+
+    pseudo_confident_frac_classwise_keys: same idea for the "Pseudo
+    confident pixel frac" panel, but covering every class (background and
+    auxiliary classes included, not just tracked_labels) -- the aggregate
+    confident_frac is computed over every pixel regardless of class, so a
+    class occupying only a couple percent of a volume can be silently
+    filtered out (or not) with almost no visible effect on the aggregate,
+    which stays dominated by whatever the majority class is.
     """
 
     if "epoch" not in history:
@@ -327,6 +338,11 @@ def save_training_progress_plot(history, progress_png_file, dataset_name, fold, 
     for ax, (key, title, best_mode) in zip(axes, plot_keys):
         if key == "dice" and dice_classwise_keys:
             series = {k.removeprefix("dice_"): np.asarray(history[k], dtype=float) for k in dice_classwise_keys}
+        elif key == "train_pseudo_confident_frac" and pseudo_confident_frac_classwise_keys:
+            series = {
+                k.removeprefix("train_pseudo_confident_frac_"): np.asarray(history[k], dtype=float)
+                for k in pseudo_confident_frac_classwise_keys
+            }
         else:
             series = {key: np.asarray(history[key], dtype=float)}
 
@@ -642,6 +658,33 @@ def convert_segmentation_to_255(segmentation):
     # Matches the Codabench baseline scripts' convention: binary mask as
     # plain 0/255 uint8.
     return (segmentation > 0).astype(np.uint8) * 255
+
+
+# =============================================================================
+# Keep-largest-component postprocessing
+# =============================================================================
+def keep_largest_component(segmentation, foreground_labels):
+    """
+    For each foreground label, zero out every connected component of that
+    label's binary mask except the largest one. Only appropriate for
+    labels whose anatomy is a single structure (e.g. CT/TEE valves) --
+    not for classes with legitimately multi-component ground truth (e.g.
+    video's equipment class, see the commit that removed this postprocessing
+    for video).
+    """
+    out = segmentation.copy()
+    for label in foreground_labels:
+        mask = segmentation == label
+        if not mask.any():
+            continue
+        components, num_components = ndimage.label(mask)
+        if num_components <= 1:
+            continue
+        sizes = np.bincount(components.ravel())
+        sizes[0] = 0
+        largest_component = sizes.argmax()
+        out[mask & (components != largest_component)] = 0
+    return out
 
 
 # =============================================================================

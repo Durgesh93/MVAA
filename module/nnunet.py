@@ -46,6 +46,7 @@ from .losses import BoundaryLoss, CompoundLoss, WeakStrongPseudoLabelLoss
 from utils import (
     write_prediction_case_zip as _write_prediction_case_zip,
     write_submission_prediction as _write_submission_prediction,
+    keep_largest_component as _keep_largest_component,
 )
 
 
@@ -60,13 +61,23 @@ class PredictionOps:
     with `.to()`).
     """
 
-    def __init__(self, plans_manager, configuration_manager, label_manager, dataset_json, trainer_name, configuration_name):
+    def __init__(
+        self,
+        plans_manager,
+        configuration_manager,
+        label_manager,
+        dataset_json,
+        trainer_name,
+        configuration_name,
+        postprocess_keep_largest_component=False,
+    ):
         self.pm = plans_manager
         self.cm = configuration_manager
         self.lm = label_manager
         self.dataset_json = dataset_json
         self.trainer_name = trainer_name
         self.configuration_name = configuration_name
+        self.postprocess_keep_largest_component = postprocess_keep_largest_component
 
     def _unwrap_network(self, network):
         if hasattr(network, "module"):
@@ -129,6 +140,8 @@ class PredictionOps:
         item = batch[0]
         logits = self._predict_logits(network=network, device=device, data=item["data"])
         predicted_segments, predicted_probs = self._restore_prediction_shape(logits=logits, properties=item["properties"])
+        if self.postprocess_keep_largest_component:
+            predicted_segments = _keep_largest_component(predicted_segments, self.lm.foreground_labels)
         item.update({"logits": logits, "predicted_segments": predicted_segments, "predicted_probs": predicted_probs})
         return item
 
@@ -176,6 +189,7 @@ class NNUnetSetup:
             dataset_json=self.dataset_json,
             trainer_name=trainer_name,
             configuration_name=litmodule_cfg.configuration,
+            postprocess_keep_largest_component=litmodule_cfg.postprocess_keep_largest_component,
         )
 
     def _make_trainer_shim(self, is_ddp):
@@ -197,7 +211,8 @@ class NNUnetSetup:
         shim = self._make_trainer_shim(is_ddp)
 
         assert not self.lm.has_regions, (
-            "CompoundLoss (DC_and_CE_loss + optional BoundaryLoss) does " "not support region-based labels"
+            "CompoundLoss (Dice + class-balanced CE + optional BoundaryLoss) does "
+            "not support region-based labels"
         )
 
         if self.cfg.use_boundary:
@@ -213,6 +228,7 @@ class NNUnetSetup:
             ignore_label=self.lm.ignore_label,
             boundary_cls=boundary_cls,
             boundary_kwargs=boundary_kwargs,
+            foreground_weight=getattr(self.cfg, "foreground_weight", 1.0),
         )
 
         if self.enable_deep_supervision:

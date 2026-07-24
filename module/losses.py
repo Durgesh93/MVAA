@@ -1,15 +1,17 @@
 """
-Compound loss for the supervised trainer: nnU-Net's own default Dice +
-CE loss (DC_and_CE_loss, built from MemoryEfficientSoftDiceLoss and
-RobustCrossEntropyLoss -- see nnUNetTrainer._build_loss upstream),
-with an optional third BoundaryLoss (Kervadec et al., 2019) term
-mixed in via a convex combination once module/nnunet.py's epoch hook
-ramps its weight above 0.
+Compound loss for the supervised trainer: Dice (MemoryEfficientSoftDiceLoss,
+do_bg=False) + a foreground-weighted CE (_foreground_weighted_ce, not
+nnU-Net's own DC_and_CE_loss/RobustCrossEntropyLoss, which averages CE per
+voxel with no class weighting -- see _foreground_weighted_ce's docstring
+for why that's worth overriding for a task like CT where background is
+~98% of a crop), with an optional third BoundaryLoss (Kervadec et al.,
+2019) term mixed in via a convex combination once module/nnunet.py's
+epoch hook ramps its weight above 0.
 
 The Tversky / Focal / Focal-Tversky region+pixel variants tried across
 the phase 1-3 experiment branches didn't outperform plain Dice+CE, so
-this file no longer reimplements that family or exposes a configurable
-loss_type -- CompoundLoss always uses nnU-Net's default loss, with
+this file doesn't reimplement that family or expose a configurable
+loss_type -- CompoundLoss always uses this Dice+CE combination, with
 BoundaryLoss as the only optional add-on.
 
 BoundaryLoss has no floor forcing any foreground prediction on its
@@ -24,7 +26,6 @@ import torch
 from scipy.ndimage import distance_transform_edt
 from torch import nn, Tensor
 
-from nnunetv2.training.loss.compound_losses import DC_and_CE_loss
 from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss
 from nnunetv2.utilities.helpers import softmax_helper_dim1
 
@@ -41,6 +42,43 @@ LOSS_CLIP_VALUE = 1e6
 def _clip_loss(loss: Tensor) -> Tensor:
     loss = torch.nan_to_num(loss, nan=LOSS_CLIP_VALUE, posinf=LOSS_CLIP_VALUE, neginf=-LOSS_CLIP_VALUE)
     return torch.clamp(loss, min=-LOSS_CLIP_VALUE, max=LOSS_CLIP_VALUE)
+
+
+def _foreground_weighted_ce(net_output: Tensor, target: Tensor, loss_mask=None, foreground_weight: float = 1.0) -> Tensor:
+    """
+    Standard per-voxel cross-entropy with a static class weight (background
+    at 1.0, every other class at foreground_weight), not renormalized by
+    each class's own voxel count. Ground-truth labels are trustworthy here
+    (real annotations, not pseudo-labels), so biasing the gradient toward
+    the rare class (e.g. CT's mitral valve, ~2% of voxels) is safe -- unlike
+    the pseudo-label branch (WeakStrongPseudoLabelLoss), there's no risk of
+    amplifying a wrong self-generated guess.
+
+    A per-class-averaged-then-uniformly-combined version of this was tried
+    and reverted (2026-07-23 session): renormalizing by each class's own
+    voxel count made the rare class's contribution high-variance batch to
+    batch. A static weight avoids that -- it scales the gradient without
+    renormalizing, so it doesn't get noisier just because a batch happens
+    to have few foreground voxels.
+
+    target: (B, 1, ...) integer class-id map. loss_mask: same shape,
+    boolean/0-1, voxels to include (ignore_label support).
+    """
+
+    target_flat = target[:, 0].long()
+
+    num_classes = net_output.shape[1]
+    class_weight = torch.ones(num_classes, device=net_output.device, dtype=net_output.dtype)
+    class_weight[1:] = foreground_weight
+
+    per_voxel_ce = nn.functional.cross_entropy(net_output, target_flat, weight=class_weight, reduction="none")
+
+    valid = loss_mask[:, 0].bool() if loss_mask is not None else torch.ones_like(target_flat, dtype=torch.bool)
+
+    if not valid.any():
+        return torch.zeros((), device=net_output.device, dtype=net_output.dtype)
+
+    return per_voxel_ce[valid].mean()
 
 
 def _onehot_target(x: Tensor, y: Tensor, do_bg: bool) -> Tensor:
@@ -142,8 +180,17 @@ class BoundaryLoss(nn.Module):
 
 class CompoundLoss(nn.Module):
     """
-    nnU-Net's default Dice + CE loss (DC_and_CE_loss), with an optional
-    BoundaryLoss term mixed in via a convex combination:
+    nnU-Net's default Dice + CE combination, but with CE made foreground-
+    weighted (_foreground_weighted_ce) instead of nnU-Net's own
+    DC_and_CE_loss (plain per-voxel CE) -- for a task like CT where
+    background is ~98% of a crop and the real class is ~2%, a plain
+    per-voxel CE average is dominated by background. Dice was already
+    immune to this (do_bg=False, per-class by construction); CE wasn't, so
+    this is the matching fix on that side. foreground_weight defaults to
+    1.0 (plain CE, no-op) -- set it via config for tasks where the rare
+    class needs a boost.
+
+    Optional BoundaryLoss term mixed in via a convex combination:
     (1 - boundary_weight) * dice_ce + boundary_weight * boundary.
 
     boundary_cls: BoundaryLoss, or None (no boundary term -- the
@@ -152,19 +199,23 @@ class CompoundLoss(nn.Module):
     ramps it up over epochs when litmodule.use_boundary is set).
     """
 
-    def __init__(self, batch_dice: bool, ddp: bool, ignore_label=None, boundary_cls=None, boundary_kwargs=None):
+    def __init__(
+        self,
+        batch_dice: bool,
+        ddp: bool,
+        ignore_label=None,
+        boundary_cls=None,
+        boundary_kwargs=None,
+        foreground_weight: float = 1.0,
+    ):
         super().__init__()
 
         self.ignore_label = ignore_label
         self.boundary_weight = 0.0
+        self.foreground_weight = foreground_weight
 
-        self.dice_ce = DC_and_CE_loss(
-            {"batch_dice": batch_dice, "smooth": 1e-5, "do_bg": False, "ddp": ddp},
-            {},
-            weight_ce=1,
-            weight_dice=1,
-            ignore_label=ignore_label,
-            dice_class=MemoryEfficientSoftDiceLoss,
+        self.dc = MemoryEfficientSoftDiceLoss(
+            apply_nonlin=softmax_helper_dim1, batch_dice=batch_dice, smooth=1e-5, do_bg=False, ddp=ddp
         )
 
         self.boundary = (
@@ -176,12 +227,25 @@ class CompoundLoss(nn.Module):
     def set_boundary_weight(self, weight: float) -> None:
         self.boundary_weight = weight
 
+    def _dice_ce(self, net_output: Tensor, target: Tensor) -> Tensor:
+        if self.ignore_label is not None:
+            mask = target != self.ignore_label
+            target_dice = torch.where(mask, target, torch.zeros_like(target))
+        else:
+            target_dice = target
+            mask = None
+
+        dc_loss = self.dc(net_output, target_dice, loss_mask=mask)
+        ce_loss = _foreground_weighted_ce(net_output, target, loss_mask=mask, foreground_weight=self.foreground_weight)
+
+        return dc_loss + ce_loss
+
     def forward(self, net_output: Tensor, target: Tensor) -> Tensor:
         """
         target must be b, c, x, y(, z) with c=1
         """
 
-        dice_ce = self.dice_ce(net_output, target)
+        dice_ce = self._dice_ce(net_output, target)
 
         if self.boundary is None or self.boundary_weight <= 0:
             return _clip_loss(dice_ce)
@@ -290,6 +354,19 @@ class WeakStrongPseudoLabelLoss(nn.Module):
 
     Confidence threshold is per-class and EMA-tracked via
     AdaptiveConfidenceThreshold -- see that class's docstring.
+
+    The CE itself is a single flat masked mean over confident voxels, no
+    class weighting or per-class averaging of any kind (tried twice --
+    per-class-averaged-then-uniformly-combined, then a static foreground
+    weight -- and reverted both times, 2026-07-23 session). Unlike
+    CompoundLoss's ground-truth-labeled CE, this loss's targets are the
+    model's own weak-view predictions -- deliberately *not* biasing it
+    toward foreground, since doing so on self-generated pseudo-labels
+    risks reinforcing whatever the model currently over/under-predicts
+    for the rare class rather than correcting it. The (already
+    class-conditioned) AdaptiveConfidenceThreshold is the only place this
+    loss discriminates between classes -- filtering *which* voxels count,
+    not how much each one is weighted once it does.
     """
 
     def __init__(self, adaptive_momentum: float = 0.999):
@@ -298,12 +375,23 @@ class WeakStrongPseudoLabelLoss(nn.Module):
 
     def forward(self, weak_logits: Tensor, strong_logits_list):
         """
-        Returns (loss, confident_frac) -- confident_frac is the fraction of
-        weak-view pixels that cleared the threshold (num_confident /
-        confident_mask.numel()), so callers can log it alongside the loss.
-        It's the direct diagnostic for whether a flat/tiny loss reflects a
-        healthy confident-pixel population or a threshold admitting almost
-        no pixels at all -- see lightning_module.py's _pseudo_loss.
+        Returns (loss, confident_frac, per_class_confident_frac).
+
+        confident_frac is the aggregate fraction of weak-view pixels that
+        cleared the threshold (num_confident / confident_mask.numel()) --
+        but that aggregate is computed over every pixel regardless of
+        class, so for a class occupying only a couple percent of a
+        volume (e.g. CT's mitral valve, ~2% of voxels) it's almost
+        entirely a background-confidence artifact and stays pinned near
+        1.0 whether or not the rare foreground class's pseudo-labels are
+        actually trustworthy. per_class_confident_frac breaks the same
+        ratio out per class (indexed by class id, NaN where a class
+        doesn't appear in this batch's pseudo-labels at all -- torchmetrics'
+        MeanMetric silently drops NaN updates, so this is safe to feed
+        straight into per-step logging without a batch necessarily
+        containing every class) so callers can see whether the rare
+        classes are actually being filtered sensibly, not just the
+        dominant one. See lightning_module.py's _pseudo_loss.
         """
 
         with torch.no_grad():
@@ -317,16 +405,24 @@ class WeakStrongPseudoLabelLoss(nn.Module):
 
             confident_mask = confidence >= threshold
 
+            per_class_confident_frac = torch.full((num_classes,), float("nan"), device=weak_logits.device)
+            for c in range(num_classes):
+                class_mask = pseudo_label == c
+                class_count = class_mask.sum()
+                if class_count > 0:
+                    per_class_confident_frac[c] = (confident_mask & class_mask).sum().float() / class_count.float()
+
         num_confident = confident_mask.sum()
         confident_frac = num_confident.float() / confident_mask.numel()
 
         if num_confident == 0:
-            return torch.zeros((), device=weak_logits.device, dtype=weak_logits.dtype), confident_frac
+            zero = torch.zeros((), device=weak_logits.device, dtype=weak_logits.dtype)
+            return zero, confident_frac, per_class_confident_frac
 
         view_losses = []
 
         for strong_logits in strong_logits_list:
             per_pixel_ce = nn.functional.cross_entropy(strong_logits, pseudo_label, reduction="none")
-            view_losses.append((per_pixel_ce * confident_mask).sum() / num_confident)
+            view_losses.append(per_pixel_ce[confident_mask].mean())
 
-        return torch.stack(view_losses).mean(), confident_frac
+        return torch.stack(view_losses).mean(), confident_frac, per_class_confident_frac
