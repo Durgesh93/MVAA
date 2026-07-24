@@ -1,10 +1,11 @@
 # =============================================================================
-# MVAA SSL nnU-Net experiment config
+# MVAA stage-1 pretraining config (TEE) -- masked-volume reconstruction
+# on TrL + TrU pooled together (no labels used).
 # =============================================================================
 
 seed: 12345
 
-experiment_name: ssl_pretrain
+experiment_name: ssl_pretrain_stage1
 
 # =============================================================================
 # Runtime / cluster-controlled values
@@ -20,12 +21,17 @@ training_strategy: ???
 dataset_id: Dataset002_MVAA_TEE_SSL
 configuration: 3d_fullres
 fold: all
-task_id: 'task2'
 prefix: 't2_tee'
 plans_identifier: nnUNetPlans
 
 # =============================================================================
 # Paths
+#
+# experiment_name is ssl_pretrain_stage1 here (not ssl_pretrain, stage
+# 2's name) so this stage's checkpoints/ live in their own folder --
+# stage 2's `train` command clears its own fold_output_folder on every
+# fresh run, which would otherwise delete the very checkpoint stage 2
+# needs to load from.
 # =============================================================================
 
 paths:
@@ -45,43 +51,30 @@ datamodule:
   seed: ${seed}
   plans_identifier: ${plans_identifier}
   prefix: ${prefix}
-  K: 5
   transform_geometric: true
-  oversample_fg: 0.33
+  num_val_cases: 10
 
 # =============================================================================
 # LightningModule config
 # =============================================================================
 
 litmodule:
-  task_id: ${task_id}
-  prefix: ${prefix}
   dataset_id: ${dataset_id}
   configuration: ${configuration}
   fold: ${fold}
-  seed: ${seed}
   plans_identifier: ${plans_identifier}
   initial_lr: 0.01
   weight_decay: 0.00003
   num_epochs: ${trainer.max_epochs}
-  use_boundary: true
-  boundary_weight_max: 0.20
-  boundary_ramp_epochs: ${trainer.max_epochs}
-  lambda_pseudo: 0.20
-  pseudo_threshold_momentum: 0.999
-  pseudo_warmup_epochs: 5
-  foreground_weight: 10.0
-  tracked_labels: ["class_1", "class_2"]
-  postprocess_keep_largest_component: true
-  tta_use_mirroring: true
-  tta_tile_step_size: 0.5
+  mask_ratio: 0.4
+  mask_block_size: 16
 
 # =============================================================================
 # Trainer config
 # =============================================================================
 
 trainer:
-  max_epochs: 300
+  max_epochs: 150
   strategy: ${training_strategy}
   precision: 16-mixed
   log_every_n_steps: 1
@@ -108,29 +101,16 @@ progress_bar:
 # Checkpointer config
 # =============================================================================
 
-
 checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.nnunet_results}/${dataset_id}/${plans_identifier}__${configuration}/fold_${fold}/checkpoints
-  filename: "best-{epoch:03d}-{dice:.4f}"
+  filename: "best-{epoch:03d}-{val_loss:.4f}"
   save_last: false
   save_top_k: 1
-  monitor: "dice"
-  mode: "max"
+  monitor: "val_loss"
+  mode: "min"
   auto_insert_metric_name: false
 
-# Lightning's built-in save_last only refreshes in the SAME step it also
-# saves a new top-k checkpoint (see ModelCheckpoint.on_validation_end --
-# last is gated behind `_last_global_step_saved == trainer.global_step`,
-# which the monitor-based callback above only bumps when dice hits a new
-# record). Once dice plateaus, that would silently stop updating even
-# though training keeps progressing. This second, unmonitored callback
-# saves unconditionally every epoch instead, to the fixed filename
-# "_last_tracker" -- save_last is off here since it's redundant with that
-# (and, being a separate untracked "last.ckpt" lineage, doesn't survive
-# job restarts cleanly: a resumed process doesn't know about the previous
-# process's last.ckpt and versions off a new last-v1.ckpt instead of
-# reusing it).
 checkpoint_last:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.nnunet_results}/${dataset_id}/${plans_identifier}__${configuration}/fold_${fold}/checkpoints
@@ -139,25 +119,3 @@ checkpoint_last:
   save_top_k: 1
   monitor: null
   auto_insert_metric_name: false
-
-# =============================================================================
-# Stochastic Weight Averaging
-#
-# Same rationale as experiment_CT.yaml: averages weights over the last 20%
-# of training into a flatter, less noisy minimum once the Dice-HD plateau
-# gets noisy. swa_lrs=0.002 approximates where PolyLRScheduler's decay
-# already is at epoch 240/300 ((1-240/300)**0.9 * 0.01 ~= 0.0024) -- same
-# initial_lr/max_epochs as CT, so the same value applies here. No
-# BatchNorm in this network (InstanceNorm only), so none of SWA's usual
-# running-stats recalibration applies. See engine.py's _run_training
-# docstring for why an extra explicit validate() + separate swa.ckpt are
-# needed -- the averaged weights only get swapped into the model at
-# on_train_end, after the last per-epoch checkpoint has already been
-# written. Not yet exercised for TEE (only CT so far).
-# =============================================================================
-swa:
-  _target_: lightning.pytorch.callbacks.StochasticWeightAveraging
-  swa_lrs: 0.002
-  swa_epoch_start: 0.8
-  annealing_epochs: 10
-  annealing_strategy: cos

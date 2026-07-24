@@ -45,7 +45,7 @@ datamodule:
   seed: ${seed}
   plans_identifier: ${plans_identifier}
   prefix: ${prefix}
-  K: 5
+  K: 10
   transform_geometric: true
   oversample_fg: 0.33
 
@@ -64,15 +64,17 @@ litmodule:
   initial_lr: 0.01
   weight_decay: 0.00003
   num_epochs: ${trainer.max_epochs}
-  use_boundary: true
+  use_boundary: false
   boundary_weight_max: 0.20
   boundary_ramp_epochs: ${trainer.max_epochs}
-  lambda_pseudo: 0.20
+  lambda_pseudo: 0.30
   pseudo_threshold_momentum: 0.999
   pseudo_warmup_epochs: 5
   foreground_weight: 10.0
   tracked_labels: ["class_1"]
   postprocess_keep_largest_component: true
+  tta_use_mirroring: true
+  tta_tile_step_size: 0.5
   pretrained_ckpt: null
 
 # =============================================================================

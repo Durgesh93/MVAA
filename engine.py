@@ -3,10 +3,12 @@ Training / prediction / submission engine for SSL nnU-Net experiments.
 
 Usage:
     python engine.py train ct       # runs stage 1 (pretrain) THEN stage 2, chained
-    python engine.py train tee      # no pretrain config yet -- stage 2 only
-    python engine.py train video    # no pretrain config yet -- stage 2 only
+    python engine.py train tee      # runs stage 1 (pretrain) THEN stage 2, chained
+    python engine.py train video    # runs stage 1 (pretrain) THEN stage 2, chained
 
     python engine.py pretrain ct    # stage 1 only, if you want it standalone
+    python engine.py pretrain tee
+    python engine.py pretrain video
 
     python engine.py retrain video
     python engine.py retrain tee
@@ -43,8 +45,8 @@ Usage:
     zips from a previous train/predict run sitting alongside freshly
     written ones.
 
-    For any experiment with a stage-1 config (currently only ct, see
-    CONFIG_MAP_PRETRAIN), `train` always runs stage 1 (masked-volume
+    For any experiment with a stage-1 config (all three -- ct, tee, video,
+    see CONFIG_MAP_PRETRAIN), `train` always runs stage 1 (masked-volume
     reconstruction on TrL+TrU pooled, no labels) fresh first, under its
     own experiment_name (ssl_pretrain_stage1) so its checkpoints/ never
     collide with stage 2's -- then resolves stage 1's best checkpoint
@@ -104,7 +106,7 @@ NIFTI_SUBMISSION_SUFFIX = "-pred.nii.gz"
 
 
 CONFIG_MAP = {"ct": "experiment_CT", "tee": "experiment_TEE", "video": "experiment_video"}
-CONFIG_MAP_PRETRAIN = {"ct": "pretrain_CT"}
+CONFIG_MAP_PRETRAIN = {"ct": "pretrain_CT", "tee": "pretrain_TEE", "video": "pretrain_video"}
 
 
 def _swa_checkpoint_path(cfg):
@@ -296,7 +298,7 @@ def _run_pretraining(config_name):
 
 def _run_training(config_name, pretrain_config_name=None):
     """
-    pretrain_config_name: when set (only "ct" has one so far, via
+    pretrain_config_name: when set (all three experiments have one, via
     CONFIG_MAP_PRETRAIN), stage 1 runs first in this same process, then
     its resolved best checkpoint is wired into stage 2 as a hydra
     override -- one `train` call does both stages, no manual copying of
@@ -497,7 +499,7 @@ def clear_results(cfg, clear_checkpoints=True):
 
 
 @app.command()
-def pretrain(experiment: str = typer.Argument(..., help="Which experiment to pretrain (stage 1): ct.")):
+def pretrain(experiment: str = typer.Argument(..., help="Which experiment to pretrain (stage 1): ct, tee, or video.")):
     """
     Stage-1 masked-volume reconstruction on TrL+TrU pooled together (no
     labels used). Writes checkpoints under its own experiment_name
@@ -522,12 +524,11 @@ def pretrain(experiment: str = typer.Argument(..., help="Which experiment to pre
 @app.command()
 def train(experiment: str = typer.Argument(..., help="Which experiment to train: ct, tee, or video.")):
     """
-    For experiments with a stage-1 pretrain config (currently only ct,
-    via CONFIG_MAP_PRETRAIN), this runs BOTH stages in one call: stage 1
+    All three experiments have a stage-1 pretrain config (via
+    CONFIG_MAP_PRETRAIN), so this runs BOTH stages in one call: stage 1
     (masked-volume reconstruction) always runs first, fresh, then its
     resolved best checkpoint is automatically wired into stage 2 -- no
-    separate `pretrain` call or manual yaml edit needed. tee/video have
-    no pretrain config yet, so they train exactly as before.
+    separate `pretrain` call or manual yaml edit needed.
     """
 
     try:
