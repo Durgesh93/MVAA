@@ -4,7 +4,7 @@
 
 seed: 12345
 
-experiment_name: ssl
+experiment_name: ssl_small_patch_size
 
 # =============================================================================
 # Runtime / cluster-controlled values
@@ -85,6 +85,8 @@ litmodule:
   foreground_weight: 10.0
   tracked_labels: ["class_1"]
   postprocess_keep_largest_component: true
+  tta_use_mirroring: true
+  tta_tile_step_size: 0.5
   patch_size_override: ${patch_size_override}
 
 # =============================================================================

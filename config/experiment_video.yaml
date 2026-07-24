@@ -4,7 +4,7 @@
 
 seed: 12345
 
-experiment_name: ssl
+experiment_name: ssl_small_patch_size
 
 # =============================================================================
 # Runtime / cluster-controlled values
@@ -81,6 +81,8 @@ litmodule:
   pseudo_warmup_epochs: 5
   tracked_labels: ["class_10"]
   postprocess_keep_largest_component: false
+  tta_use_mirroring: true
+  tta_tile_step_size: 0.5
   patch_size_override: ${patch_size_override}
 
 # =============================================================================
@@ -146,3 +148,25 @@ checkpoint_last:
   save_top_k: 1
   monitor: null
   auto_insert_metric_name: false
+
+# =============================================================================
+# Stochastic Weight Averaging
+#
+# Same rationale as experiment_CT.yaml: averages weights over the last 20%
+# of training into a flatter, less noisy minimum once the Dice-HD plateau
+# gets noisy. swa_lrs=0.002 approximates where PolyLRScheduler's decay
+# already is at epoch 240/300 ((1-240/300)**0.9 * 0.01 ~= 0.0024) -- same
+# initial_lr/max_epochs as CT, so the same value applies here. No
+# BatchNorm in this network (InstanceNorm only), so none of SWA's usual
+# running-stats recalibration applies. See engine.py's _run_training
+# docstring for why an extra explicit validate() + separate swa.ckpt are
+# needed -- the averaged weights only get swapped into the model at
+# on_train_end, after the last per-epoch checkpoint has already been
+# written. Not yet exercised for video (only CT so far).
+# =============================================================================
+swa:
+  _target_: lightning.pytorch.callbacks.StochasticWeightAveraging
+  swa_lrs: 0.002
+  swa_epoch_start: 0.8
+  annealing_epochs: 10
+  annealing_strategy: cos

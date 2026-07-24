@@ -71,6 +71,8 @@ class PredictionOps:
         trainer_name,
         configuration_name,
         postprocess_keep_largest_component=False,
+        use_mirroring=True,
+        tile_step_size=0.5,
     ):
         self.pm = plans_manager
         self.cm = configuration_manager
@@ -79,6 +81,8 @@ class PredictionOps:
         self.trainer_name = trainer_name
         self.configuration_name = configuration_name
         self.postprocess_keep_largest_component = postprocess_keep_largest_component
+        self.use_mirroring = use_mirroring
+        self.tile_step_size = tile_step_size
 
     def _unwrap_network(self, network):
         if hasattr(network, "module"):
@@ -87,9 +91,9 @@ class PredictionOps:
 
     def _make_predictor(self, net, device):
         predictor = nnUNetPredictor(
-            tile_step_size=0.5,
+            tile_step_size=self.tile_step_size,
             use_gaussian=True,
-            use_mirroring=True,
+            use_mirroring=self.use_mirroring,
             perform_everything_on_device=True,
             device=device,
             verbose=False,
@@ -193,6 +197,8 @@ class NNUnetSetup:
             trainer_name=trainer_name,
             configuration_name=litmodule_cfg.configuration,
             postprocess_keep_largest_component=litmodule_cfg.postprocess_keep_largest_component,
+            use_mirroring=litmodule_cfg.tta_use_mirroring,
+            tile_step_size=litmodule_cfg.tta_tile_step_size,
         )
 
     def _make_trainer_shim(self, is_ddp):
