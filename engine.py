@@ -58,6 +58,7 @@ from omegaconf import OmegaConf
 
 from lightning.pytorch.strategies import DDPStrategy
 from lightning.fabric.plugins.environments import LightningEnvironment
+from lightning.pytorch.callbacks import Callback
 
 
 from config import build_config
@@ -91,6 +92,54 @@ NIFTI_SUBMISSION_SUFFIX = "-pred.nii.gz"
 
 
 CONFIG_MAP = {"ct": "experiment_CT", "tee": "experiment_TEE", "video": "experiment_video"}
+
+
+def _swa_checkpoint_path(cfg):
+    return (
+        Path(cfg.paths.nnunet_results)
+        / cfg.dataset_id
+        / f"{cfg.plans_identifier}__{cfg.configuration}"
+        / f"fold_{cfg.fold}"
+        / "checkpoints"
+        / "swa.ckpt"
+    )
+
+
+class _SWACheckpointCallback(Callback):
+    """
+    Saves the SWA running average's current weights to a fixed swa.ckpt
+    path every epoch once the SWA phase starts, not just once at the very
+    end. StochasticWeightAveraging itself only transfers/exposes the
+    average into pl_module at on_train_end -- if the job crashes partway
+    through the SWA phase (has happened at least once this session, for
+    reasons unrelated to SWA itself), all that averaging work would
+    otherwise be lost with nothing saved to show for it.
+
+    Reads swa_callback's own running average directly (_average_model,
+    n_averaged) rather than re-implementing averaging -- both are lightning
+    private attributes, but this is a widely used pattern for exactly this
+    gap (Lightning's built-in callback has no periodic-checkpoint hook of
+    its own). Safe to read at on_train_epoch_end: _average_model is only
+    ever updated once per epoch, at on_train_epoch_start, so its value is
+    stable for the rest of that epoch.
+    """
+
+    def __init__(self, swa_callback, ckpt_path):
+        self.swa_callback = swa_callback
+        self.ckpt_path = Path(ckpt_path)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if not trainer.is_global_zero:
+            return
+
+        average_model = self.swa_callback._average_model
+        n_averaged = self.swa_callback.n_averaged
+
+        if average_model is None or n_averaged is None or int(n_averaged) == 0:
+            return
+
+        self.ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"state_dict": average_model.state_dict()}, self.ckpt_path)
 
 
 def _select_cluster_environment(trainer_cfg):
@@ -141,6 +190,11 @@ def _build_trainer(cfg, prediction=False):
         callbacks.append(instantiate(cfg.checkpoint))
         callbacks.append(instantiate(cfg.checkpoint_last))
 
+    if "swa" in cfg:
+        swa_callback = instantiate(cfg.swa)
+        callbacks.append(swa_callback)
+        callbacks.append(_SWACheckpointCallback(swa_callback, _swa_checkpoint_path(cfg)))
+
     trainer = L.Trainer(**trainer_cfg, callbacks=callbacks)
 
     return trainer
@@ -183,9 +237,37 @@ def _build_objects(config_name, prediction=False, clear=None):
 
 
 def _run_training(config_name):
+    """
+    When cfg carries an "swa" block, _SWACheckpointCallback (registered in
+    _build_trainer) already keeps checkpoints/swa.ckpt updated every epoch
+    during the SWA phase, so a mid-run crash doesn't lose that averaging
+    work. This final step is the "clean finish" case: Lightning's
+    StochasticWeightAveraging callback swaps the averaged weights into the
+    in-memory model at on_train_end (after the fit loop has already
+    finished, so no per-epoch validation/checkpoint ever saw them), so we
+    run one more explicit validation pass here to print real metrics for
+    the final average, and overwrite swa.ckpt with that exact end state.
+    """
+
     cfg, datamodule, model, trainer = _build_objects(config_name=config_name, prediction=False)
 
     trainer.fit(model=model, datamodule=datamodule)
+
+    if "swa" in cfg:
+        print()
+        print("[train] SWA: validating averaged weights (swapped in at on_train_end)")
+        print()
+
+        trainer.validate(model=model, datamodule=datamodule)
+
+        swa_ckpt_path = _swa_checkpoint_path(cfg)
+        trainer.save_checkpoint(swa_ckpt_path)
+
+        print()
+        print("[train] SWA checkpoint saved:")
+        print(f"  {swa_ckpt_path}")
+        print("  Use `predict ct --ckpt <this path>` to generate predictions from the SWA-averaged model.")
+        print()
 
 
 def _run_retraining(config_name):

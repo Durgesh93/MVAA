@@ -51,12 +51,21 @@ class SSLnnUNetLightningModule(L.LightningModule):
         self.ddp = DDPHelper()
         self.metrics = MetricsTracker(tracked_labels=self.tracked_labels, all_labels=self.all_labels)
 
-        self.network = None
+        # Built here (not in `setup()`) so the network exists before any
+        # callback's own `setup()` hook runs -- Lightning's _call_setup_hook
+        # calls callback setup() before LightningModule.setup(), and
+        # StochasticWeightAveraging.setup() takes `deepcopy(pl_module)` as
+        # its averaging base. With self.network still None at that point,
+        # the copy had zero registered parameters, so SWA's per-epoch
+        # update_parameters() (a zip() over empty parameter iterators) was
+        # silently a no-op the whole run -- swa.ckpt ended up with an empty
+        # state_dict. build_network() has no trainer/device dependency, so
+        # it's safe to construct immediately.
+        self.network = self.nnunet.build_network()
         self.loss = None
         self.pseudo_loss_fn = None
 
     def setup(self, stage=None):
-        self.network = self.nnunet.build_network()
         is_ddp = int(self.trainer.world_size) > 1
         self.loss = self.nnunet.build_loss(is_ddp=is_ddp)
         self.pseudo_loss_fn = self.nnunet.build_pseudo_loss()
