@@ -169,6 +169,30 @@ def set_nnunet_env(cfg):
     return {"nnunet_raw": nnunet_raw, "nnunet_preprocessed": nnunet_preprocessed, "nnunet_results": nnunet_results}
 
 
+def override_patch_size(configuration_manager, patch_size_override):
+    """
+    Override a ConfigurationManager's patch_size in place.
+
+    patch_size is a read-only property backed by the manager's own
+    .configuration dict (no setter) -- this mutates that dict directly so
+    every downstream reader of .patch_size (data loading's final_patch_size,
+    the rotation-margin init_ps calculation, sliding-window inference's
+    tile size) picks up the override consistently. Both SSLnnUNetDataModule
+    and NNUnetSetup build their own ConfigurationManager from the same
+    plans, so both must call this with the same value or training and
+    inference would disagree on patch size.
+
+    The new size must stay divisible by the network's per-axis cumulative
+    pooling stride (product of architecture.arch_kwargs.strides per axis)
+    or skip-connection concatenation between encoder/decoder stages will
+    crash on a shape mismatch -- this function does not validate that,
+    since it has no network reference to check against.
+    """
+
+    if patch_size_override is not None:
+        configuration_manager.configuration["patch_size"] = list(patch_size_override)
+
+
 def resolve_runtime_config(cfg, prediction=False):
     """
     Resolve runtime placeholders:

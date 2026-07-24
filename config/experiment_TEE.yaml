@@ -24,6 +24,15 @@ task_id: 'task2'
 prefix: 't2_tee'
 plans_identifier: nnUNetPlans
 
+# Overrides ConfigurationManager's planned patch_size (null = use the
+# plan's own value). Must stay divisible by the network's per-axis
+# cumulative pooling stride or skip-connection concatenation crashes on
+# a shape mismatch -- see experiment_CT.yaml, where this was actually
+# exercised, for the full rationale (CT's patch_vol >= case_vol for
+# roughly half its cases at the planned size, making oversample_fg a
+# no-op there). Not yet exercised for TEE.
+patch_size_override: null
+
 # =============================================================================
 # Paths
 # =============================================================================
@@ -48,6 +57,7 @@ datamodule:
   K: 5
   transform_geometric: true
   oversample_fg: 0.33
+  patch_size_override: ${patch_size_override}
 
 # =============================================================================
 # LightningModule config
@@ -73,6 +83,7 @@ litmodule:
   foreground_weight: 10.0
   tracked_labels: ["class_1", "class_2"]
   postprocess_keep_largest_component: true
+  patch_size_override: ${patch_size_override}
 
 # =============================================================================
 # Trainer config

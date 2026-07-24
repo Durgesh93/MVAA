@@ -24,6 +24,17 @@ task_id: 'task1'
 prefix: 't1_ct'
 plans_identifier: nnUNetPlans
 
+# Overrides ConfigurationManager's planned patch_size (default null = use
+# the plan's own value). Must stay divisible by the network's per-axis
+# cumulative pooling stride (16 on the depth axis, 32 on the other two,
+# for CT's 5-stage architecture) or skip-connection concatenation crashes
+# on a shape mismatch. [64, 96, 96] shrinks the patch to ~26% of the
+# original [112, 128, 160] volume specifically so oversample_fg has real
+# room to bias toward foreground -- at the original patch_size,
+# patch_vol >= case_vol for roughly half the CT cases, making
+# oversample_fg a no-op regardless of its value (see ct_memory.md).
+patch_size_override: [64, 96, 96]
+
 # =============================================================================
 # Paths
 # =============================================================================
@@ -45,9 +56,10 @@ datamodule:
   seed: ${seed}
   plans_identifier: ${plans_identifier}
   prefix: ${prefix}
-  K: 5
+  K: 10
   transform_geometric: true
-  oversample_fg: 0.33
+  oversample_fg: 0.50
+  patch_size_override: ${patch_size_override}
 
 # =============================================================================
 # LightningModule config
@@ -73,6 +85,7 @@ litmodule:
   foreground_weight: 10.0
   tracked_labels: ["class_1"]
   postprocess_keep_largest_component: true
+  patch_size_override: ${patch_size_override}
 
 # =============================================================================
 # Trainer config
@@ -135,3 +148,26 @@ checkpoint_last:
   save_top_k: 1
   monitor: null
   auto_insert_metric_name: false
+
+# =============================================================================
+# Stochastic Weight Averaging
+#
+# Targets the noisy/oscillating Dice-HD plateau observed in training_
+# progress.png (bounces within a band rather than smoothly settling)
+# rather than trying to escape it -- averages weights over the last 20%
+# of training into a flatter, less noisy minimum. swa_lrs=0.002
+# approximates where PolyLRScheduler's decay already is at epoch 240/300
+# ((1-240/300)**0.9 * 0.01 ~= 0.0024), so entering the SWA phase doesn't
+# jolt the LR back up. No BatchNorm in this network (InstanceNorm3d
+# only, verified directly), so none of SWA's usual running-stats
+# recalibration applies. See engine.py's _run_training docstring for why
+# an extra explicit validate() + separate swa.ckpt are needed -- the
+# averaged weights only get swapped into the model at on_train_end,
+# after the last per-epoch checkpoint has already been written.
+# =============================================================================
+swa:
+  _target_: lightning.pytorch.callbacks.StochasticWeightAveraging
+  swa_lrs: 0.002
+  swa_epoch_start: 0.8
+  annealing_epochs: 10
+  annealing_strategy: cos

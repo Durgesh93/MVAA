@@ -43,7 +43,7 @@ from nnunetv2.utilities.crossval_split import generate_crossval_split
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 from nnunetv2.utilities.dataset_name_id_conversion import maybe_convert_to_dataset_name
 
-from utils import split_by_rank
+from utils import split_by_rank, override_patch_size
 
 from .raw_case_dataset import nnUNetRawCaseDataset, nnunet_raw_case_collate
 from .multiview_loader import MultiViewUnlabeledDataLoader
@@ -88,6 +88,8 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
         self.pm = PlansManager(self.plans)
         self.cm = self.pm.get_configuration(self.configuration)
         self.lm = self.pm.get_label_manager(self.dataset_json)
+
+        override_patch_size(self.cm, self.cfg.patch_size_override)
 
         self.folder = join(self.base, self.cm.data_identifier)
 

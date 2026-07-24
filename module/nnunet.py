@@ -47,6 +47,7 @@ from utils import (
     write_prediction_case_zip as _write_prediction_case_zip,
     write_submission_prediction as _write_submission_prediction,
     keep_largest_component as _keep_largest_component,
+    override_patch_size as _override_patch_size,
 )
 
 
@@ -88,7 +89,7 @@ class PredictionOps:
         predictor = nnUNetPredictor(
             tile_step_size=0.5,
             use_gaussian=True,
-            use_mirroring=False,
+            use_mirroring=True,
             perform_everything_on_device=True,
             device=device,
             verbose=False,
@@ -179,6 +180,8 @@ class NNUnetSetup:
         self.pm = PlansManager(self.plans)
         self.cm = self.pm.get_configuration(litmodule_cfg.configuration)
         self.lm = self.pm.get_label_manager(self.dataset_json)
+
+        _override_patch_size(self.cm, litmodule_cfg.patch_size_override)
 
         self.num_input_channels = determine_num_input_channels(self.pm, self.cm, self.dataset_json)
 
