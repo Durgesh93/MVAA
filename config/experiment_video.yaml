@@ -26,11 +26,23 @@ plans_identifier: nnUNetPlans
 
 # Overrides ConfigurationManager's planned patch_size (null = use the
 # plan's own value). Must stay divisible by the network's per-axis
-# cumulative pooling stride or skip-connection concatenation crashes on
-# a shape mismatch -- see experiment_CT.yaml, where this was actually
-# exercised, for the full rationale. Not yet exercised for video (2d
-# configuration, so patch_size here is [H, W] not [D, H, W]).
-patch_size_override: null
+# cumulative pooling stride (128 on both H and W -- 8-stage 2d
+# architecture, first stage stride [1,1], remaining 7 stages stride 2)
+# or skip-connection concatenation crashes on a shape mismatch.
+#
+# Worse than CT here: every one of the 117 real TrL cases has the same
+# fixed frame size [720, 1280] (H, W), and the planned patch [768, 1280]
+# already meets or exceeds that on both axes (768>720, 1280==1280) --
+# patch_vol >= case_vol for 117/117 cases, not just "roughly half" like
+# CT. oversample_fg is a complete no-op regardless of class (class_10 is
+# present in all 117 cases, median ~9.1% of frame area, but that's
+# irrelevant when there's zero crop freedom to begin with).
+# [640, 1152] (both still multiples of 128) gives real freedom on both
+# axes (~80% of frame area) without cutting too aggressively -- the
+# equipment class can span up to ~95% of a frame (mean 23.5%), so a
+# CT-style hard shrink would just force constant clipping through large
+# equipment instances regardless of crop placement.
+patch_size_override: [640, 1152]
 
 # =============================================================================
 # Paths
