@@ -26,12 +26,22 @@ plans_identifier: nnUNetPlans
 
 # Overrides ConfigurationManager's planned patch_size (null = use the
 # plan's own value). Must stay divisible by the network's per-axis
-# cumulative pooling stride or skip-connection concatenation crashes on
-# a shape mismatch -- see experiment_CT.yaml, where this was actually
-# exercised, for the full rationale (CT's patch_vol >= case_vol for
-# roughly half its cases at the planned size, making oversample_fg a
-# no-op there). Not yet exercised for TEE.
-patch_size_override: null
+# cumulative pooling stride (16 on the depth axis, 32 on the other two,
+# same 6-stage architecture as CT) or skip-connection concatenation
+# crashes on a shape mismatch.
+#
+# Unlike CT, TEE does not have the "oversample_fg is a no-op" problem:
+# measured against all 105 real TrL cases' shapes_after_crop, the
+# planned [112, 128, 128] patch already sits at 12.7%/22.6%/45.2%
+# (min/median/max) of case volume -- comparable to what CT deliberately
+# shrank down to, not the >=100% CT saw for half its cases. The one
+# real issue is axis 1: 15/105 cases have case-dim <=128 there, so they
+# get zero crop freedom (padding-only) at the planned size. Shrinking
+# just that axis to 96 (still a multiple of 32) removes the tightness
+# for every case while keeping volume at 75% of the original -- not
+# copying CT's [64, 96, 96], which would overshoot and cut context TEE
+# doesn't need to give up.
+patch_size_override: [112, 96, 128]
 
 # =============================================================================
 # Paths
