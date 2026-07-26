@@ -74,6 +74,7 @@ litmodule:
   postprocess_keep_largest_component: false
   tta_use_mirroring: true
   tta_tile_step_size: 0.5
+  pretrained_ckpt: null
 
 # =============================================================================
 # Trainer config

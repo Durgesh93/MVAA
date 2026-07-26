@@ -103,7 +103,12 @@ class PretrainDataModule(TransformBuilderMixin, L.LightningDataModule):
         reserved_cpus = max(world_size, math.ceil(0.20 * cpu_count))
         usable_cpus = max(1, cpu_count - reserved_cpus)
 
-        workers_per_augmenter = max(4, usable_cpus // world_size)
+        # At least 1 worker -- a hardcoded floor of 4 here would
+        # oversubscribe CPUs whenever usable_cpus // world_size comes out
+        # below that (e.g. 2 visible CPUs/rank on a 6-GPU job), which is
+        # exactly what caused the severe slowdowns/timeouts seen in
+        # practice.
+        workers_per_augmenter = max(1, usable_cpus // world_size)
         workers_per_augmenter = min(workers_per_augmenter, 8)
 
         num_cached = max(8, min(16, workers_per_augmenter * 2))
