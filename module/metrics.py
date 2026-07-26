@@ -14,13 +14,15 @@ device placement handle this (rather than a manual .to(device) call
 before every update) is the same "boring", idiomatic way any other
 torchmetrics-based Metric is wired into a LightningModule.
 
-epoch_metrics is deliberately a plain dict of CatMetric, not a
-MetricCollection: it has no DDP collective (sync_on_compute=False,
-rank-0-only plotting), and a plain dict isn't itself an nn.Module, so
-it's invisible to the auto-registration/.to(device) cascade above --
-it isn't forced onto the model's device the way step_metrics is (it
-follows whatever device update_epoch_metrics happens to hand it, same
-as any other unregistered CatMetric). compute_epoch_history() always
+epoch_metrics is an nn.ModuleDict of CatMetric, not a MetricCollection:
+it has no DDP collective (sync_on_compute=False, rank-0-only plotting),
+so it doesn't need MetricCollection's cross-metric batching -- but it
+still needs to be a registered nn.Module (ModuleDict, not a plain dict)
+so its accumulated per-epoch history is included in this LightningModule's
+state_dict and survives `retrain`'s trainer.fit(ckpt_path=...) resume. A
+plain dict here would silently lose the whole training_progress.png curve
+on every retrain, since Lightning's checkpoint save/restore only walks
+registered submodules/parameters/buffers. compute_epoch_history() always
 .cpu()s the result before handing it to matplotlib either way.
 
 Printing, self.log-ing, and writing the progress plot to disk are
@@ -95,9 +97,9 @@ class MetricsTracker(nn.Module):
         # every epoch's entry (NaN included), so arrays stay aligned and the
         # plotting code's existing `~np.isnan(values)` masking handles the
         # gaps correctly instead of crashing.
-        self.epoch_metrics = {
-            key: CatMetric(sync_on_compute=False, nan_strategy="disable") for key in self.epoch_metric_keys
-        }
+        self.epoch_metrics = nn.ModuleDict(
+            {key: CatMetric(sync_on_compute=False, nan_strategy="disable") for key in self.epoch_metric_keys}
+        )
 
     def compute_step_metrics(self):
         return self.step_metrics.compute()

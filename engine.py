@@ -43,6 +43,7 @@ Usage:
 """
 
 import json
+import multiprocessing
 import re
 import shutil
 from pathlib import Path
@@ -71,13 +72,26 @@ from utils import (
     resolve_prediction_ckpt,
 )
 
-# The augmenter's background workers are forked, not spawned. If this process
-# ever runs a parallelized CPU op (e.g. torch.load-ing a checkpoint on
-# retrain) before that fork, PyTorch's native intra-op thread pool gets
-# initialized here first -- the fork then hands each worker a thread-pool
-# descriptor pointing at threads that don't exist post-fork, and the
-# worker's first CPU conv/op deadlocks forever waiting on them. Pinning this
-# process to 1 thread means there's no pool to poison in the first place.
+# The augmenter's background workers are launched with 'spawn', not the
+# platform default 'fork'. On this cluster, Lightning/the trainer already
+# initializes a CUDA context in this process before the augmenter's worker
+# pool starts (moving the model to the GPU happens ahead of the first
+# train_dataloader() call) -- a fork() after that point marks every child as
+# a "bad fork" in PyTorch's CUDA runtime, so the FIRST time a forked worker
+# ever touches any torch.cuda API (observed happening right at the
+# train-to-validation boundary, not during training itself) it dies with
+# "Cannot re-initialize CUDA in forked subprocess". spawn gives each worker
+# a fresh interpreter with no inherited CUDA/fork state, so it's never
+# poisoned regardless of when it starts relative to the parent's CUDA init.
+# Must be set before any multiprocessing.Process is created anywhere
+# (including inside batchgenerators), so this runs at import time.
+multiprocessing.set_start_method("spawn", force=True)
+
+# Also still pin this process to 1 thread: even with spawn, a parallelized
+# CPU op in this process before torch.load-ing a checkpoint on retrain could
+# otherwise contend with the augmentation workers for the same handful of
+# CPUs (see the min-worker-count fix in datamodule/data_module.py) -- keeping
+# this process single-threaded leaves more of a starved CPU budget for them.
 torch.set_num_threads(1)
 
 app = typer.Typer()
