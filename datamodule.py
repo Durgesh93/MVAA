@@ -340,8 +340,12 @@ class SSLnnUNetDataModule(L.LightningDataModule):
 
         workers_per_augmenter = usable_cpus // total_augmenters
 
-        # Minimum 4 workers per augmenter.
-        workers_per_augmenter = max(4, workers_per_augmenter)
+        # At least 1 worker per augmenter -- a hardcoded floor of 4 here
+        # would oversubscribe CPUs whenever usable_cpus // total_augmenters
+        # comes out below that (e.g. 2 visible CPUs/rank on a 6-GPU job),
+        # which is exactly what caused the severe slowdowns/timeouts seen
+        # in practice.
+        workers_per_augmenter = max(1, workers_per_augmenter)
 
         # Safety cap.
         workers_per_augmenter = min(workers_per_augmenter, 8)
