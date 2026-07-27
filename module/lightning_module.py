@@ -1,10 +1,9 @@
+import os
 from pathlib import Path
 from typing import Any, Dict
 
 import torch
 import lightning as L
-
-from nnunetv2.paths import nnUNet_results
 
 from .metrics import MetricsTracker
 from .ddp import DDPHelper
@@ -38,8 +37,21 @@ class SSLnnUNetLightningModule(L.LightningModule):
             ((label_id, name) for name, label_id in self.dataset_json["labels"].items()), key=lambda item: item[0]
         )
 
+        # Read from os.environ at construction time, not imported from
+        # nnunetv2.paths at module level -- that constant is only bound
+        # once, on the first `import module` anywhere in the process.
+        # `predict all` calls _build_objects once per experiment (ct, tee,
+        # video) in the same process, each with its own
+        # set_nnunet_env(cfg) update, but a module-level import means only
+        # the FIRST experiment's nnUNet_results value would ever be picked
+        # up here -- silently misdirecting the 2nd/3rd experiment's
+        # training_progress.png/validation/prediction/submission into the
+        # 1st experiment's folder even though checkpoints (sourced from
+        # the Hydra cfg directly) land in the right place.
         self.actual_validation_output_base = (
-            Path(nnUNet_results) / self.dataset_name / (self.cfg.plans_identifier + "__" + self.cfg.configuration)
+            Path(os.environ["nnUNet_results"])
+            / self.dataset_name
+            / (self.cfg.plans_identifier + "__" + self.cfg.configuration)
         )
 
         self.fold_output_folder = self.actual_validation_output_base / f"fold_{self.cfg.fold}"
