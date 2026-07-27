@@ -23,6 +23,7 @@ only decoder.seg_layers.* (shape differs: num_input_channels here vs.
 num_segmentation_heads there).
 """
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +33,7 @@ import lightning as L
 
 from batchgenerators.utilities.file_and_folder_operations import join, load_json
 
-from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
+from nnunetv2.paths import nnUNet_preprocessed
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.utilities.dataset_name_id_conversion import maybe_convert_to_dataset_name
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
@@ -60,8 +61,13 @@ class PretrainLightningModule(L.LightningModule):
         self.cm = self.pm.get_configuration(self.cfg.configuration)
         self.num_input_channels = determine_num_input_channels(self.pm, self.cm, dataset_json)
 
+        # Read from os.environ at construction time, not imported from
+        # nnunetv2.paths at module level -- see the matching comment in
+        # lightning_module.py for why the module-level import goes stale
+        # once both LightningModule classes have been imported in the same
+        # process.
         self.fold_output_folder = (
-            Path(nnUNet_results)
+            Path(os.environ["nnUNet_results"])
             / self.dataset_name
             / (self.cfg.plans_identifier + "__" + self.cfg.configuration)
             / f"fold_{self.cfg.fold}"

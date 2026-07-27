@@ -1,10 +1,9 @@
+import os
 from pathlib import Path
 from typing import Any, Dict
 
 import torch
 import lightning as L
-
-from nnunetv2.paths import nnUNet_results
 
 from .metrics import MetricsTracker
 from .ddp import DDPHelper
@@ -38,8 +37,21 @@ class SSLnnUNetLightningModule(L.LightningModule):
             ((label_id, name) for name, label_id in self.dataset_json["labels"].items()), key=lambda item: item[0]
         )
 
+        # Read from os.environ at construction time, not imported from
+        # nnunetv2.paths at module level -- that constant is only bound
+        # once, on the first `import module` anywhere in the process. The
+        # chained `train` command imports the whole `module` package during
+        # stage 1 (while nnUNet_results still points at
+        # ssl_pretrain_stage1's path), and Python's module cache means this
+        # class's copy would never pick up stage 2's later
+        # set_nnunet_env(cfg) update -- silently misdirecting
+        # training_progress.png/validation/prediction/submission into
+        # stage 1's folder even though checkpoints (sourced from the
+        # Hydra cfg directly) land in the right place.
         self.actual_validation_output_base = (
-            Path(nnUNet_results) / self.dataset_name / (self.cfg.plans_identifier + "__" + self.cfg.configuration)
+            Path(os.environ["nnUNet_results"])
+            / self.dataset_name
+            / (self.cfg.plans_identifier + "__" + self.cfg.configuration)
         )
 
         self.fold_output_folder = self.actual_validation_output_base / f"fold_{self.cfg.fold}"
