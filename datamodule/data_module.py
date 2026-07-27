@@ -126,6 +126,13 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
 
         self.limit_train_batches = None
 
+        # Tracks every augmenter _make_augmenter() has handed out, so
+        # teardown() can close them deterministically instead of relying on
+        # __del__/GC -- see NonDetMultiThreadedAugmenter._finish()'s
+        # docstring for why an ungraceful shutdown races the watcher thread
+        # against the daemon worker processes dying on their own.
+        self._augmenters = []
+
     # ------------------------------------------------------------------
     # nnU-Net helpers
     # ------------------------------------------------------------------
@@ -223,17 +230,20 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
             raise RuntimeError("self.num_processes is None. setup() must run before train_dataloader().")
 
         if self.num_processes <= 0:
-            return SingleThreadedAugmenter(loader, None)
+            augmenter = SingleThreadedAugmenter(loader, None)
+        else:
+            augmenter = NonDetMultiThreadedAugmenter(
+                loader,
+                None,
+                num_processes=self.num_processes,
+                num_cached=self.num_cached,
+                seeds=None,
+                pin_memory=self.pin_memory,
+                wait_time=0.002,
+            )
 
-        return NonDetMultiThreadedAugmenter(
-            loader,
-            None,
-            num_processes=self.num_processes,
-            num_cached=self.num_cached,
-            seeds=None,
-            pin_memory=self.pin_memory,
-            wait_time=0.002,
-        )
+        self._augmenters.append(augmenter)
+        return augmenter
 
     # ------------------------------------------------------------------
     # Lightning hooks
@@ -242,6 +252,19 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
     def prepare_data(self):
         cls = infer_dataset_class(self.folder)
         cls.unpack_dataset(self.folder, overwrite_existing=False, num_processes=1, verify=True)
+
+    def teardown(self, stage=None):
+        # Close background augmenter workers deterministically here, before
+        # the process exits -- otherwise their shutdown races the daemon
+        # worker processes dying on their own vs. __del__/GC eventually
+        # calling _finish(), which is what produces the "background workers
+        # are no longer alive" RuntimeError from the results_loop watcher
+        # thread at interpreter shutdown.
+        for augmenter in self._augmenters:
+            finish = getattr(augmenter, "_finish", None)
+            if finish is not None:
+                finish()
+        self._augmenters = []
 
     def setup(self, stage=None):
         """
