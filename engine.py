@@ -123,6 +123,10 @@ CONFIG_MAP = {"ct": "experiment_CT", "tee": "experiment_TEE", "video": "experime
 CONFIG_MAP_PRETRAIN = {"ct": "pretrain_CT", "tee": "pretrain_TEE", "video": "pretrain_video"}
 
 
+def _is_rank_zero():
+    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+
+
 def _swa_checkpoint_path(cfg):
     return (
         Path(cfg.paths.nnunet_results)
@@ -322,11 +326,12 @@ def _run_training(config_name, pretrain_config_name=None):
     extra_overrides = []
 
     if pretrain_config_name is not None:
-        print()
-        print("=" * 80)
-        print("[train] Stage 1: pretraining")
-        print("=" * 80)
-        print()
+        if _is_rank_zero():
+            print()
+            print("=" * 80)
+            print("[train] Stage 1: pretraining")
+            print("=" * 80)
+            print()
 
         _run_pretraining(config_name=pretrain_config_name)
 
@@ -340,14 +345,15 @@ def _run_training(config_name, pretrain_config_name=None):
                 f"Stage 1 (pretraining) finished but no best checkpoint was found at: {best_ckpt}"
             )
 
-        print()
-        print("[train] Stage 1 complete. Best checkpoint:")
-        print(f"  {best_ckpt}")
-        print()
-        print("=" * 80)
-        print("[train] Stage 2: segmentation training (pretrained init)")
-        print("=" * 80)
-        print()
+        if _is_rank_zero():
+            print()
+            print("[train] Stage 1 complete. Best checkpoint:")
+            print(f"  {best_ckpt}")
+            print()
+            print("=" * 80)
+            print("[train] Stage 2: segmentation training (pretrained init)")
+            print("=" * 80)
+            print()
 
         extra_overrides = [f"litmodule.pretrained_ckpt={best_ckpt}"]
 
@@ -356,30 +362,6 @@ def _run_training(config_name, pretrain_config_name=None):
     )
 
     trainer.fit(model=model, datamodule=datamodule)
-
-    if "swa" in cfg:
-        # _SWACheckpointCallback (registered in _build_trainer) already keeps
-        # checkpoints/swa.ckpt updated every epoch during the SWA phase, so a
-        # mid-run crash doesn't lose that averaging work. This is the "clean
-        # finish" case: StochasticWeightAveraging swaps the averaged weights
-        # into the in-memory model at on_train_end (after the fit loop has
-        # already finished, so no per-epoch validation/checkpoint ever saw
-        # them), so we run one more explicit validation pass here to print
-        # real metrics for the final average, and overwrite swa.ckpt with
-        # that exact end state.
-        print()
-        print("[train] SWA: validating averaged weights (swapped in at on_train_end)")
-        print()
-
-        trainer.validate(model=model, datamodule=datamodule)
-
-        swa_ckpt_path = _swa_checkpoint_path(cfg)
-        trainer.save_checkpoint(swa_ckpt_path)
-
-        print()
-        print("[train] SWA checkpoint saved:")
-        print(f"  {swa_ckpt_path}")
-        print("  Use `predict ct --ckpt <this path>` to generate predictions from the SWA-averaged model.")
 
 
 def _run_retraining(config_name):
@@ -394,11 +376,12 @@ def _run_retraining(config_name):
             "'train' run -- use 'train' for a fresh run instead."
         )
 
-    print()
-    print("[retrain] Resuming from checkpoint:")
-    print(f"  {resolved_ckpt}")
-    print(f"  target num_epochs (from current yaml): {trainer.max_epochs}")
-    print()
+    if _is_rank_zero():
+        print()
+        print("[retrain] Resuming from checkpoint:")
+        print(f"  {resolved_ckpt}")
+        print(f"  target num_epochs (from current yaml): {trainer.max_epochs}")
+        print()
 
     trainer.fit(model=model, datamodule=datamodule, ckpt_path=resolved_ckpt)
 
@@ -408,11 +391,12 @@ def _run_prediction(config_name, ckpt=CKPT):
 
     resolved_ckpt = resolve_prediction_ckpt(cfg=cfg, ckpt=ckpt)
 
-    print()
-    print("[predict] Using checkpoint:")
-    print(f"  requested: {ckpt}")
-    print(f"  resolved : {resolved_ckpt}")
-    print()
+    if _is_rank_zero():
+        print()
+        print("[predict] Using checkpoint:")
+        print(f"  requested: {ckpt}")
+        print(f"  resolved : {resolved_ckpt}")
+        print()
 
     trainer.test(model=model, datamodule=datamodule, ckpt_path=resolved_ckpt)
 
@@ -429,20 +413,22 @@ def _run_prediction_all(ckpt=CKPT):
             "ct, tee, and video."
         )
 
-    print()
-    print("Predicting all experiments")
-    print(f"Experiments: {', '.join(CONFIG_MAP.keys())}")
-    print(f"Fold: {FOLD_NUM}")
-    print(f"Checkpoint: {ckpt}")
-    print()
+    if _is_rank_zero():
+        print()
+        print("Predicting all experiments")
+        print(f"Experiments: {', '.join(CONFIG_MAP.keys())}")
+        print(f"Fold: {FOLD_NUM}")
+        print(f"Checkpoint: {ckpt}")
+        print()
 
     for experiment, config_name in CONFIG_MAP.items():
-        print()
-        print("=" * 80)
-        print(f"[predict all] Experiment: {experiment}")
-        print(f"[predict all] Config: {config_name}")
-        print("=" * 80)
-        print()
+        if _is_rank_zero():
+            print()
+            print("=" * 80)
+            print(f"[predict all] Experiment: {experiment}")
+            print(f"[predict all] Config: {config_name}")
+            print("=" * 80)
+            print()
 
         _run_prediction(config_name=config_name, ckpt=ckpt)
 
@@ -476,7 +462,7 @@ def clear_results(cfg, clear_checkpoints=True):
     that would redundantly repeat it even exists.
     """
 
-    is_rank_zero = not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+    is_rank_zero = _is_rank_zero()
 
     fold_output_folder = (
         Path(cfg.paths.nnunet_results)
@@ -526,11 +512,12 @@ def pretrain(experiment: str = typer.Argument(..., help="Which experiment to pre
     except ValueError as e:
         raise typer.BadParameter(str(e))
 
-    print()
-    print(f"Pretraining (stage 1) experiment: {experiment}")
-    print(f"Config: {config_name}")
-    print(f"Fold: {FOLD_NUM}")
-    print()
+    if _is_rank_zero():
+        print()
+        print(f"Pretraining (stage 1) experiment: {experiment}")
+        print(f"Config: {config_name}")
+        print(f"Fold: {FOLD_NUM}")
+        print()
 
     _run_pretraining(config_name=config_name)
 
@@ -552,13 +539,14 @@ def train(experiment: str = typer.Argument(..., help="Which experiment to train:
 
     pretrain_config_name = CONFIG_MAP_PRETRAIN.get(experiment)
 
-    print()
-    print(f"Training experiment: {experiment}")
-    print(f"Config: {config_name}")
-    if pretrain_config_name:
-        print(f"Stage-1 pretrain config: {pretrain_config_name} (runs first, auto-chained)")
-    print(f"Fold: {FOLD_NUM}")
-    print()
+    if _is_rank_zero():
+        print()
+        print(f"Training experiment: {experiment}")
+        print(f"Config: {config_name}")
+        if pretrain_config_name:
+            print(f"Stage-1 pretrain config: {pretrain_config_name} (runs first, auto-chained)")
+        print(f"Fold: {FOLD_NUM}")
+        print()
 
     _run_training(config_name=config_name, pretrain_config_name=pretrain_config_name)
 
@@ -579,11 +567,12 @@ def retrain(experiment: str = typer.Argument(..., help="Which experiment to resu
     except ValueError as e:
         raise typer.BadParameter(str(e))
 
-    print()
-    print(f"Resuming training for experiment: {experiment}")
-    print(f"Config: {config_name}")
-    print(f"Fold: {FOLD_NUM}")
-    print()
+    if _is_rank_zero():
+        print()
+        print(f"Resuming training for experiment: {experiment}")
+        print(f"Config: {config_name}")
+        print(f"Fold: {FOLD_NUM}")
+        print()
 
     _run_retraining(config_name=config_name)
 
@@ -605,12 +594,13 @@ def predict(
     except ValueError as e:
         raise typer.BadParameter(str(e))
 
-    print()
-    print(f"Predicting experiment: {experiment}")
-    print(f"Config: {config_name}")
-    print(f"Fold: {FOLD_NUM}")
-    print(f"Checkpoint: {ckpt}")
-    print()
+    if _is_rank_zero():
+        print()
+        print(f"Predicting experiment: {experiment}")
+        print(f"Config: {config_name}")
+        print(f"Fold: {FOLD_NUM}")
+        print(f"Checkpoint: {ckpt}")
+        print()
 
     _run_prediction(config_name=config_name, ckpt=ckpt)
 
@@ -654,11 +644,12 @@ def submit():
 
         all_items.append(item)
 
-    print()
-    print("Creating one submission zip for all experiments")
-    print(f"Fold: {FOLD_NUM}")
-    print(f"Experiment name: {resolved_experiment_name}")
-    print()
+    if _is_rank_zero():
+        print()
+        print("Creating one submission zip for all experiments")
+        print(f"Fold: {FOLD_NUM}")
+        print(f"Experiment name: {resolved_experiment_name}")
+        print()
 
     output_zip = Path(__file__).resolve().parent / f"submission_{resolved_experiment_name}.zip"
 
@@ -707,17 +698,18 @@ def submit():
                 json.dumps({"cases": sorted(cases, key=lambda x: x["case_id"])}, indent=2),
             )
 
-    print()
-    print("[submission] Created single submission zip:")
-    print(f"  {output_zip}")
-    print()
-
-    for item in all_items:
-        print(f"[submission] {item['experiment']}")
-        print(f"  folder inside zip: {item['prefix']}/")
-        print(f"  json: {item['json_name']}")
-        print(f"  prediction files: {len(item['prediction_files'])}")
+    if _is_rank_zero():
         print()
+        print("[submission] Created single submission zip:")
+        print(f"  {output_zip}")
+        print()
+
+        for item in all_items:
+            print(f"[submission] {item['experiment']}")
+            print(f"  folder inside zip: {item['prefix']}/")
+            print(f"  json: {item['json_name']}")
+            print(f"  prediction files: {len(item['prediction_files'])}")
+            print()
 
 
 if __name__ == "__main__":
