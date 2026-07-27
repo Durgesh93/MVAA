@@ -102,7 +102,7 @@ litmodule:
 # =============================================================================
 
 trainer:
-  max_epochs: 1
+  max_epochs: 300
   strategy: ${training_strategy}
   precision: 16-mixed
   log_every_n_steps: 1
@@ -128,8 +128,6 @@ progress_bar:
 # =============================================================================
 # Checkpointer config
 # =============================================================================
-
-
 checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
   dirpath: ${paths.nnunet_results}/${dataset_id}/${plans_identifier}__${configuration}/fold_${fold}/checkpoints
