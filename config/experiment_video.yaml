@@ -81,7 +81,7 @@ litmodule:
 # =============================================================================
 
 trainer:
-  max_epochs: 300
+  max_epochs: 1
   strategy: ${training_strategy}
   precision: 16-mixed
   log_every_n_steps: 1

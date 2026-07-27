@@ -198,7 +198,8 @@ class MetricsTracker(nn.Module):
             self.step_metrics[key].update(value)
 
     def update_epoch_metrics(self, synced_metrics, current_epoch):
-        self.epoch_metrics["epoch"].update(torch.tensor([current_epoch], dtype=torch.float32))
+        epoch_tensor = torch.tensor([current_epoch], dtype=torch.float32, device=self.epoch_metrics["epoch"].device)
+        self.epoch_metrics["epoch"].update(epoch_tensor)
         for key in self.tracked_metric_keys:
             value = synced_metrics[key]
             self.epoch_metrics[key].update(value)
