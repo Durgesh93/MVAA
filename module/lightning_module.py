@@ -217,7 +217,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
         if self.trainer.is_global_zero and save_training_progress:
             write_training_progress_plot(
                 history=self.metrics.compute_epoch_history(),
-                progress_png_file=self.actual_validation_output_base / "training_progress.png",
+                progress_png_file=self.progress_png_file,
                 dataset_name=self.dataset_name,
                 fold=self.cfg.fold,
                 dice_classwise_keys=self.metrics.dice_keys,
