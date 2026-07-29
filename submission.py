@@ -800,7 +800,10 @@ REFERENCE_DATA_DIR = NNUNET_DATA_DIR / "MVAA_nnUNET" / "reference_data"
 SAMPLE_VAL_CASES = 3
 
 
-def _stage_sample_volumes(task_dir: str, prefix: str, strip_suffix: str = "") -> None:
+def _stage_sample_volumes(task_dir: str, prefix: str) -> None:
+    # Copied under their own original filename -- discover_cases (see
+    # workspace/datamodule/inference_dataset.py) accepts any *.nii.gz name,
+    # no renaming needed.
     src_dir = REFERENCE_DATA_DIR / task_dir / "val" / "images"
     cases = sorted(src_dir.glob("*.nii.gz"))[:SAMPLE_VAL_CASES]
     if not cases:
@@ -809,8 +812,7 @@ def _stage_sample_volumes(task_dir: str, prefix: str, strip_suffix: str = "") ->
     dest_dir = INFERENCE_DIR / "input" / prefix
     dest_dir.mkdir(parents=True, exist_ok=True)
     for case in cases:
-        stem = case.name.removesuffix(".nii.gz").removesuffix(strip_suffix)
-        dest = dest_dir / f"{stem}_0000.nii.gz"
+        dest = dest_dir / case.name
         info(f"[{prefix}] {case} -> {dest}", "🧪")
         shutil.copy2(case, dest)
 
@@ -836,7 +838,7 @@ def _stage_sample_video() -> None:
 
 def sample_input_action() -> None:
     _stage_sample_volumes("t1_ct", "t1_ct")
-    _stage_sample_volumes("t2_tee", "t2_tee", strip_suffix="-US")
+    _stage_sample_volumes("t2_tee", "t2_tee")
     _stage_sample_video()
     success(f"input/ ready with {SAMPLE_VAL_CASES} sample val cases per task", "🧪")
 

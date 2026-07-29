@@ -10,14 +10,14 @@ instead of nnUNet_raw/imagesTs, with no pre-known case-id list, no TrL/TrU
 split, no DDP rank splitting, no augmenters.
 
 CT/TEE raw reference data is plain nii.gz on disk (see
-data_task2_TEE_nnunet.py's collect_tee_files), matching nnU-Net's own
-per-channel '<case_id>_<channel:04d><file_ending>' convention directly --
-InferenceCaseDataset handles both. Video's raw reference data is PNG
-frames (see data_task3_VIDEO_nnunet.py's collect_video_files) -- the
-'_0000/_0001/_0002.nii.gz' triplet is only how *our* training pipeline
-stores it internally after conversion, so video needs its own dataset
-(VideoInferenceCaseDataset, in this file) that converts each frame on the
-fly instead (see video_source.py).
+data_task2_TEE_nnunet.py's collect_tee_files) -- InferenceCaseDataset
+treats every '*<file_ending>' file in image_folder as its own case,
+whatever it's named, no naming convention assumed. Video's raw reference
+data is PNG frames (see data_task3_VIDEO_nnunet.py's collect_video_files)
+-- the '_0000/_0001/_0002.nii.gz' triplet is only how *our* training
+pipeline stores it internally after conversion, so video needs its own
+dataset (VideoInferenceCaseDataset, in this file) that converts each frame
+on the fly instead (see video_source.py), likewise accepting any PNG.
 """
 
 from pathlib import Path
@@ -31,37 +31,20 @@ from .video_source import discover_video_frames, write_frame_as_nnunet_channels
 
 def discover_cases(image_folder, file_ending, num_channels):
     """
-    Map each case_id under image_folder to its ordered list of per-channel
-    image files.
+    Map each case_id under image_folder to its single-channel image file.
 
-    ASSUMPTION, not yet verified against the real hidden test set:
-    image_folder mirrors nnU-Net's own '<case_id>_<channel:04d><file_ending>'
-    naming (matching how nnUNet_raw/imagesTs is laid out internally). The
-    competition's original raw reference data instead uses task-specific
-    suffixes (e.g. TEE: '<case>-US.nii.gz', see
-    data_preparation/data_task2_TEE_nnunet.py's collect_tee_files) -- if
-    the organizer's hidden-test /input follows that convention instead,
-    only this function needs to change; preprocessing/prediction below is
-    unaffected either way since it only consumes the resolved file list.
+    Every '*<file_ending>' file is one case, using its own filename (minus
+    file_ending) as case_id -- no assumption about naming, so this works
+    regardless of what the files are actually called. Only holds for
+    num_channels=1 (all CT/TEE ever use): filenames alone can't say which
+    files belong to the same multi-channel case.
     """
+    if num_channels != 1:
+        raise ValueError(f"discover_cases only supports single-channel inputs, got num_channels={num_channels}")
+
     image_folder = Path(image_folder)
-    channel0_suffix = f"_{0:04d}{file_ending}"
 
-    case_ids = sorted(f.name[: -len(channel0_suffix)] for f in image_folder.glob(f"*{channel0_suffix}"))
-
-    cases = {}
-
-    for case_id in case_ids:
-        image_files = [str(image_folder / f"{case_id}_{c:04d}{file_ending}") for c in range(num_channels)]
-
-        missing = [f for f in image_files if not Path(f).exists()]
-
-        if missing:
-            raise FileNotFoundError(f"Case '{case_id}' is missing channel files: {missing}")
-
-        cases[case_id] = image_files
-
-    return cases
+    return {f.name[: -len(file_ending)]: [str(f)] for f in sorted(image_folder.glob(f"*{file_ending}"))}
 
 
 def preprocess_case_files(image_files, case_id, plans_manager, configuration_manager, dataset_json):
