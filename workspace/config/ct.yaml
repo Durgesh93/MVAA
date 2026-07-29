@@ -1,0 +1,27 @@
+task_id: task1
+prefix: t1_ct
+dataset_id: Dataset001_MVAA_CT_SSL
+configuration: 3d_fullres
+plans_identifier: nnUNetPlans
+
+# nnunet_preprocessed is shared across all 3 tasks: NNUnetSetup joins it
+# with dataset_id itself.
+nnunet_preprocessed: plans
+
+# ${env:VAR,default} is a custom OmegaConf resolver (registered in
+# utils.py) reading an env var with a fallback default -- /input and
+# /output match the Docker contract; only relevant when MVAA_INPUT_DIR/
+# MVAA_OUTPUT_DIR aren't set (e.g. running this file directly, outside
+# the container).
+input_dir: ${env:MVAA_INPUT_DIR,/input}/${prefix}
+output_dir: ${env:MVAA_OUTPUT_DIR,/output}/${prefix}
+
+# No env var for this one (unlike input/output) -- /work is just fixed by
+# the organizer's contract as their writable scratch mount. Used instead
+# of writing inside the image's own filesystem, which isn't guaranteed
+# writable (e.g. Apptainer's SIF root is read-only by default).
+work_dir: /work
+
+postprocess_keep_largest_component: true
+tta_use_mirroring: true
+tta_tile_step_size: 0.5

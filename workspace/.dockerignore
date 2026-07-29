@@ -1,0 +1,12 @@
+# Local dev-only test data -- not part of the submission image (the
+# runner mounts /input and /output itself; see run_inference.py).
+.temp/
+
+Dockerfile
+.dockerignore
+apptainer.def
+docker.sh
+submission.zip
+
+**/__pycache__/
+**/*.pyc

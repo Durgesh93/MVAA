@@ -1,0 +1,16 @@
+task_id: task3
+prefix: t3_vid
+dataset_id: Dataset003_MVAA_VIDEO_SSL
+configuration: 2d
+plans_identifier: nnUNetPlans
+
+nnunet_preprocessed: plans
+
+input_dir: ${env:MVAA_INPUT_DIR,/input}/${prefix}
+output_dir: ${env:MVAA_OUTPUT_DIR,/output}/${prefix}
+
+work_dir: /work
+
+postprocess_keep_largest_component: false
+tta_use_mirroring: true
+tta_tile_step_size: 0.5

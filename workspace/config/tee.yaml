@@ -1,0 +1,16 @@
+task_id: task2
+prefix: t2_tee
+dataset_id: Dataset002_MVAA_TEE_SSL
+configuration: 3d_fullres
+plans_identifier: nnUNetPlans
+
+nnunet_preprocessed: plans
+
+input_dir: ${env:MVAA_INPUT_DIR,/input}/${prefix}
+output_dir: ${env:MVAA_OUTPUT_DIR,/output}/${prefix}
+
+work_dir: /work
+
+postprocess_keep_largest_component: true
+tta_use_mirroring: true
+tta_tile_step_size: 0.5
