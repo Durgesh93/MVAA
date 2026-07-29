@@ -734,7 +734,8 @@ def destroy_vastai_instance(instance_id: str, config: dict) -> None:
 # ============================================================
 if "EXP_STORAGE_BASE" not in os.environ:
     raise EnvironmentError("EXP_STORAGE_BASE is not set -- source envs/workspace/platforms/<platform>/main.sh first.")
-NNUNET_RESULTS_DIR = Path(os.environ["EXP_STORAGE_BASE"]) / "data" / "nnUNet" / "nnUNet_results"
+NNUNET_DATA_DIR = Path(os.environ["EXP_STORAGE_BASE"]) / "data" / "nnUNet"
+NNUNET_RESULTS_DIR = NNUNET_DATA_DIR / "nnUNet_results"
 CKPTS_DIR = WORKSPACE_DIR / "ckpts"
 
 CKPT_PLANS_IDENTIFIER = "nnUNetPlans"
@@ -795,7 +796,7 @@ def stage_ckpt_action(branch: str, version: str = "best") -> None:
 # checked in under input/ (case IDs sort in the same order they were
 # originally picked in).
 # ============================================================
-REFERENCE_DATA_DIR = Path(os.environ["EXP_STORAGE_BASE"]) / "data" / "nnUNet" / "MVAA_nnUNET" / "reference_data"
+REFERENCE_DATA_DIR = NNUNET_DATA_DIR / "MVAA_nnUNET" / "reference_data"
 SAMPLE_VAL_CASES = 3
 
 
