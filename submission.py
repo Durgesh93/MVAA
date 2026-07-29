@@ -9,13 +9,14 @@ Run with no args for an interactive menu, or invoke each step directly:
     python3 submission.py create-vast         # 1. rent/reuse a vast.ai instance
     python3 submission.py delete-vast         # 2. destroy the instance on record
     python3 submission.py stage-ckpt supervised [--version best|last|swa]  # 3. copy checkpoints into workspace/ckpts/
-    python3 submission.py push-docker         # 4. build zips + rsync to remote
-    python3 submission.py trigger-build [--push]  # 5. run workspace/docker.sh remotely
-    python3 submission.py pull-output         # 6. pull the remote output/ back as a zip
+    python3 submission.py sample-input        # 4. pull val cases from MVAA_nnUNET into input/
+    python3 submission.py push-docker         # 5. build zips + rsync to remote
+    python3 submission.py trigger-build [--push]  # 6. run workspace/docker.sh remotely
+    python3 submission.py pull-output         # 7. pull the remote output/ back as a zip
 
-Steps are independent -- rerun just one as needed (workspace/ckpts/ and
-zip/ persist between runs). Connection details for the current vast.ai
-instance are remembered in .submission_state.json (gitignored, like
+Steps are independent -- rerun just one as needed (workspace/ckpts/, input/,
+and zip/ all persist between runs). Connection details for the current
+vast.ai instance are remembered in .submission_state.json (gitignored, like
 config.json).
 
 Artifacts, written under zip/ by push-docker:
@@ -788,7 +789,59 @@ def stage_ckpt_action(branch: str, version: str = "best") -> None:
 
 
 # ============================================================
-# The 6 actions, callable directly (menu) or via typer (CLI)
+# Sample input/ (local docker.sh testing) -- MVAA_nnUNET/reference_data
+# holds the same train/val split used to build nnUNet_raw, so pulling the
+# first N sorted val cases per task reproduces the fixed sample already
+# checked in under input/ (case IDs sort in the same order they were
+# originally picked in).
+# ============================================================
+REFERENCE_DATA_DIR = Path(os.environ["EXP_STORAGE_BASE"]) / "data" / "nnUNet" / "MVAA_nnUNET" / "reference_data"
+SAMPLE_VAL_CASES = 3
+
+
+def _stage_sample_volumes(task_dir: str, prefix: str, strip_suffix: str = "") -> None:
+    src_dir = REFERENCE_DATA_DIR / task_dir / "val" / "images"
+    cases = sorted(src_dir.glob("*.nii.gz"))[:SAMPLE_VAL_CASES]
+    if not cases:
+        raise FileNotFoundError(f"No validation cases found in {src_dir}")
+
+    dest_dir = INFERENCE_DIR / "input" / prefix
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for case in cases:
+        stem = case.name.removesuffix(".nii.gz").removesuffix(strip_suffix)
+        dest = dest_dir / f"{stem}_0000.nii.gz"
+        info(f"[{prefix}] {case} -> {dest}", "🧪")
+        shutil.copy2(case, dest)
+
+
+def _stage_sample_video() -> None:
+    src_dir = REFERENCE_DATA_DIR / "t3_vid" / "val" / "images"
+    recordings = sorted(p for p in src_dir.iterdir() if p.is_dir())
+    if not recordings:
+        raise FileNotFoundError(f"No validation recordings found in {src_dir}")
+
+    recording = recordings[0]
+    frames = sorted(recording.glob("*.png"))[:SAMPLE_VAL_CASES]
+    if not frames:
+        raise FileNotFoundError(f"No frames found in {recording}")
+
+    dest_dir = INFERENCE_DIR / "input" / "t3_vid" / recording.name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for frame in frames:
+        dest = dest_dir / frame.name
+        info(f"[t3_vid] {frame} -> {dest}", "🧪")
+        shutil.copy2(frame, dest)
+
+
+def sample_input_action() -> None:
+    _stage_sample_volumes("t1_ct", "t1_ct")
+    _stage_sample_volumes("t2_tee", "t2_tee", strip_suffix="-US")
+    _stage_sample_video()
+    success(f"input/ ready with {SAMPLE_VAL_CASES} sample val cases per task", "🧪")
+
+
+# ============================================================
+# The 7 actions, callable directly (menu) or via typer (CLI)
 # ============================================================
 def create_vast_action(config: dict) -> dict:
     if not config.get("vast_api_key"):
@@ -885,8 +938,9 @@ def interactive_menu() -> None:
                 console.input("[bold cyan]?[/] Version [dim]\\[best/last/swa, default best][/]: ").strip() or "best",
             ),
         ),
+        ("4", "🧪", "Create sample input (pull val cases from MVAA_nnUNET)", lambda: sample_input_action()),
         (
-            "4",
+            "5",
             "📦",
             "Push docker (build zips + rsync archive to remote)",
             lambda: push_docker_action(
@@ -894,14 +948,14 @@ def interactive_menu() -> None:
             ),
         ),
         (
-            "5",
+            "6",
             "▶️ ",
             "Trigger build (run workspace/docker.sh on remote)",
             lambda: trigger_build_action(
                 load_machine_config(), push=_ask_yes_no("Also push image to Docker Hub?")
             ),
         ),
-        ("6", "📥", "Pull output (fetch remote output/ as a local zip)", lambda: pull_output_action(load_machine_config())),
+        ("7", "📥", "Pull output (fetch remote output/ as a local zip)", lambda: pull_output_action(load_machine_config())),
     ]
 
     while True:
@@ -974,11 +1028,17 @@ def stage_ckpt_cmd(
     _guarded(stage_ckpt_action, branch, version)
 
 
+@app.command("sample-input")
+def sample_input_cmd() -> None:
+    """🧪 4. Pull a small sample of val cases from MVAA_nnUNET into input/ for local docker.sh testing."""
+    _guarded(sample_input_action)
+
+
 @app.command("push-docker")
 def push_docker_cmd(
     clean_zip: bool = typer.Option(False, "--clean-zip", help="Delete old zip/ contents first."),
 ) -> None:
-    """📦 4. Build submission.zip + the docker build archive, and rsync it to the remote machine."""
+    """📦 5. Build submission.zip + the docker build archive, and rsync it to the remote machine."""
     _guarded(push_docker_action, load_machine_config(), clean_zip=clean_zip)
 
 
@@ -986,19 +1046,19 @@ def push_docker_cmd(
 def trigger_build_cmd(
     push: bool = typer.Option(False, "--push", help="Also push the built image to Docker Hub."),
 ) -> None:
-    """▶️  5. Run workspace/docker.sh on the remote machine against the last pushed archive."""
+    """▶️  6. Run workspace/docker.sh on the remote machine against the last pushed archive."""
     _guarded(trigger_build_action, load_machine_config(), push=push)
 
 
 @app.command("pull-output")
 def pull_output_cmd() -> None:
-    """📥 6. Zip the remote output/ dir and pull it back to zip/output_docker_<timestamp>.zip."""
+    """📥 7. Zip the remote output/ dir and pull it back to zip/output_docker_<timestamp>.zip."""
     _guarded(pull_output_action, load_machine_config())
 
 
 if __name__ == "__main__":
     # `--tunnel` is this script re-invoking itself as an SSH ProxyCommand --
-    # intercept before typer ever sees argv (not one of the 6 subcommands).
+    # intercept before typer ever sees argv (not one of the 7 subcommands).
     if len(sys.argv) > 1 and sys.argv[1] == "--tunnel":
         _, target_host, target_port, proxy_host, proxy_port = sys.argv[1:6]
         run_tunnel(target_host, target_port, proxy_host, int(proxy_port))
