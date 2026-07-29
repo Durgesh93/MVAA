@@ -731,7 +731,9 @@ def destroy_vastai_instance(instance_id: str, config: dict) -> None:
 # dirs/data_storage at the same shared nnUNet_results tree, keyed by branch
 # name. run_inference.py loads workspace/ckpts/<prefix>/model.ckpt per task.
 # ============================================================
-NNUNET_RESULTS_DIR = Path("/cluster/work/projects/nn8104k/dsi014/experiment_storage/data/nnUNet/nnUNet_results")
+if "EXP_STORAGE_BASE" not in os.environ:
+    raise EnvironmentError("EXP_STORAGE_BASE is not set -- source envs/workspace/platforms/<platform>/main.sh first.")
+NNUNET_RESULTS_DIR = Path(os.environ["EXP_STORAGE_BASE"]) / "data" / "nnUNet" / "nnUNet_results"
 CKPTS_DIR = WORKSPACE_DIR / "ckpts"
 
 CKPT_PLANS_IDENTIFIER = "nnUNetPlans"
