@@ -2,20 +2,16 @@
 Converts raw video frame PNGs into nnU-Net's per-channel nii.gz
 representation on the fly, at inference time -- replicating
 data_preparation/data_task3_VIDEO_nnunet.py's
-write_video_rgb_image_as_nnunet_channels (same RGB-channel-split and
-spatial-orientation-normalize logic) without needing the full data-prep
-pipeline. Temp channel files are written to work_dir and are safe to
-discard after preprocessing.
+write_video_rgb_image_as_nnunet_channels (same RGB-split and
+orientation-normalize logic) without the full data-prep pipeline. Temp
+channel files go to work_dir and are safe to discard after preprocessing.
 
 ASSUMPTION, not yet verified against the real hidden test set: /input's
 video task is raw per-frame PNGs grouped one subfolder per recording
-(mirroring the /output layout's REC_xxx/ convention) -- CT/TEE's raw
-reference data is plain nii.gz (see data_task2_TEE_nnunet.py's
-collect_tee_files), but video's raw reference data is confirmed PNG (see
-data_task3_VIDEO_nnunet.py's collect_video_files, which globs
-train_dir/*/*.png and test_dir/*/*.png) -- nii.gz-per-channel is only how
-*our own* training pipeline stores video internally after conversion, not
-how the organizers are likely to hand us raw frames.
+(mirroring /output's REC_xxx/ convention) -- confirmed as PNG per
+data_task3_VIDEO_nnunet.py's collect_video_files, but the nii.gz-per-channel
+form is only how *our own* training pipeline stores it after conversion,
+not necessarily how the organizers hand us raw frames.
 """
 
 from pathlib import Path

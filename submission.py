@@ -385,12 +385,10 @@ DOCKERHUB_TLS_HOSTS = ["registry-1.docker.io", "auth.docker.io", "index.docker.i
 
 def trust_remote_dockerhub_proxy_cert(config: dict) -> None:
     # Some vast.ai hosts transparently MITM Docker Hub's TLS with their own
-    # cert (confirmed via cert chain inspection -- a bandwidth-saving pull
-    # cache, not malicious). `insecure-registries` doesn't bypass this, and
-    # we never see the proxy's root CA, only its leaf cert -- so capture each
-    # hostname's current leaf cert and trust it directly (exact-match trust
-    # doesn't need a chain to a root). Harmless if a host isn't intercepting
-    # at all -- this just captures the real cert instead.
+    # cert (a pull cache, not malicious). `insecure-registries` doesn't
+    # bypass this, and we never see the proxy's root CA, only its leaf --
+    # so trust each hostname's current leaf cert directly (exact-match
+    # trust needs no root chain). Harmless if a host isn't intercepting.
     capture_cmds = " && ".join(
         f"(echo | openssl s_client -connect {host}:443 -servername {host} 2>/dev/null "
         f"| openssl x509 | sudo tee /usr/local/share/ca-certificates/vast-proxy-{host}.crt >/dev/null)"
@@ -729,15 +727,11 @@ def destroy_vastai_instance(instance_id: str, config: dict) -> None:
 
 # ============================================================
 # Setup (workspace/{ckpts,plans,input}) -- one branch determines all three:
-# workspace/ckpts/<prefix>/model.ckpt (run_inference.py's checkpoint),
-# workspace/plans/<dataset_id>/{nnUNetPlans,dataset}.json (NNUnetSetup's
-# network config -- can legitimately differ from what's currently in
-# nnUNet_preprocessed, e.g. a class added mid-project, or a checkpoint
-# trained elsewhere with a different config, with no copy saved alongside
-# the checkpoint itself to detect that from), and workspace/input/ (a
-# small local sample to test against). Every branch worktree symlinks
-# dirs/data_storage at the same shared nnUNet_results/nnUNet_preprocessed
-# tree, keyed by branch name, so only a branch name is needed for all three.
+# the checkpoint, its matching plans/dataset.json (can legitimately differ
+# from nnUNet_preprocessed's current copy, e.g. a class added mid-project,
+# with no snapshot saved alongside the checkpoint to catch that), and a
+# small local input sample. Every branch worktree symlinks dirs/data_storage
+# at the same shared tree, keyed by branch name, so one name covers all three.
 # ============================================================
 if "EXP_STORAGE_BASE" not in os.environ:
     raise EnvironmentError("EXP_STORAGE_BASE is not set -- source envs/workspace/platforms/<platform>/main.sh first.")

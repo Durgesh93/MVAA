@@ -2,12 +2,10 @@
 set -euo pipefail
 
 # Build the MVAA submission image and test it against workspace/input/ (see
-# ../submission.py's setup_action for how that gets populated -- excluded
-# from the image itself via .dockerignore) and the sibling output/, work/
-# folders, using the organizer's exact docker run contract (section 4:
-# network none, resource limits, -v .../input:ro etc., -e MVAA_*_DIR,
-# -w /work) so a passing run here is a real signal for the actual
-# submission, not just "it builds."
+# ../submission.py's setup_action; excluded from the image via .dockerignore)
+# and the sibling output/, work/ folders, using the organizer's exact docker
+# run contract (section 4) so a passing run here is a real signal, not just
+# "it builds."
 #
 # Push to Docker Hub is opt-in (./docker.sh --push), only after a PASS,
 # never automatic -- run `docker login` yourself first (once, interactively;
@@ -23,21 +21,14 @@ if [ "${1:-}" = "--push" ]; then
   PUSH=1
 fi
 
-# Some vast.ai hosts run a transparent TLS-intercepting proxy on Docker
-# Hub's hostnames (presumably a bandwidth-saving pull-through cache --
-# confirmed via `getent hosts registry-1.docker.io` returning a private
-# 192.168.x.x address even when queried against 8.8.8.8, i.e. the redirect
-# is at the host's network level, not something in this VM's own config).
-# It terminates TLS with its own cert instead of Docker Hub's real one.
-# `insecure-registries` does NOT work around this -- confirmed by direct
-# testing, Docker still enforces strict TLS for the official docker.io
-# registry regardless of that setting. The proxy also never sends its own
-# root CA in the handshake (only its per-host leaf cert), so instead of
-# trying to trust a root we don't have, just capture whatever leaf cert
-# each hostname currently presents and add it directly as a trusted
-# anchor -- an exact-match trust entry doesn't need to be self-signed. If
-# a host ISN'T doing this interception, this just captures the real Docker
-# Hub cert instead, which is already trusted anyway -- harmless either way.
+# Some vast.ai hosts transparently MITM Docker Hub's TLS with their own
+# cert (confirmed via `getent hosts` resolving to a private 192.168.x.x
+# address -- a bandwidth-saving pull cache, not something in this VM's own
+# config). `insecure-registries` doesn't bypass this, and the proxy never
+# sends its own root CA, only its leaf cert -- so capture each hostname's
+# current leaf cert and trust it directly (exact-match trust doesn't need
+# a root). Harmless if a host isn't intercepting -- this just captures the
+# real cert instead.
 for h in registry-1.docker.io auth.docker.io index.docker.io; do
   echo | openssl s_client -connect "$h:443" -servername "$h" 2>/dev/null \
     | openssl x509 | sudo tee "/usr/local/share/ca-certificates/vast-proxy-$h.crt" >/dev/null
@@ -47,29 +38,21 @@ sudo update-ca-certificates
 sudo apt install -y nvidia-container-toolkit
 sudo nvidia-ctk runtime configure --runtime=docker
 
-# One restart for both config changes above -- not one each. systemd rate-
-# limits how many times a unit can restart within a short window
-# (StartLimitBurst), and restarting docker.service back-to-back (once here,
-# once already in submission.py's docker_login_remote before this script
-# even ran) was enough to trip it ("start-limit-hit"), which then made this
-# restart fail even though the config itself was fine. reset-failed clears
-# that rate-limit state defensively before we ask for the one restart we
-# actually need.
+# One restart for both config changes -- systemd's restart rate-limit
+# already tripped once from submission.py's docker_login_remote restarting
+# docker.service right before this script ran. reset-failed clears that
+# state first so this restart doesn't fail too.
 sudo systemctl reset-failed docker.service 2>/dev/null || true
 sudo systemctl restart docker
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFERENCE_DIR="$(dirname "$SCRIPT_DIR")"
-# Docker Hub, username durgesh1993 -- this is also what gets pushed for
-# the actual CodaBench submission.json (see ../submission.py), not just a
-# local test tag. Keep this in sync with submission.py's IMAGE constant.
+# Also what gets pushed for the actual CodaBench submission.json (see
+# ../submission.py) -- keep in sync with submission.py's IMAGE constant.
 IMAGE_TAG="docker.io/durgesh1993/team_vi:final"
 
-# Only drop our own tag + dangling leftovers from previous builds of it --
-# NOT `docker system prune -af`, which would also evict the base image's
-# cached layers and make every build re-pull/re-run from scratch. Scoped
-# like this, unchanged layers (base image, unchanged COPY steps) stay
-# cached, so a second build after a small code change is fast.
+# Only our own tag + its dangling leftovers -- not `docker system prune -af`,
+# which would also evict the base image's cached layers.
 echo "==> Removing previous $IMAGE_TAG (keeping cache/other images)"
 docker rmi -f "$IMAGE_TAG" 2>/dev/null || true
 docker image prune -f

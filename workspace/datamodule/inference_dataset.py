@@ -1,23 +1,18 @@
 """
-Inference-only nnU-Net raw-case datasets for the Docker submission
-contract.
+Inference-only nnU-Net raw-case datasets for the Docker submission contract.
 
 Mirrors datamodule/raw_case_dataset.py's nnUNetRawCaseDataset (has_gt=False
-prediction path: preprocesses one raw case via nnU-Net's own
-preprocessing_iterator_fromfiles, returning the same dict shape consumed by
-module/nnunet.py's PredictionOps.run_prediction) but sourced from /input
-instead of nnUNet_raw/imagesTs, with no pre-known case-id list, no TrL/TrU
-split, no DDP rank splitting, no augmenters.
+path: preprocesses one raw case via nnU-Net's own
+preprocessing_iterator_fromfiles) but sourced from /input instead of
+nnUNet_raw/imagesTs, with no pre-known case-id list, TrL/TrU split, DDP
+rank splitting, or augmenters.
 
-CT/TEE raw reference data is plain nii.gz on disk (see
-data_task2_TEE_nnunet.py's collect_tee_files) -- InferenceCaseDataset
-treats every '*<file_ending>' file in image_folder as its own case,
-whatever it's named, no naming convention assumed. Video's raw reference
-data is PNG frames (see data_task3_VIDEO_nnunet.py's collect_video_files)
--- the '_0000/_0001/_0002.nii.gz' triplet is only how *our* training
-pipeline stores it internally after conversion, so video needs its own
-dataset (VideoInferenceCaseDataset, in this file) that converts each frame
-on the fly instead (see video_source.py), likewise accepting any PNG.
+CT/TEE reference data is plain nii.gz -- InferenceCaseDataset treats every
+'*<file_ending>' file as its own case, whatever it's named. Video's
+reference data is PNG frames -- the '_0000/_0001/_0002.nii.gz' triplet is
+only how *our* training pipeline stores it internally, so video gets its
+own dataset (VideoInferenceCaseDataset) that converts each frame on the
+fly instead (see video_source.py), likewise accepting any PNG.
 """
 
 from pathlib import Path

@@ -2,24 +2,21 @@
 NNUnetSetup for inference.
 
 Loads nnU-Net plans/dataset.json and builds the PlansManager/
-ConfigurationManager/LabelManager, and the network architecture via
-nnU-Net's own trainer static method. Training-only pieces from the
-original per-experiment nnunet.py (loss/optimizer construction, boundary-
-weight ramping, and their losses.py dependency) are intentionally not
-ported here -- inference never calls them.
+ConfigurationManager/LabelManager plus the network architecture via
+nnU-Net's own trainer static method. Training-only pieces (loss/optimizer
+construction, boundary-weight ramping) are intentionally not ported here --
+inference never calls them.
 
 Sliding-window inference lives in PredictionOps (composed, not mixed in)
--- self.predictor. It shares NNUnetSetup's own pm/cm/lm/dataset_json by
-construction, so callers never need to pass configuration_manager
-themselves. Mask writing is NOT wrapped here (see inference_module.py,
-which calls utils.write_submission_prediction directly to get its
-returned path).
+-- self.predictor, sharing pm/cm/lm/dataset_json by construction so callers
+never pass configuration_manager themselves. Mask writing is NOT wrapped
+here (see inference_module.py, which calls utils.write_submission_prediction
+directly for its returned path).
 
-Static (authored once, shared by every experiment) rather than copied
-per-experiment. The one experiment-specific behavior found in the SSL
-family (ssl_small_patch_size overrides the plans' patch_size) is handled
-generically via an optional cfg.patch_size_override field instead of
-forking this file per branch.
+Static and shared by every experiment rather than copied per-experiment --
+the one experiment-specific SSL behavior (ssl_small_patch_size overriding
+patch_size) is handled via an optional cfg.patch_size_override field
+instead of forking this file per branch.
 """
 
 from batchgenerators.utilities.file_and_folder_operations import join, load_json

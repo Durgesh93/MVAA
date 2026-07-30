@@ -1,10 +1,9 @@
 """
 Utility functions for the Docker inference entrypoint (run_inference.py).
 
-Trimmed to only what's reachable from the inference path -- this file used
-to be a 1:1 copy of the training codebase's utils.py (metrics, training-
-progress plotting, DDP rank merging, the Slicer case-zip writer, etc.),
-none of which run_inference.py/inference_module.py/nnunet.py ever call.
+Trimmed to only what's reachable from the inference path -- this used to be
+a 1:1 copy of the training codebase's utils.py (metrics, training-progress
+plotting, DDP rank merging, etc.), none of which inference ever calls.
 """
 
 import json
@@ -15,9 +14,9 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-# Lets yaml configs reference env vars directly, e.g.
-# input_dir: ${env:MVAA_INPUT_DIR,/input}/${prefix} -- optional 2nd arg is
-# the default when the var is unset; omit it to require the var (raises).
+# Lets yaml configs reference env vars, e.g.
+# input_dir: ${env:MVAA_INPUT_DIR,/input}/${prefix} -- omit the 2nd arg to
+# require the var (raises if unset).
 OmegaConf.register_new_resolver("env", lambda name, default=None: os.environ.get(name, default))
 
 from skimage.io import imsave as skimage_imsave
@@ -53,12 +52,10 @@ def convert_segmentation_to_255(segmentation):
 # =============================================================================
 def keep_largest_component(segmentation, foreground_labels):
     """
-    For each foreground label, zero out every connected component of that
-    label's binary mask except the largest one. Only appropriate for
-    labels whose anatomy is a single structure (e.g. CT/TEE valves) --
-    not for classes with legitimately multi-component ground truth (e.g.
-    video's equipment class, see the commit that removed this postprocessing
-    for video).
+    Zero out every connected component except the largest, per foreground
+    label. Only for labels whose anatomy is a single structure (e.g. CT/TEE
+    valves) -- not classes with legitimately multi-component ground truth
+    (e.g. video's equipment class, hence not applied there).
     """
     out = segmentation.copy()
     for label in foreground_labels:
@@ -90,13 +87,9 @@ SEGMENT_COLOR_PALETTE = [
 
 
 # =============================================================================
-# Shared segmentation image I/O
-#
-# nnU-Net's own image_reader_writer.write_seg() trips into 16-bit output
-# whenever a mask's max value is exactly 255
-# (np.uint8 if np.max(seg) < 255 else np.uint16). We control the dtype
-# ourselves everywhere a segmentation is written, so this always writes
-# uint8 directly and skips that writer entirely.
+# Shared segmentation image I/O -- nnU-Net's own image_reader_writer.write_seg()
+# trips into 16-bit output whenever a mask's max value is exactly 255. We
+# control the dtype ourselves, so this writes uint8 directly instead.
 # =============================================================================
 class SegmentationImageIO:
 

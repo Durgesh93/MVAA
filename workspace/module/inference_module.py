@@ -2,13 +2,12 @@
 Lightning wrapper for inference.
 
 Builds the network + prediction ops via NNUnetSetup (module/nnunet.py --
-static, shared as-is across the SSL family; see that file's own docstring
-for why). predict_step writes each case's mask directly (mirrors how the
-original training code's SSLnnUNetLightningModule.validation_step writes
-as it goes, rather than accumulating trainer.predict()'s return values,
-which would hold every case's full-resolution volume/logits in memory at
-once), and records the written path -- turning that into a
-task*_predictions.json entry is run_inference.py's job, not this class's.
+static, shared as-is across the SSL family, see that file's docstring).
+predict_step writes each case's mask directly rather than accumulating
+trainer.predict()'s return values (which would hold every case's
+full-resolution volume/logits in memory at once), and records the written
+path -- turning that into a task*_predictions.json entry is
+run_inference.py's job, not this class's.
 """
 
 from pathlib import Path
@@ -26,11 +25,10 @@ class InferenceLightningModule(L.LightningModule):
         self.cfg = litmodule_cfg
         self.output_dir = Path(output_dir)
 
-        # enable_deep_supervision=True must match training (SSLnnUNetLightningModule
-        # hardcodes True) -- the checkpoint's state_dict includes the deep-supervision
-        # decoder heads' parameters, so the architecture must be built with them present
-        # for load_state_dict to match. PredictionOps toggles deep_supervision off at
-        # the *forward-pass* level per case; the parameters themselves are unaffected.
+        # Must match training (True) -- the checkpoint's state_dict includes the
+        # deep-supervision decoder heads' params, so load_state_dict needs them
+        # present in the built architecture. PredictionOps toggles deep_supervision
+        # off per case at the forward-pass level only; params are unaffected.
         self.nnunet = NNUnetSetup(litmodule_cfg, enable_deep_supervision=True, trainer_name=self.__class__.__name__)
         self.network = self.nnunet.build_network()
 
@@ -49,8 +47,8 @@ class InferenceLightningModule(L.LightningModule):
             network=self.network, device=self.device, batch=batch, batch_idx=batch_idx
         )
 
-        # Called directly (PredictionOps has no write wrapper -- see
-        # nnunet.py) since we need the returned path to record it below.
+        # Called directly (PredictionOps has no write wrapper) since we
+        # need the returned path to record it below.
         pred_file = write_submission_prediction(
             prediction=prediction,
             output_folder=self.output_dir,

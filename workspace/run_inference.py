@@ -1,25 +1,19 @@
 """
 Docker inference entrypoint.
 
-Called directly by the image's ENTRYPOINT -- no CLI flags at runtime. Per
-the submission contract, the organizer's runner only sets
-MVAA_INPUT_DIR=/input, MVAA_OUTPUT_DIR=/output (both mounted volumes) and
--w /work (a third mounted, writable scratch volume, set as the container's
-cwd -- there is no separate env var for it). Runs all 3 tasks, loading
-each one's checkpoint into a Lightning module and running trainer.predict()
-over /input, writing masks + task*_predictions.json into /output/<prefix>/.
+Called directly by the image's ENTRYPOINT -- no CLI flags. Per the
+submission contract, the runner sets MVAA_INPUT_DIR=/input,
+MVAA_OUTPUT_DIR=/output, and -w /work (its cwd, no env var). Runs all 3
+tasks, loading each checkpoint into a Lightning module and running
+trainer.predict() over /input, writing masks + task*_predictions.json
+into /output/<prefix>/.
 
-Training used Lightning, so inference reuses the same LightningModule/
-LightningDataModule shape (InferenceLightningModule/InferenceDataModule)
-instead of hand-rolling device placement and the predict loop -- Lightning
-handles moving the module/batches to the right accelerator, no_grad/eval
-mode, etc. Mask writing happens inside predict_step itself (see
-module/inference_module.py), which just records the written path (not
-accumulated in trainer.predict()'s return value, to avoid holding every
-case's full-resolution volume in memory at once) -- turning that into a
-task*_predictions.json entry is utils.write_predictions_json's job, kept
-in utils.py alongside the other inference-entrypoint helpers so this file
-stays pure orchestration.
+Reuses training's LightningModule/LightningDataModule shape so Lightning
+handles device placement/eval mode instead of hand-rolling it. Mask
+writing happens inside predict_step (module/inference_module.py), which
+just records the written path (not accumulated in trainer.predict()'s
+return value, to avoid holding every case's full-resolution volume in
+memory) -- utils.write_predictions_json turns that into the json entry.
 """
 
 import os
@@ -46,13 +40,12 @@ def run_task(task: str, device: torch.device) -> None:
 
     print(f"[{task}] loading plans/checkpoint for {prefix}")
 
-    # Must be set before NNUnetSetup() is constructed. nnunetv2.paths.nnUNet_preprocessed
-    # is a lazy os.PathLike wrapper around os.environ, re-read on every access -- so this
-    # just needs to run before first use, not before nnunetv2 is imported.
+    # Must be set before NNUnetSetup() is constructed -- nnunetv2.paths.nnUNet_preprocessed
+    # is a lazy os.PathLike wrapper re-read on every access, so this just needs
+    # to run before first use, not before nnunetv2 is imported.
     os.environ["nnUNet_preprocessed"] = str(BASE_DIR / cfg.nnunet_preprocessed)
 
-    # cfg.input_dir/output_dir/work_dir are resolved by load_task_cfg --
-    # see config/<task>.yaml.
+    # Resolved by load_task_cfg -- see config/<task>.yaml.
     image_folder = Path(cfg.input_dir)
 
     task_output_dir = Path(cfg.output_dir)
@@ -80,11 +73,10 @@ def run_task(task: str, device: torch.device) -> None:
         work_dir=(work_dir / prefix) if is_video else None,
     )
 
-    # This cluster does not launch jobs via srun, so Lightning's automatic
-    # cluster-environment detection is unsafe here -- SLURMEnvironment's
-    # constructor validates srun variables eagerly and raises whenever
-    # SLURM_NTASKS > 1 without SLURM_NTASKS_PER_NODE (see engine.py's own
-    # _select_cluster_environment for the same workaround during training).
+    # No srun here, so Lightning's automatic cluster-environment detection
+    # is unsafe -- SLURMEnvironment's constructor raises whenever SLURM_NTASKS
+    # > 1 without SLURM_NTASKS_PER_NODE (same workaround as engine.py's
+    # _select_cluster_environment during training).
     trainer = L.Trainer(
         accelerator="gpu" if device.type == "cuda" else "cpu",
         devices=1,
@@ -109,9 +101,8 @@ def main() -> None:
         for task in TASKS:
             run_task(task, device)
     finally:
-        # Scratch (video frame staging only) lives under cfg.work_dir/.temp --
-        # same fixed /work path for every task's yaml, safe to remove whether
-        # or not every task succeeded.
+        # Scratch (video frame staging only), safe to remove regardless of
+        # whether every task succeeded.
         shutil.rmtree(Path("/work") / ".temp", ignore_errors=True)
 
 
