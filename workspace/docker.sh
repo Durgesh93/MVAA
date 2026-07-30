@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build the MVAA submission image and test it against the sibling
-# input/, output/, work/ folders (see ../submission.py for how this layout got
-# here), using the organizer's exact docker run contract (section 4:
+# Build the MVAA submission image and test it against workspace/input/ (see
+# ../submission.py's setup_action for how that gets populated -- excluded
+# from the image itself via .dockerignore) and the sibling output/, work/
+# folders, using the organizer's exact docker run contract (section 4:
 # network none, resource limits, -v .../input:ro etc., -e MVAA_*_DIR,
 # -w /work) so a passing run here is a real signal for the actual
 # submission, not just "it builds."
@@ -82,7 +83,7 @@ docker build -t "$IMAGE_TAG" "$SCRIPT_DIR"
 
 mkdir -p "$INFERENCE_DIR/output" "$INFERENCE_DIR/work"
 
-echo "==> Running $IMAGE_TAG against $INFERENCE_DIR/{input,output,work}"
+echo "==> Running $IMAGE_TAG against $SCRIPT_DIR/input and $INFERENCE_DIR/{output,work}"
 docker run --rm $GPUS \
   --network none \
   --memory "$MEMORY" \
@@ -91,7 +92,7 @@ docker run --rm $GPUS \
   --shm-size 8g \
   --cap-drop ALL \
   --security-opt no-new-privileges \
-  -v "$INFERENCE_DIR/input":/input:ro \
+  -v "$SCRIPT_DIR/input":/input:ro \
   -v "$INFERENCE_DIR/output":/output:rw \
   -v "$INFERENCE_DIR/work":/work:rw \
   -e MVAA_INPUT_DIR=/input \

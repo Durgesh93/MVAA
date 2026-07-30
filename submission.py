@@ -8,22 +8,22 @@ Run with no args for an interactive menu, or invoke each step directly:
     python3 submission.py                    # interactive menu
     python3 submission.py create-vast         # 1. rent/reuse a vast.ai instance
     python3 submission.py delete-vast         # 2. destroy the instance on record
-    python3 submission.py stage-ckpt supervised [--version best|last|swa]  # 3. copy checkpoints into workspace/ckpts/
-    python3 submission.py sample-input        # 4. pull val cases from MVAA_nnUNET into input/
-    python3 submission.py push-docker         # 5. build zips + rsync to remote
-    python3 submission.py trigger-build [--push]  # 6. run workspace/docker.sh remotely
-    python3 submission.py pull-output         # 7. pull the remote output/ back as a zip
+    python3 submission.py setup supervised [--version best|last|swa]  # 3. stage input/ckpts/plans for a branch
+    python3 submission.py push-docker         # 4. build zips + rsync to remote
+    python3 submission.py trigger-build [--push]  # 5. run workspace/docker.sh remotely
+    python3 submission.py pull-output         # 6. pull the remote output/ back as a zip
 
-Steps are independent -- rerun just one as needed (workspace/ckpts/, input/,
-and zip/ all persist between runs). Connection details for the current
-vast.ai instance are remembered in .submission_state.json (gitignored, like
-config.json).
+Steps are independent -- rerun just one as needed (workspace/{ckpts,plans,
+input}/ and zip/ all persist between runs). Connection details for the
+current vast.ai instance are remembered in .submission_state.json
+(gitignored, like config.json).
 
 Artifacts, written under zip/ by push-docker:
     zip/submission.zip         -- uploaded to CodaBench (points at IMAGE;
                                    must match workspace/docker.sh's IMAGE_TAG)
-    zip/docker_<timestamp>.zip -- self-extracting archive of input/+workspace/,
-                                   also copied to workspace/submission.zip so
+    zip/docker_<timestamp>.zip -- self-extracting archive of workspace/
+                                   (input/ckpts/plans included), also
+                                   copied to workspace/submission.zip so
                                    it travels inside the archive
 
 The archive is a normal zip with a shell script prepended -- still
@@ -95,7 +95,7 @@ def error(message: str, emoji: str = "❌") -> None:
 IMAGE = "docker.io/durgesh1993/team_vi:final"
 TIMEOUT_SECONDS = 21600
 
-INCLUDE_DIRS = ["input", "workspace"]
+INCLUDE_DIRS = ["workspace"]
 
 EXCLUDE_DIR_NAMES = {"__pycache__", ".temp"}
 EXCLUDE_SUFFIXES = {".pyc"}
@@ -728,28 +728,30 @@ def destroy_vastai_instance(instance_id: str, config: dict) -> None:
 
 
 # ============================================================
-# Checkpoint staging (workspace/ckpts + workspace/plans) -- every branch
-# worktree symlinks dirs/data_storage at the same shared nnUNet_results/
-# nnUNet_preprocessed tree, keyed by branch name. run_inference.py loads
-# workspace/ckpts/<prefix>/model.ckpt per task, and NNUnetSetup builds the
-# network from workspace/plans/<dataset_id>/{nnUNetPlans,dataset}.json --
-# both must move together. Plans/dataset.json can legitimately differ
-# between checkpoints (e.g. a class added mid-project, or a checkpoint
-# trained elsewhere with a different config) with no copy saved alongside
-# the checkpoint itself to detect that from -- staging both from the same
-# source every time is what keeps workspace/plans in sync with whichever
-# checkpoint is active, instead of silently going stale.
+# Setup (workspace/{ckpts,plans,input}) -- one branch determines all three:
+# workspace/ckpts/<prefix>/model.ckpt (run_inference.py's checkpoint),
+# workspace/plans/<dataset_id>/{nnUNetPlans,dataset}.json (NNUnetSetup's
+# network config -- can legitimately differ from what's currently in
+# nnUNet_preprocessed, e.g. a class added mid-project, or a checkpoint
+# trained elsewhere with a different config, with no copy saved alongside
+# the checkpoint itself to detect that from), and workspace/input/ (a
+# small local sample to test against). Every branch worktree symlinks
+# dirs/data_storage at the same shared nnUNet_results/nnUNet_preprocessed
+# tree, keyed by branch name, so only a branch name is needed for all three.
 # ============================================================
 if "EXP_STORAGE_BASE" not in os.environ:
     raise EnvironmentError("EXP_STORAGE_BASE is not set -- source envs/workspace/platforms/<platform>/main.sh first.")
 NNUNET_DATA_DIR = Path(os.environ["EXP_STORAGE_BASE"]) / "data" / "nnUNet"
 NNUNET_RESULTS_DIR = NNUNET_DATA_DIR / "nnUNet_results"
 NNUNET_PREPROCESSED_DIR = NNUNET_DATA_DIR / "nnUNet_preprocessed"
+REFERENCE_DATA_DIR = NNUNET_DATA_DIR / "MVAA_nnUNET" / "reference_data"
 CKPTS_DIR = WORKSPACE_DIR / "ckpts"
 PLANS_DIR = WORKSPACE_DIR / "plans"
+INPUT_DIR = WORKSPACE_DIR / "input"
 
 CKPT_PLANS_IDENTIFIER = "nnUNetPlans"
 CKPT_FOLD = "all"
+SAMPLE_VAL_CASES = 3
 
 # task -> (dataset_id, configuration, prefix), same across every branch.
 CKPT_TASKS = {
@@ -757,6 +759,10 @@ CKPT_TASKS = {
     "tee": ("Dataset002_MVAA_TEE_SSL", "3d_fullres", "t2_tee"),
     "video": ("Dataset003_MVAA_VIDEO_SSL", "2d", "t3_vid"),
 }
+
+
+def list_available_branches() -> list[str]:
+    return sorted(p.name for p in NNUNET_RESULTS_DIR.iterdir() if p.is_dir())
 
 
 def _resolve_ckpt_file(checkpoint_dir: Path, version: str) -> Path:
@@ -793,39 +799,6 @@ def _stage_plans(dataset_id: str) -> None:
         shutil.copy2(src, dest)
 
 
-def stage_ckpt_action(branch: str, version: str = "best") -> None:
-    branch_dir = NNUNET_RESULTS_DIR / branch
-    if not branch_dir.is_dir():
-        available = ", ".join(sorted(p.name for p in NNUNET_RESULTS_DIR.iterdir() if p.is_dir()))
-        raise FileNotFoundError(f"Unknown branch '{branch}' under {NNUNET_RESULTS_DIR}. Available: {available}")
-
-    for task, (dataset_id, configuration, prefix) in CKPT_TASKS.items():
-        checkpoint_dir = (
-            branch_dir / dataset_id / f"{CKPT_PLANS_IDENTIFIER}__{configuration}" / f"fold_{CKPT_FOLD}" / "checkpoints"
-        )
-        ckpt_path = _resolve_ckpt_file(checkpoint_dir, version)
-
-        dest_dir = CKPTS_DIR / prefix
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest_path = dest_dir / "model.ckpt"
-
-        info(f"[{task}] {ckpt_path} -> {dest_path}", "💾")
-        shutil.copy2(ckpt_path, dest_path)
-
-        _stage_plans(dataset_id)
-
-
-# ============================================================
-# Sample input/ (local docker.sh testing) -- MVAA_nnUNET/reference_data
-# holds the same train/val split used to build nnUNet_raw, so pulling the
-# first N sorted val cases per task reproduces the fixed sample already
-# checked in under input/ (case IDs sort in the same order they were
-# originally picked in).
-# ============================================================
-REFERENCE_DATA_DIR = NNUNET_DATA_DIR / "MVAA_nnUNET" / "reference_data"
-SAMPLE_VAL_CASES = 3
-
-
 def _stage_sample_volumes(task_dir: str, prefix: str) -> None:
     # Copied under their own original filename -- discover_cases (see
     # workspace/datamodule/inference_dataset.py) accepts any *.nii.gz name,
@@ -835,7 +808,7 @@ def _stage_sample_volumes(task_dir: str, prefix: str) -> None:
     if not cases:
         raise FileNotFoundError(f"No validation cases found in {src_dir}")
 
-    dest_dir = INFERENCE_DIR / "input" / prefix
+    dest_dir = INPUT_DIR / prefix
     dest_dir.mkdir(parents=True, exist_ok=True)
     for case in cases:
         dest = dest_dir / case.name
@@ -854,7 +827,7 @@ def _stage_sample_video() -> None:
     if not frames:
         raise FileNotFoundError(f"No frames found in {recording}")
 
-    dest_dir = INFERENCE_DIR / "input" / "t3_vid" / recording.name
+    dest_dir = INPUT_DIR / "t3_vid" / recording.name
     dest_dir.mkdir(parents=True, exist_ok=True)
     for frame in frames:
         dest = dest_dir / frame.name
@@ -862,15 +835,36 @@ def _stage_sample_video() -> None:
         shutil.copy2(frame, dest)
 
 
-def sample_input_action() -> None:
+def setup_action(branch: str, version: str = "best") -> None:
+    branch_dir = NNUNET_RESULTS_DIR / branch
+    if not branch_dir.is_dir():
+        available = ", ".join(list_available_branches())
+        raise FileNotFoundError(f"Unknown branch '{branch}' under {NNUNET_RESULTS_DIR}. Available: {available}")
+
+    for task, (dataset_id, configuration, prefix) in CKPT_TASKS.items():
+        checkpoint_dir = (
+            branch_dir / dataset_id / f"{CKPT_PLANS_IDENTIFIER}__{configuration}" / f"fold_{CKPT_FOLD}" / "checkpoints"
+        )
+        ckpt_path = _resolve_ckpt_file(checkpoint_dir, version)
+
+        dest_dir = CKPTS_DIR / prefix
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / "model.ckpt"
+
+        info(f"[{task}] {ckpt_path} -> {dest_path}", "💾")
+        shutil.copy2(ckpt_path, dest_path)
+
+        _stage_plans(dataset_id)
+
     _stage_sample_volumes("t1_ct", "t1_ct")
     _stage_sample_volumes("t2_tee", "t2_tee")
     _stage_sample_video()
-    success(f"input/ ready with {SAMPLE_VAL_CASES} sample val cases per task", "🧪")
+
+    success(f"'{branch}' ({version}) staged: workspace/{{ckpts,plans,input}}/ ready", "🧪")
 
 
 # ============================================================
-# The 7 actions, callable directly (menu) or via typer (CLI)
+# The 6 actions, callable directly (menu) or via typer (CLI)
 # ============================================================
 def create_vast_action(config: dict) -> dict:
     if not config.get("vast_api_key"):
@@ -954,22 +948,35 @@ def _ask_yes_no(prompt: str, default: bool = False) -> bool:
     return answer in ("y", "yes")
 
 
+def _prompt_branch() -> str:
+    # Suggestions generated dynamically (not a fixed list) -- straight from
+    # NNUNET_RESULTS_DIR, so it always reflects whatever branches actually
+    # exist right now.
+    branches = list_available_branches()
+    table = Table(box=box.ROUNDED, show_header=False, padding=(0, 1, 0, 1), expand=False)
+    table.add_column("branch", style="bold cyan")
+    for b in branches:
+        table.add_row(b)
+    console.print(Panel(table, title="[bold]Available branches[/]", border_style="cyan", box=box.ROUNDED))
+
+    return console.input("[bold cyan]?[/] Branch name: ").strip()
+
+
 def interactive_menu() -> None:
     menu = [
         ("1", "🚀", "Create vast.ai instance", lambda: create_vast_action(load_machine_config())),
         ("2", "💥", "Delete vast.ai instance", lambda: delete_vast_action(load_machine_config())),
         (
             "3",
-            "💾",
-            "Stage checkpoints (copy a branch's checkpoints into workspace/ckpts)",
-            lambda: stage_ckpt_action(
-                console.input("[bold cyan]?[/] Branch name (e.g. supervised, ssl, ssl_pretrain): ").strip(),
+            "🧪",
+            "Setup (stage a branch's checkpoints, plans, and sample input)",
+            lambda: setup_action(
+                _prompt_branch(),
                 console.input("[bold cyan]?[/] Version [dim]\\[best/last/swa, default best][/]: ").strip() or "best",
             ),
         ),
-        ("4", "🧪", "Create sample input (pull val cases from MVAA_nnUNET)", lambda: sample_input_action()),
         (
-            "5",
+            "4",
             "📦",
             "Push docker (build zips + rsync archive to remote)",
             lambda: push_docker_action(
@@ -977,14 +984,14 @@ def interactive_menu() -> None:
             ),
         ),
         (
-            "6",
+            "5",
             "▶️ ",
             "Trigger build (run workspace/docker.sh on remote)",
             lambda: trigger_build_action(
                 load_machine_config(), push=_ask_yes_no("Also push image to Docker Hub?")
             ),
         ),
-        ("7", "📥", "Pull output (fetch remote output/ as a local zip)", lambda: pull_output_action(load_machine_config())),
+        ("6", "📥", "Pull output (fetch remote output/ as a local zip)", lambda: pull_output_action(load_machine_config())),
     ]
 
     while True:
@@ -1048,26 +1055,20 @@ def delete_vast_cmd() -> None:
     _guarded(delete_vast_action, load_machine_config())
 
 
-@app.command("stage-ckpt")
-def stage_ckpt_cmd(
-    branch: str = typer.Argument(..., help="nnUNet_results subfolder name, e.g. supervised, ssl, ssl_pretrain"),
+@app.command("setup")
+def setup_cmd(
+    branch: str = typer.Argument(None, help="nnUNet_results subfolder name -- omit to pick from a live list."),
     version: str = typer.Option("best", "--version", help="Which checkpoint to use: best, last, or swa."),
 ) -> None:
-    """💾 3. Copy a branch's trained checkpoints into workspace/ckpts/ (run before push-docker)."""
-    _guarded(stage_ckpt_action, branch, version)
-
-
-@app.command("sample-input")
-def sample_input_cmd() -> None:
-    """🧪 4. Pull a small sample of val cases from MVAA_nnUNET into input/ for local docker.sh testing."""
-    _guarded(sample_input_action)
+    """🧪 3. Stage a branch's checkpoints, plans, and sample input (workspace/{ckpts,plans,input}/)."""
+    _guarded(setup_action, branch or _prompt_branch(), version)
 
 
 @app.command("push-docker")
 def push_docker_cmd(
     clean_zip: bool = typer.Option(False, "--clean-zip", help="Delete old zip/ contents first."),
 ) -> None:
-    """📦 5. Build submission.zip + the docker build archive, and rsync it to the remote machine."""
+    """📦 4. Build submission.zip + the docker build archive, and rsync it to the remote machine."""
     _guarded(push_docker_action, load_machine_config(), clean_zip=clean_zip)
 
 
@@ -1075,19 +1076,19 @@ def push_docker_cmd(
 def trigger_build_cmd(
     push: bool = typer.Option(False, "--push", help="Also push the built image to Docker Hub."),
 ) -> None:
-    """▶️  6. Run workspace/docker.sh on the remote machine against the last pushed archive."""
+    """▶️  5. Run workspace/docker.sh on the remote machine against the last pushed archive."""
     _guarded(trigger_build_action, load_machine_config(), push=push)
 
 
 @app.command("pull-output")
 def pull_output_cmd() -> None:
-    """📥 7. Zip the remote output/ dir and pull it back to zip/output_docker_<timestamp>.zip."""
+    """📥 6. Zip the remote output/ dir and pull it back to zip/output_docker_<timestamp>.zip."""
     _guarded(pull_output_action, load_machine_config())
 
 
 if __name__ == "__main__":
     # `--tunnel` is this script re-invoking itself as an SSH ProxyCommand --
-    # intercept before typer ever sees argv (not one of the 7 subcommands).
+    # intercept before typer ever sees argv (not one of the 6 subcommands).
     if len(sys.argv) > 1 and sys.argv[1] == "--tunnel":
         _, target_host, target_port, proxy_host, proxy_port = sys.argv[1:6]
         run_tunnel(target_host, target_port, proxy_host, int(proxy_port))

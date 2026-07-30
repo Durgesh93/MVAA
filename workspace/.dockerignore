@@ -1,5 +1,8 @@
 # Local dev-only test data -- not part of the submission image (the
-# runner mounts /input and /output itself; see run_inference.py).
+# runner mounts /input and /output itself; see run_inference.py). input/
+# only lives under workspace/ (this build context) for local docker.sh
+# testing -- see submission.py's setup_action.
+input/
 .temp/
 
 Dockerfile
