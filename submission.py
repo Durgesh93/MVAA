@@ -728,15 +728,25 @@ def destroy_vastai_instance(instance_id: str, config: dict) -> None:
 
 
 # ============================================================
-# Checkpoint staging (workspace/ckpts) -- every branch worktree symlinks
-# dirs/data_storage at the same shared nnUNet_results tree, keyed by branch
-# name. run_inference.py loads workspace/ckpts/<prefix>/model.ckpt per task.
+# Checkpoint staging (workspace/ckpts + workspace/plans) -- every branch
+# worktree symlinks dirs/data_storage at the same shared nnUNet_results/
+# nnUNet_preprocessed tree, keyed by branch name. run_inference.py loads
+# workspace/ckpts/<prefix>/model.ckpt per task, and NNUnetSetup builds the
+# network from workspace/plans/<dataset_id>/{nnUNetPlans,dataset}.json --
+# both must move together. Plans/dataset.json can legitimately differ
+# between checkpoints (e.g. a class added mid-project, or a checkpoint
+# trained elsewhere with a different config) with no copy saved alongside
+# the checkpoint itself to detect that from -- staging both from the same
+# source every time is what keeps workspace/plans in sync with whichever
+# checkpoint is active, instead of silently going stale.
 # ============================================================
 if "EXP_STORAGE_BASE" not in os.environ:
     raise EnvironmentError("EXP_STORAGE_BASE is not set -- source envs/workspace/platforms/<platform>/main.sh first.")
 NNUNET_DATA_DIR = Path(os.environ["EXP_STORAGE_BASE"]) / "data" / "nnUNet"
 NNUNET_RESULTS_DIR = NNUNET_DATA_DIR / "nnUNet_results"
+NNUNET_PREPROCESSED_DIR = NNUNET_DATA_DIR / "nnUNet_preprocessed"
 CKPTS_DIR = WORKSPACE_DIR / "ckpts"
+PLANS_DIR = WORKSPACE_DIR / "plans"
 
 CKPT_PLANS_IDENTIFIER = "nnUNetPlans"
 CKPT_FOLD = "all"
@@ -769,6 +779,20 @@ def _resolve_ckpt_file(checkpoint_dir: Path, version: str) -> Path:
     return best_ckpts[0]
 
 
+def _stage_plans(dataset_id: str) -> None:
+    src_dir = NNUNET_PREPROCESSED_DIR / dataset_id
+    dest_dir = PLANS_DIR / dataset_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    for name in ("nnUNetPlans.json", "dataset.json"):
+        src = src_dir / name
+        if not src.is_file():
+            raise FileNotFoundError(f"Missing {src} -- can't stage plans for {dataset_id}")
+        dest = dest_dir / name
+        info(f"[{dataset_id}] {src} -> {dest}", "📐")
+        shutil.copy2(src, dest)
+
+
 def stage_ckpt_action(branch: str, version: str = "best") -> None:
     branch_dir = NNUNET_RESULTS_DIR / branch
     if not branch_dir.is_dir():
@@ -787,6 +811,8 @@ def stage_ckpt_action(branch: str, version: str = "best") -> None:
 
         info(f"[{task}] {ckpt_path} -> {dest_path}", "💾")
         shutil.copy2(ckpt_path, dest_path)
+
+        _stage_plans(dataset_id)
 
 
 # ============================================================
