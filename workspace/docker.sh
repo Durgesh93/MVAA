@@ -22,18 +22,26 @@ if [ "${1:-}" = "--push" ]; then
 fi
 
 # Some vast.ai hosts transparently MITM Docker Hub's TLS with their own
-# cert (confirmed via `getent hosts` resolving to a private 192.168.x.x
-# address -- a bandwidth-saving pull cache, not something in this VM's own
-# config). `insecure-registries` doesn't bypass this, and the proxy never
-# sends its own root CA, only its leaf cert -- so capture each hostname's
-# current leaf cert and trust it directly (exact-match trust doesn't need
-# a root). Harmless if a host isn't intercepting -- this just captures the
-# real cert instead.
-for h in registry-1.docker.io auth.docker.io index.docker.io; do
-  echo | openssl s_client -connect "$h:443" -servername "$h" 2>/dev/null \
-    | openssl x509 | sudo tee "/usr/local/share/ca-certificates/vast-proxy-$h.crt" >/dev/null
-done
-sudo update-ca-certificates
+# proxy cert (a bandwidth-saving pull cache, not something in this VM's own
+# config). Pinning the intercepted leaf cert (the previous approach here)
+# turned out unreliable: the proxy is load-balanced across nodes that each
+# mint their own leaf, so the cert captured a moment ago isn't necessarily
+# the one presented on the next connection -- confirmed by querying the
+# same host twice a few minutes apart and getting different fingerprints.
+# insecure-registries sidesteps this by skipping cert verification for
+# just these hosts; harmless if a host isn't intercepting at all, since a
+# real cert still connects fine either way.
+sudo python3 - <<'PYEOF'
+import json
+path = "/etc/docker/daemon.json"
+try:
+    config = json.load(open(path))
+except (FileNotFoundError, json.JSONDecodeError):
+    config = {}
+hosts = ["registry-1.docker.io", "auth.docker.io", "index.docker.io"]
+config["insecure-registries"] = sorted(set(config.get("insecure-registries", [])) | set(hosts))
+json.dump(config, open(path, "w"), indent=2)
+PYEOF
 
 sudo apt install -y nvidia-container-toolkit
 sudo nvidia-ctk runtime configure --runtime=docker

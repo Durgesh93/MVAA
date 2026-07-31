@@ -7,15 +7,14 @@
     "labels": {
         "background": 0,
         "class_10": 1,
-        "class_11": 2,
-        "equipment": 3
+        "class_11": 2
     },
-    "numTraining": 1544,
+    "numTraining": 1534,
     "file_ending": ".nii.gz",
     "name": "Dataset003_MVAA_VIDEO_SSL",
-    "description": "MVAA semi-supervised nnU-Net dataset. TrL has real masks. TrU has dummy zero masks. Task 3 VIDEO RGB multi-class dataset (task labels 10, 11; auxiliary label 2).",
+    "description": "MVAA semi-supervised nnU-Net dataset. TrL has real masks. TrU has dummy zero masks. Task 3 VIDEO RGB multi-class dataset (labels 10 and 11).",
     "ssl_counts": {
-        "TrL": 117,
+        "TrL": 107,
         "TrU": 1427,
         "Ts": 48
     },
@@ -127,7 +126,9 @@
             "0103",
             "0104",
             "0105",
-            "0106",
+            "0106"
+        ],
+        "TrU": [
             "0107",
             "0108",
             "0109",
@@ -137,9 +138,7 @@
             "0113",
             "0114",
             "0115",
-            "0116"
-        ],
-        "TrU": [
+            "0116",
             "0117",
             "0118",
             "0119",
@@ -1556,17 +1555,7 @@
             "1530",
             "1531",
             "1532",
-            "1533",
-            "1534",
-            "1535",
-            "1536",
-            "1537",
-            "1538",
-            "1539",
-            "1540",
-            "1541",
-            "1542",
-            "1543"
+            "1533"
         ],
         "Ts": [
             "REC_20250428_101313_571A_000190",

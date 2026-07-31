@@ -6,14 +6,13 @@ write_video_rgb_image_as_nnunet_channels (same RGB-split and
 orientation-normalize logic) without the full data-prep pipeline. Temp
 channel files go to work_dir and are safe to discard after preprocessing.
 
-ASSUMPTION, not yet verified against the real hidden test set: /input's
-video task is raw per-frame PNGs grouped one subfolder per recording
-(mirroring /output's REC_xxx/ convention) -- confirmed as PNG per
-data_task3_VIDEO_nnunet.py's collect_video_files, but the nii.gz-per-channel
-form is only how *our own* training pipeline stores it after conversion,
-not necessarily how the organizers hand us raw frames.
+Which case_id maps to which PNG is resolved from test_cases.json (the
+submission contract's manifest), not by walking the directory -- so the
+on-disk layout underneath image_folder (e.g. one subfolder per recording)
+only has to match whatever relative paths the manifest itself points at.
 """
 
+import json
 from pathlib import Path
 
 import nibabel as nib
@@ -63,19 +62,35 @@ def write_frame_as_nnunet_channels(png_path, case_id, work_dir):
 
 def discover_video_frames(image_folder):
     """
-    Map each case_id to its source PNG path, one per REC_xxx/ recording
-    subfolder. case_id is '<rec_id>_<frame_stem>' unless the frame's own
-    filename already starts with the recording id.
+    Map each case_id to its source PNG path plus its output subfolder, per
+    the official submission contract's test_cases.json manifest:
+        {"cases": [{"case_id": ..., "image": "relative/path"}, ...]}
+    "image" is resolved relative to image_folder's parent (/input itself),
+    not to image_folder (/input/<prefix>) -- confirmed against a real
+    failed hidden-test run (Task 1, same manifest format) whose error
+    showed a doubled .../t1_ct/t1_ct/... path when "image" was joined onto
+    image_folder directly, meaning "image" already carries the <prefix>/
+    segment (e.g. "t3_vid/REC_xxx/frame.png").
+
+    output_subdir strips that same leading <prefix>/ segment before
+    carrying the rest (e.g. "REC_xxx") along, so mirroring it under
+    /output/<prefix>/ doesn't double it up the same way on the output side.
     """
     image_folder = Path(image_folder)
+    manifest_path = image_folder / "test_cases.json"
+
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Missing test_cases.json manifest: {manifest_path}")
+
+    manifest = json.loads(manifest_path.read_text())
+
+    input_root = image_folder.parent
+    prefix = image_folder.name
 
     frames = {}
-
-    for rec_dir in sorted(p for p in image_folder.iterdir() if p.is_dir()):
-        for png_path in sorted(rec_dir.glob("*.png")):
-            stem = png_path.stem
-            case_id = stem if stem.startswith(rec_dir.name) else f"{rec_dir.name}_{stem}"
-
-            frames[case_id] = png_path
+    for entry in manifest["cases"]:
+        image_rel = Path(entry["image"])
+        within_task = image_rel.relative_to(prefix) if image_rel.parts[:1] == (prefix,) else image_rel
+        frames[entry["case_id"]] = {"path": input_root / image_rel, "output_subdir": within_task.parent}
 
     return frames

@@ -8,7 +8,6 @@ plotting, DDP rank merging, etc.), none of which inference ever calls.
 
 import json
 import os
-import re
 from pathlib import Path
 import numpy as np
 import torch
@@ -139,16 +138,25 @@ def write_submission_prediction(
     """
     Write one predict_step output in rank-local submission format.
 
-    Supported output:
-        <case_id>-pred.nii.gz
-        <case_id>_label_bin.png
+    Supported output (matching the organizer's documented example filenames):
+        <case_id>_pred.nii.gz
+        <case_id>_pred.png
 
     PNG is only allowed for 2D nnU-Net predictions.
+
+    If prediction["output_subdir"] is set (video: the manifest's own
+    "image" parent folder, e.g. a recording id -- see
+    datamodule/video_source.py), the file is written under that subfolder
+    of output_folder instead of directly inside it, mirroring the input's
+    own grouping rather than guessing it from case_id.
     """
 
     case_id = prediction["case_id"]
 
     output_folder = Path(output_folder)
+    output_subdir = prediction.get("output_subdir")
+    if output_subdir is not None and str(output_subdir) not in ("", "."):
+        output_folder = output_folder / output_subdir
     output_folder.mkdir(parents=True, exist_ok=True)
 
     output_format = str(output_format).lower().lstrip(".")
@@ -198,9 +206,9 @@ def write_submission_prediction(
         else:
             raise ValueError(f"Unsupported nnU-Net plan dimension: {configuration_manager.patch_size}")
 
-        pred_file = output_folder / f"{case_id}-pred{file_ending}"
+        pred_file = output_folder / f"{case_id}_pred{file_ending}"
 
-        tmp_pred_file = output_folder / (f"{case_id}-pred.tmp_{os.getpid()}{file_ending}")
+        tmp_pred_file = output_folder / (f"{case_id}_pred.tmp_{os.getpid()}{file_ending}")
 
         sitk_stuff = prediction["properties"]["sitk_stuff"]
 
@@ -243,9 +251,9 @@ def write_submission_prediction(
 
                 rgb[segmentation == class_value] = tuple(int(round(c * 255)) for c in color)
 
-            pred_file = output_folder / f"{case_id}_label_bin.png"
+            pred_file = output_folder / f"{case_id}_pred.png"
 
-            tmp_pred_file = output_folder / (f"{case_id}_label_bin.tmp_{os.getpid()}.png")
+            tmp_pred_file = output_folder / (f"{case_id}_pred.tmp_{os.getpid()}.png")
 
             segmentation_io.write_png(rgb, tmp_pred_file)
 
@@ -268,9 +276,9 @@ def write_submission_prediction(
         else:
             raise ValueError(f"PNG writer expects [H, W] or [1, H, W], got {segmentation.shape}")
 
-        pred_file = output_folder / f"{case_id}_label_bin.png"
+        pred_file = output_folder / f"{case_id}_pred.png"
 
-        tmp_pred_file = output_folder / (f"{case_id}_label_bin.tmp_{os.getpid()}.png")
+        tmp_pred_file = output_folder / (f"{case_id}_pred.tmp_{os.getpid()}.png")
 
         segmentation_io.write_png(segmentation[0], tmp_pred_file)
 
@@ -282,10 +290,6 @@ def write_submission_prediction(
 # =============================================================================
 # Inference entrypoint helpers (run_inference.py)
 # =============================================================================
-
-VIDEO_CASE_ID_PATTERN = re.compile(r"^(?P<video_id>.+)_(?P<frame>\d{6})$")
-NIFTI_SUBMISSION_SUFFIX = "-pred.nii.gz"
-VIDEO_SUBMISSION_SUFFIX = "_label_bin.png"
 
 
 def load_task_cfg(task):
@@ -309,55 +313,27 @@ def load_checkpoint(module, ckpt_path: Path) -> None:
     module.load_state_dict(state_dict)
 
 
-def build_prediction_entry(pred_file: Path):
+def write_predictions_json(pred_entries, task_output_dir: Path, task_id: str) -> Path:
     """
-    Return (case_id, relative_path) for one written prediction file, moving
-    video frames under a <video_id>/ subfolder to match the contract's
-    layout (t3_vid/<video_id>/<frame>_label_bin.png).
+    pred_entries: iterable of (case_id, pred_file) -- case_id is the
+    official, organizer-supplied id (see datamodule/inference_dataset.py's
+    discover_cases/discover_video_frames), carried through as-is rather
+    than re-derived from the written filename, so it's preserved exactly
+    regardless of its shape.
     """
 
-    name = pred_file.name
-
-    if name.endswith(VIDEO_SUBMISSION_SUFFIX):
-        case_id = name[: -len(VIDEO_SUBMISSION_SUFFIX)]
-
-        match = VIDEO_CASE_ID_PATTERN.match(case_id)
-
-        if match is None:
-            raise ValueError(f"Video case_id does not match '<video_id>_<6-digit frame>' pattern: {case_id}")
-
-        video_id = match.group("video_id")
-
-        video_dir = pred_file.parent / video_id
-        video_dir.mkdir(parents=True, exist_ok=True)
-
-        moved = video_dir / name
-        pred_file.replace(moved)
-
-        return case_id, f"{video_id}/{name}"
-
-    if name.endswith(NIFTI_SUBMISSION_SUFFIX):
-        case_id = name[: -len(NIFTI_SUBMISSION_SUFFIX)]
-
-        return case_id, name
-
-    raise ValueError(f"Unrecognized prediction file name: {name}")
-
-
-def write_predictions_json(pred_files, task_output_dir: Path, task_id: str) -> Path:
+    task_output_dir = Path(task_output_dir)
     cases = []
 
-    for pred_file in pred_files:
-        case_id, relative_path = build_prediction_entry(pred_file)
-
-        relative = Path(relative_path)
+    for case_id, pred_file in pred_entries:
+        relative = Path(pred_file).relative_to(task_output_dir)
 
         if relative.is_absolute() or ".." in relative.parts:
-            raise ValueError(f"Unsafe segmentation path: {relative_path}")
+            raise ValueError(f"Unsafe segmentation path: {relative}")
 
-        cases.append({"case_id": case_id, "segmentation": relative_path})
+        cases.append({"case_id": case_id, "segmentation": relative.as_posix()})
 
-    json_path = Path(task_output_dir) / f"{task_id}_predictions.json"
+    json_path = task_output_dir / f"{task_id}_predictions.json"
     json_path.write_text(json.dumps({"cases": sorted(cases, key=lambda c: c["case_id"])}, indent=2))
 
     return json_path

@@ -5,9 +5,11 @@ Builds the network + prediction ops via NNUnetSetup (module/nnunet.py --
 static, shared as-is across the SSL family, see that file's docstring).
 predict_step writes each case's mask directly rather than accumulating
 trainer.predict()'s return values (which would hold every case's
-full-resolution volume/logits in memory at once), and records the written
-path -- turning that into a task*_predictions.json entry is
-run_inference.py's job, not this class's.
+full-resolution volume/logits in memory at once), and records
+(case_id, written_path) -- case_id is the official, organizer-supplied id
+carried straight from the batch, not re-derived from the filename later.
+Turning that into a task*_predictions.json entry is run_inference.py's
+job, not this class's.
 """
 
 from pathlib import Path
@@ -58,4 +60,4 @@ class InferenceLightningModule(L.LightningModule):
             output_format=self.submission_output_format,
         )
 
-        self.pred_files.append(Path(pred_file))
+        self.pred_files.append((prediction["case_id"], Path(pred_file)))

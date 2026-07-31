@@ -15,8 +15,14 @@ Run with no args for an interactive menu, or invoke each step directly:
 
 Steps are independent -- rerun just one as needed (workspace/{ckpts,plans,
 input}/ and zip/ all persist between runs). Connection details for the
-current vast.ai instance are remembered in .submission_state.json
-(gitignored, like config.json).
+current vast.ai instance are remembered in both config.json's own "vast"
+field (durable, survives a stale/rotated instance since it's what
+resolve_connection_config reads first) and .submission_state.json
+(gitignored, auto-managed "last known" bookkeeping used as a fallback).
+create-vast checks config.json's recorded instance id first and reuses it
+(re-fetching host/port fresh, in case those rotated) if it's still
+running -- only searching/renting a new one if it isn't. No separate
+command or instance-id flag needed to reconnect.
 
 Artifacts, written under zip/ by push-docker:
     zip/submission.zip         -- uploaded to CodaBench (points at IMAGE;
@@ -43,6 +49,10 @@ config.json fields:
     docker_password               -- optional, enables deleting the old Docker Hub tag first
     vast_api_key                  -- switches to renting a vast.ai instance
     vast_query, vast_image, vast_disk_gb, vast_min_cuda -- optional vast.ai tuning
+    vast                          -- {instance_id, host, port, user} of the current
+                                      instance; written by create-vast, but can also
+                                      be hand-edited/pasted in directly -- create-vast
+                                      reuses instance_id if it's still running
 """
 
 import concurrent.futures
@@ -314,12 +324,28 @@ def save_state(**updates) -> None:
     STATE_PATH.write_text(json.dumps(state, indent=2))
 
 
+def save_config_vast(vast: dict | None) -> None:
+    # Mirrors the resolved instance into config.json itself (durable,
+    # user-editable) rather than only .submission_state.json (gitignored,
+    # auto-managed "last known" bookkeeping) -- so a specific instance can
+    # be pinned by hand-editing config.json too, and survives independent
+    # of whatever push-docker/trigger-build last recorded. vast=None clears it.
+    config = json.loads(CONFIG_PATH.read_text())
+    if vast is None:
+        config.pop("vast", None)
+    else:
+        config["vast"] = vast
+    CONFIG_PATH.write_text(json.dumps(config, indent=2))
+
+
 def resolve_connection_config(config: dict) -> dict:
-    # vast.ai: host/port/user come from create-vast's last recorded instance instead.
+    # vast.ai: host/port/user come from config.json's own "vast" block if
+    # present (set by create-vast), else .submission_state.json's last
+    # recorded instance.
     if not config.get("vast_api_key"):
         return config
 
-    vast = load_state().get("vast")
+    vast = config.get("vast") or load_state().get("vast")
     if not vast:
         raise RuntimeError("No vast.ai instance on record -- run create-vast first.")
     return {**config, **vast}
@@ -580,33 +606,54 @@ def _vastai_run(args: list[str], config: dict, **kwargs) -> subprocess.Completed
     return subprocess.run(["vastai", *args], env=_vastai_env(config), text=True, **kwargs)
 
 
-def find_vastai_offer(config: dict) -> dict:
+def _default_vastai_queries(config: dict) -> list[str]:
     # cuda_max_good: highest CUDA a host's driver supports -- no upper bound
     # needed (driver backward compat covers the pinned cu124 image), but it
     # doesn't constrain GPU compute capability (a Blackwell/sm_120 host would
     # still have no kernels for cu124, regardless of driver version).
     # gpu_ram>=24: stand-in for "4090-class or better" (no direct GPU-tier field).
-    # vms_enabled=true: required for vastai/kvm's VM image to boot at all.
-    # reliability/inet_down: rule out flaky/slow hosts -- the cheapest options
-    # otherwise tend to hang forever pulling the ~4.8GB VM image on first boot.
-    # dlperf>=100: floor on actual compute, not just VRAM/driver/network.
+    # vms_enabled=true: required for vastai/kvm's VM image to boot at all --
+    # never relaxed, unlike every other filter below.
     min_cuda = config.get("vast_min_cuda", VASTAI_DEFAULT_MIN_CUDA)
     min_reliability = config.get("vast_min_reliability", 0.95)
     min_inet_down = config.get("vast_min_inet_down", 100)
     min_dlperf = config.get("vast_min_dlperf", 100)
-    query = config.get(
-        "vast_query",
-        f"cuda_max_good>={min_cuda} gpu_ram>=24 num_gpus=1 rentable=true verified=true "
-        f"vms_enabled=true reliability>{min_reliability} inet_down>{min_inet_down} "
-        f"dlperf>={min_dlperf}",
-    )
-    info(f"Searching vast.ai offers: {query}", "🔍")
-    result = _vastai_run(["search", "offers", query, "--raw"], config, capture_output=True, check=True)
-    offers = json.loads(result.stdout)
+    base = f"cuda_max_good>={min_cuda} gpu_ram>=24 num_gpus=1 rentable=true vms_enabled=true"
+
+    # Tried strictest-first, each step dropping one filter -- on the live
+    # market a hard dlperf>=100 alone excludes most single RTX 4090 offers
+    # (they benchmark ~97-99 on vast.ai's own scale), so combined with
+    # verified/reliability/inet_down the strict query routinely narrows
+    # down to 0-1 candidates. Falling through to a looser step is always
+    # logged, never silent.
+    return [
+        f"{base} verified=true reliability>{min_reliability} inet_down>{min_inet_down} dlperf>={min_dlperf}",
+        f"{base} reliability>{min_reliability} inet_down>{min_inet_down} dlperf>={min_dlperf / 2}",
+        f"{base} reliability>0.9",
+        base,
+    ]
+
+
+def find_vastai_offer(config: dict) -> dict:
+    # An explicit vast_query in config.json is taken as-is, no broadening --
+    # the user already said exactly what they want.
+    queries = [config["vast_query"]] if "vast_query" in config else _default_vastai_queries(config)
+
+    offers = []
+    for step, query in enumerate(queries):
+        if step > 0:
+            warn(f"No offers matched -- broadening search (step {step + 1}/{len(queries)})", "🔍")
+        info(f"Searching vast.ai offers: {query}", "🔍")
+        result = _vastai_run(["search", "offers", query, "--raw"], config, capture_output=True, check=True)
+        offers = json.loads(result.stdout)
+        if offers:
+            break
+
+    if not offers:
+        raise RuntimeError(f"No vast.ai offers matched any query, last tried: {queries[-1]}")
+
     # Sort explicitly by price rather than trusting the CLI's -o sort-flag semantics.
     offers.sort(key=lambda o: o.get("dph_total", float("inf")))
-    if not offers:
-        raise RuntimeError(f"No vast.ai offers matched: {query}")
 
     offer = offers[0]
     success(
@@ -625,7 +672,11 @@ def find_existing_vastai_instance(config: dict) -> str | None:
     for inst in instances:
         if inst.get("label") != VASTAI_LABEL:
             continue
-        status = inst.get("actual_status") or inst.get("status")
+        # cur_state is what's actually populated for an already-settled
+        # instance on this vastai CLI version -- actual_status/status come
+        # back null once an instance isn't fresh from creation, even
+        # though it's genuinely running (confirmed empirically).
+        status = inst.get("cur_state") or inst.get("actual_status") or inst.get("status")
         if status in ("running", "loading"):
             instance_id = str(inst["id"])
             info(f"Reusing existing vast.ai instance {instance_id} (status={status})", "♻️ ")
@@ -667,9 +718,16 @@ def wait_for_vastai_instance(instance_id: str, config: dict, timeout_s: int = 90
     deadline = time.time() + timeout_s
 
     while time.time() < deadline:
-        result = _vastai_run(["show", "instance", instance_id, "--raw"], config, capture_output=True, check=True)
-        instance_info = json.loads(result.stdout)
-        status = instance_info.get("actual_status") or instance_info.get("status")
+        # `show instance <id>` (singular) returns actual_status/status/
+        # cur_state all null on this vastai CLI version -- `show instances`
+        # (plural) reliably populates cur_state instead, so poll that and
+        # filter client-side (same approach as find_existing_vastai_instance).
+        result = _vastai_run(["show", "instances", "--raw"], config, capture_output=True, check=True)
+        instances = json.loads(result.stdout)
+        instance_info = next((inst for inst in instances if str(inst.get("id")) == str(instance_id)), None)
+        status = None
+        if instance_info is not None:
+            status = instance_info.get("cur_state") or instance_info.get("actual_status") or instance_info.get("status")
 
         if status == "running":
             success(f"Instance {instance_id} is running", "🟢")
@@ -759,6 +817,19 @@ def list_available_branches() -> list[str]:
     return sorted(p.name for p in NNUNET_RESULTS_DIR.iterdir() if p.is_dir())
 
 
+def list_git_branches() -> list[str]:
+    # Worktrees share one .git, so this lists every branch across all of
+    # them (main, ssl, ssl_pretrain, ...), not just this worktree's own --
+    # a branch can exist here before it has any staged nnUNet_results.
+    result = subprocess.run(
+        ["git", "-C", str(INFERENCE_DIR), "branch", "--list", "--format=%(refname:short)"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
+
+
 def _resolve_ckpt_file(checkpoint_dir: Path, version: str) -> Path:
     if version == "last":
         path = checkpoint_dir / "last.ckpt"
@@ -793,10 +864,26 @@ def _stage_plans(dataset_id: str) -> None:
         shutil.copy2(src, dest)
 
 
+def _write_test_cases_manifest(dest_dir: Path, cases: list[dict]) -> None:
+    # Official contract: {"cases": [{"case_id": ..., "image": "relative/path"}, ...]}
+    # "image" is relative to /input itself (dest_dir's parent), not to
+    # dest_dir -- confirmed against a real failed hidden-test run whose
+    # error showed a doubled .../t1_ct/t1_ct/... path when the runtime
+    # code (workspace/datamodule/inference_dataset.py, video_source.py)
+    # joined "image" onto dest_dir directly. Matching that convention here
+    # too, so a local docker.sh run exercises the same path resolution the
+    # real hidden test set does, instead of a fixture that happens to dodge
+    # this exact bug class.
+    manifest_path = dest_dir / "test_cases.json"
+    info(f"[{dest_dir.name}] writing {manifest_path} ({len(cases)} case(s))", "📝")
+    payload = {"cases": sorted(cases, key=lambda c: c["case_id"])}
+    manifest_path.write_text(json.dumps(payload, indent=2))
+
+
 def _stage_sample_volumes(task_dir: str, prefix: str) -> None:
     # Copied under their own original filename -- discover_cases (see
-    # workspace/datamodule/inference_dataset.py) accepts any *.nii.gz name,
-    # no renaming needed.
+    # workspace/datamodule/inference_dataset.py) reads test_cases.json for
+    # the case_id -> image mapping, no renaming needed.
     src_dir = REFERENCE_DATA_DIR / task_dir / "val" / "images"
     cases = sorted(src_dir.glob("*.nii.gz"))[:SAMPLE_VAL_CASES]
     if not cases:
@@ -804,10 +891,14 @@ def _stage_sample_volumes(task_dir: str, prefix: str) -> None:
 
     dest_dir = INPUT_DIR / prefix
     dest_dir.mkdir(parents=True, exist_ok=True)
+    manifest_cases = []
     for case in cases:
         dest = dest_dir / case.name
         info(f"[{prefix}] {case} -> {dest}", "🧪")
         shutil.copy2(case, dest)
+        manifest_cases.append({"case_id": case.name.removesuffix(".nii.gz"), "image": f"{prefix}/{case.name}"})
+
+    _write_test_cases_manifest(dest_dir, manifest_cases)
 
 
 def _stage_sample_video() -> None:
@@ -823,10 +914,16 @@ def _stage_sample_video() -> None:
 
     dest_dir = INPUT_DIR / "t3_vid" / recording.name
     dest_dir.mkdir(parents=True, exist_ok=True)
+    manifest_cases = []
     for frame in frames:
         dest = dest_dir / frame.name
         info(f"[t3_vid] {frame} -> {dest}", "🧪")
         shutil.copy2(frame, dest)
+        stem = frame.stem
+        case_id = stem if stem.startswith(recording.name) else f"{recording.name}_{stem}"
+        manifest_cases.append({"case_id": case_id, "image": f"t3_vid/{recording.name}/{frame.name}"})
+
+    _write_test_cases_manifest(INPUT_DIR / "t3_vid", manifest_cases)
 
 
 def setup_action(branch: str, version: str = "best") -> None:
@@ -860,11 +957,48 @@ def setup_action(branch: str, version: str = "best") -> None:
 # ============================================================
 # The 6 actions, callable directly (menu) or via typer (CLI)
 # ============================================================
+def _resolve_configured_vast_instance(config: dict) -> str | None:
+    """
+    If config.json already names an instance (config["vast"]["instance_id"]),
+    check whether it's still actually running and reuse its id instead of
+    searching/creating -- avoids renting a second instance just because a
+    previous run's id/port rotated out from under .submission_state.json.
+    Host/port are always re-fetched fresh via vastai_ssh_target() by the
+    caller, since those can change even for the same still-alive instance.
+    """
+    instance_id = (config.get("vast") or {}).get("instance_id")
+    if instance_id is None:
+        return None
+
+    result = _vastai_run(["show", "instances", "--raw"], config, capture_output=True, check=True)
+    instances = json.loads(result.stdout)
+    instance_info = next((inst for inst in instances if str(inst.get("id")) == str(instance_id)), None)
+
+    if instance_info is None:
+        info(f"config.json's recorded instance {instance_id} no longer exists -- searching/creating instead", "ℹ️ ")
+        return None
+
+    status = instance_info.get("cur_state") or instance_info.get("actual_status") or instance_info.get("status")
+    if status not in ("running", "loading"):
+        info(
+            f"config.json's recorded instance {instance_id} is not running (status={status}) "
+            "-- searching/creating instead",
+            "ℹ️ ",
+        )
+        return None
+
+    info(f"Reusing config.json's recorded instance {instance_id}", "♻️ ")
+    return str(instance_id)
+
+
 def create_vast_action(config: dict) -> dict:
     if not config.get("vast_api_key"):
         raise RuntimeError("config.json has no vast_api_key -- nothing to rent (this is for a fixed machine).")
 
-    instance_id = find_existing_vastai_instance(config)
+    instance_id = (
+        _resolve_configured_vast_instance(config)
+        or find_existing_vastai_instance(config)
+    )
     if instance_id is None:
         offer = find_vastai_offer(config)
         instance_id = create_vastai_instance(offer, config)
@@ -874,14 +1008,16 @@ def create_vast_action(config: dict) -> dict:
     conn = {**config, **ssh_target}
     wait_for_ssh_ready(conn)
 
-    save_state(vast={"instance_id": instance_id, **ssh_target})
+    vast = {"instance_id": instance_id, **ssh_target}
+    save_state(vast=vast)
+    save_config_vast(vast)
     success(f"Ready: {ssh_target['user']}@{ssh_target['host']}:{ssh_target['port']} (instance {instance_id})", "🎉")
     return conn
 
 
 def delete_vast_action(config: dict) -> None:
     state = load_state()
-    vast = state.get("vast")
+    vast = config.get("vast") or state.get("vast")
     instance_id = vast["instance_id"] if vast else find_existing_vastai_instance(config)
 
     if instance_id is None:
@@ -889,9 +1025,11 @@ def delete_vast_action(config: dict) -> None:
         return
 
     destroy_vastai_instance(instance_id, config)
-    if vast:
+    if state.get("vast"):
         state.pop("vast", None)
         STATE_PATH.write_text(json.dumps(state, indent=2))
+    if config.get("vast"):
+        save_config_vast(None)
     success(f"Destroyed instance {instance_id}", "🗑️ ")
 
 
@@ -943,15 +1081,20 @@ def _ask_yes_no(prompt: str, default: bool = False) -> bool:
 
 
 def _prompt_branch() -> str:
-    # Suggestions generated dynamically (not a fixed list) -- straight from
-    # NNUNET_RESULTS_DIR, so it always reflects whatever branches actually
-    # exist right now.
-    branches = list_available_branches()
+    # Every local git branch is shown (not just NNUNET_RESULTS_DIR's dirs),
+    # so a branch that exists but hasn't trained/staged results yet is
+    # still visible -- annotated so it's clear which ones setup can
+    # actually stage right now.
+    git_branches = list_git_branches()
+    staged = set(list_available_branches())
+
     table = Table(box=box.ROUNDED, show_header=False, padding=(0, 1, 0, 1), expand=False)
     table.add_column("branch", style="bold cyan")
-    for b in branches:
-        table.add_row(b)
-    console.print(Panel(table, title="[bold]Available branches[/]", border_style="cyan", box=box.ROUNDED))
+    table.add_column("status")
+    for b in git_branches:
+        status = "[green]results ready[/]" if b in staged else "[dim]no nnUNet_results yet[/]"
+        table.add_row(b, status)
+    console.print(Panel(table, title="[bold]Local git branches[/]", border_style="cyan", box=box.ROUNDED))
 
     return console.input("[bold cyan]?[/] Branch name: ").strip()
 
