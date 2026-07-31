@@ -44,7 +44,8 @@ since it's about where *this script* runs, not the target.
 config.json fields:
     host, port, user, key_file    -- fixed machine (ignored if vast_api_key set)
     remote_dir                    -- optional, default "~/"
-    proxy_host, proxy_port        -- optional, omit for direct internet access
+    proxy_host, proxy_port        -- optional; when unset, falls back to this shell's own
+                                      HTTPS_PROXY/HTTP_PROXY env vars, or direct if neither is set
     docker_username, docker_token -- optional, enables remote `docker login` on --push
     docker_password               -- optional, enables deleting the old Docker Hub tag first
     vast_api_key                  -- switches to renting a vast.ai instance
@@ -465,13 +466,33 @@ def _resolved_key_path(config: dict) -> Path:
     return key_file
 
 
+def _env_proxy_host_port() -> tuple[str, int] | None:
+    # Falls back to this shell's own HTTPS_PROXY/HTTP_PROXY (Olivia's
+    # compute nodes export these already) when config.json doesn't pin an
+    # explicit proxy_host -- so ssh/rsync automatically match whatever
+    # this machine actually needs instead of a stale value left over from
+    # a different machine (e.g. one with direct internet access).
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        value = os.environ.get(var)
+        if value:
+            parsed = urllib.parse.urlsplit(value)
+            if parsed.hostname:
+                return parsed.hostname, parsed.port or DEFAULT_PROXY_PORT
+    return None
+
+
 def _proxy_command(config: dict) -> str | None:
-    # No proxy_host means connect directly (e.g. a cluster with no proxy).
     # Positional args (not env-assignment) so this survives rsync's -e word-split.
     proxy_host = config.get("proxy_host")
+    proxy_port = config.get("proxy_port")
+
     if not proxy_host:
-        return None
-    proxy_port = config.get("proxy_port") or DEFAULT_PROXY_PORT
+        env_proxy = _env_proxy_host_port()
+        if env_proxy is None:
+            return None
+        proxy_host, proxy_port = env_proxy
+
+    proxy_port = proxy_port or DEFAULT_PROXY_PORT
     this_file = Path(__file__).resolve()
     return f"python3 {this_file} --tunnel %h %p {proxy_host} {proxy_port}"
 
