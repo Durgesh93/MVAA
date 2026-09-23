@@ -4,7 +4,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
 CONFIG_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG_NAME = "experiment"
+DEFAULT_CONFIG_NAME = "experiment_TEE"
 
 
 def build_config(
@@ -19,9 +19,6 @@ def build_config(
         cfg = build_config()
 
         cfg = build_config(overrides=[
-            "dataset_id=Dataset002_MVAA_TEE_SSL",
-            "configuration=2d",
-            "fold=0",
             "trainer.max_epochs=25",
         ])
     """

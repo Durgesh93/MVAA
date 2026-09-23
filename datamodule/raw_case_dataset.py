@@ -52,7 +52,11 @@ class nnUNetRawCaseDataset(Dataset):
 
         elif self.split == "test":
             self.image_folder = self.raw_dataset_folder / "imagesTs"
-            self.label_folder = None
+            # MVSeg2023's test split is labeled and the prep script keeps
+            # those masks in labelsTs, so this is a real folder now rather
+            # than None. Whether the GT is actually read still depends on
+            # has_gt, which the datamodule sets.
+            self.label_folder = self.raw_dataset_folder / "labelsTs"
 
         else:
             raise ValueError(f"Unknown split '{self.split}'. Use 'val' or 'test'.")

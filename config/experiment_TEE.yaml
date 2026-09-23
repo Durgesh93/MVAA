@@ -4,7 +4,13 @@
 
 seed: 12345
 
-experiment_name: ssl_small_patch_size
+# Must differ from the parent branch's ssl_small_patch_size:
+# paths.nnunet_results below resolves under dirs/data_storage/nnUNet,
+# which is the SAME physical scratch path for every MVAA branch (data
+# storage isn't branch-parameterized) -- reusing the parent's
+# experiment_name would read/overwrite its checkpoints and
+# validation/prediction outputs in place.
+experiment_name: ssl_tee
 
 # =============================================================================
 # Runtime / cluster-controlled values
@@ -17,11 +23,8 @@ training_strategy: ???
 # Dataset / nnU-Net setup
 # =============================================================================
 
-dataset_id: Dataset002_MVAA_TEE_SSL
+dataset_id: Dataset002_MVAA_TEE_SSL_MVSeg
 configuration: 3d_fullres
-fold: all
-task_id: 'task2'
-prefix: 't2_tee'
 plans_identifier: nnUNetPlans
 
 # Overrides ConfigurationManager's planned patch_size (null = use the
@@ -60,25 +63,39 @@ paths:
 datamodule:
   dataset_id: ${dataset_id}
   configuration: ${configuration}
-  fold: ${fold}
   seed: ${seed}
   plans_identifier: ${plans_identifier}
-  prefix: ${prefix}
   K: 5
   transform_geometric: true
   oversample_fg: 0.65
   patch_size_override: ${patch_size_override}
+
+  # Fraction of the 105 official MVSeg2023 train cases that keep their
+  # labels. MVSeg2023 is fully labeled, so unlike the old TrL/TrU scheme
+  # (which read a labeled/unlabeled partition straight out of
+  # dataset.json) the unlabeled pool has to be synthesized here: the
+  # remaining 1 - labeled_fraction cases are fed to the unlabeled branch
+  # with their targets never reaching a loss.
+  #
+  # The draw is seeded and NESTED -- the cases picked at 0.1 are a subset
+  # of those picked at 0.2 -- so a labeled_fraction sweep varies only how
+  # much supervision is available, not which cases provide it.
+  #
+  # 1.0 leaves the unlabeled pool empty and trains the plain supervised
+  # baseline through this same code path, which is the comparison any
+  # SSL result has to beat.
+  #
+  # The 30 official val and 40 official test cases are never touched by
+  # this split.
+  labeled_fraction: 0.2
 
 # =============================================================================
 # LightningModule config
 # =============================================================================
 
 litmodule:
-  task_id: ${task_id}
-  prefix: ${prefix}
   dataset_id: ${dataset_id}
   configuration: ${configuration}
-  fold: ${fold}
   seed: ${seed}
   plans_identifier: ${plans_identifier}
   initial_lr: 0.01
@@ -91,7 +108,7 @@ litmodule:
   pseudo_threshold_momentum: 0.999
   pseudo_warmup_epochs: 5
   foreground_weight: 10.0
-  tracked_labels: ["class_1", "class_2"]
+  tracked_labels: ["posterior_leaflet", "anterior_leaflet"]
   postprocess_keep_largest_component: true
   tta_use_mirroring: true
   tta_tile_step_size: 0.5
@@ -130,7 +147,7 @@ progress_bar:
 # =============================================================================
 checkpoint:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
-  dirpath: ${paths.nnunet_results}/${dataset_id}/${plans_identifier}__${configuration}/fold_${fold}/checkpoints
+  dirpath: ${paths.nnunet_results}/${dataset_id}/${plans_identifier}__${configuration}/checkpoints
   filename: "best-{epoch:03d}-{dice:.4f}"
   save_last: false
   save_top_k: 1
@@ -152,7 +169,7 @@ checkpoint:
 # reusing it).
 checkpoint_last:
   _target_: lightning.pytorch.callbacks.ModelCheckpoint
-  dirpath: ${paths.nnunet_results}/${dataset_id}/${plans_identifier}__${configuration}/fold_${fold}/checkpoints
+  dirpath: ${paths.nnunet_results}/${dataset_id}/${plans_identifier}__${configuration}/checkpoints
   filename: "_last_tracker"
   save_last: false
   save_top_k: 1

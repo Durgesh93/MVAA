@@ -16,8 +16,8 @@ attributes). `network`/`device` are likewise passed into
 predictor.run_prediction() per call rather than stored, for the same
 reason.
 
-Sliding-window inference + writing case zips/submission files live in
-PredictionOps (composed, not mixed in) -- self.predictor. It shares
+Sliding-window inference + writing case zips live in PredictionOps
+(composed, not mixed in) -- self.predictor. It shares
 NNUnetSetup's own pm/cm/lm/dataset_json by construction, so callers
 never need to pass configuration_manager themselves.
 """
@@ -45,7 +45,6 @@ from .losses import BoundaryLoss, CompoundLoss, WeakStrongPseudoLabelLoss
 
 from utils import (
     write_prediction_case_zip as _write_prediction_case_zip,
-    write_submission_prediction as _write_submission_prediction,
     keep_largest_component as _keep_largest_component,
     override_patch_size as _override_patch_size,
 )
@@ -53,7 +52,7 @@ from utils import (
 
 class PredictionOps:
     """
-    Sliding-window inference plus writing case zips/submission files.
+    Sliding-window inference plus writing case zips.
 
     Constructed once by NNUnetSetup with its own pm/cm/lm/dataset_json
     -- no dependency on the LightningModule's `self`. `network`/`device`
@@ -158,16 +157,6 @@ class PredictionOps:
             include_gt=include_gt,
             keep_temp_folder=keep_temp_folder,
             reset_direction=reset_direction,
-        )
-
-    def write_submission_prediction(self, prediction, output_folder, convert_to_255, keep_classes, submission_output_format):
-        _write_submission_prediction(
-            prediction=prediction,
-            output_folder=output_folder,
-            configuration_manager=self.cm,
-            convert_to_255=convert_to_255,
-            keep_classes=keep_classes,
-            output_format=submission_output_format,
         )
 
 

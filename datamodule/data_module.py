@@ -1,5 +1,18 @@
 """
-Semi-supervised LightningDataModule for SSL nnU-Net.
+Semi-supervised LightningDataModule for SSL nnU-Net on MVSeg2023.
+
+Splits come from dataset.json's `case_ids`, which records MVSeg2023's own
+train (105) / val (30) / test (40) partition, which is the only split the
+dataset defines and is used as-is.
+
+Every MVSeg2023 case is labeled, so the labeled/unlabeled partition is
+SYNTHESIZED rather than read: cfg.labeled_fraction of the train split
+keeps its labels (TrL) and the remainder becomes the unlabeled pool
+(TrU). The draw is seeded and nested across fractions. Nothing is
+stripped on disk -- a case is unlabeled only because it is routed to the
+unlabeled loader, whose targets never reach a loss. At
+labeled_fraction=1.0 the pool is empty, no unlabeled loader is built, and
+training is plain supervised.
 
 Train:
     preprocessed nnUNetDataset + nnUNetDataLoader for TrL, plus a
@@ -8,15 +21,14 @@ Train:
     multiview_loader.MultiViewUnlabeledDataLoader's docstring).
 
 Validation:
-    raw imagesTr + labelsTr.
-    Dataset preprocesses raw case and returns data, properties, GT.
+    raw imagesTr + labelsTr, the 30 official val cases.
 
-Prediction:
-    raw imagesTs.
-    Dataset preprocesses raw case and returns data, properties.
+Test:
+    raw imagesTs + labelsTs, the 40 official test cases. MVSeg2023
+    releases these labeled, so the held-out set is scorable.
 
-All split logic is inside setup(), because setup() has trainer.world_size
-and trainer.global_rank.
+Rank-local sharding lives in setup(), which is where trainer.world_size
+and trainer.global_rank are available.
 """
 
 import math
@@ -31,7 +43,7 @@ from lightning.pytorch.utilities.combined_loader import CombinedLoader
 
 from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
 from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
-from batchgenerators.utilities.file_and_folder_operations import join, isfile, load_json, save_json, maybe_mkdir_p
+from batchgenerators.utilities.file_and_folder_operations import join, load_json
 
 from batchgeneratorsv2.transforms.utils.compose import ComposeTransforms
 
@@ -39,7 +51,6 @@ from nnunetv2.paths import nnUNet_preprocessed, nnUNet_raw
 from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
 from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
-from nnunetv2.utilities.crossval_split import generate_crossval_split
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 from nnunetv2.utilities.dataset_name_id_conversion import maybe_convert_to_dataset_name
 
@@ -58,16 +69,22 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
 
         self.dataset_id = self.cfg.dataset_id
         self.configuration = self.cfg.configuration
-        self.fold = self.cfg.fold
         self.seed = self.cfg.seed
         self.plans_identifier = self.cfg.plans_identifier
-        self.prefix = str(self.cfg.prefix)
         self.K = int(self.cfg.K)
         self.transform_geometric = bool(self.cfg.transform_geometric)
 
         self.enable_deep_supervision = True
         self.oversample_fg = float(self.cfg.oversample_fg)
         self.print_case_ids = True
+
+        self.labeled_fraction = float(self.cfg.labeled_fraction)
+
+        if not 0.0 < self.labeled_fraction <= 1.0:
+            raise ValueError(
+                f"labeled_fraction must be in (0, 1], got {self.labeled_fraction}. "
+                "Use 1.0 for the fully supervised baseline (empty unlabeled pool)."
+            )
 
         # These are resolved automatically in setup(),
         # because Lightning trainer.world_size is only reliable there.
@@ -108,13 +125,17 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
         self.is_cascaded = False
         self.prev_stage_folder = None
 
-        ssl = self.dataset_json["ssl_case_ids"]
+        # Official MVSeg2023 partition, written by
+        # data_preparation/data_mvseg2023_nnunet.py. Every one of these
+        # cases is labeled -- unlike the old ssl_case_ids TrL/TrU/Ts key,
+        # this says nothing about supervision, only provenance. The
+        # labeled/unlabeled split is synthesized in setup() from
+        # cfg.labeled_fraction.
+        case_ids = self.dataset_json["case_ids"]
 
-        self.trl_all = list(ssl["TrL"])
-        self.tru_all = list(ssl["TrU"])
-        self.ts_all = list(ssl["Ts"])
-
-        self.splits_file = join(self.base, "splits_final_TrL.json")
+        self.train_all = list(case_ids["train"])
+        self.val_all = list(case_ids["val"])
+        self.ts_all = list(case_ids["test"])
 
         self.ds_class = None
 
@@ -292,38 +313,45 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
         self.num_processes, self.num_cached = self._resolve_augmentation_processes(world_size=world_size)
 
         # ------------------------------------------------------------
-        # Full TrL train/val split
+        # Train/val/test split
+        #
+        # Taken verbatim from MVSeg2023's own partition. The dataset
+        # defines exactly one train/val boundary, so cross-validation
+        # would mean re-splitting a split that is already authoritative.
+        #
+        # The only split decided here is labeled vs unlabeled, below.
         # ------------------------------------------------------------
-        if self.fold == "all":
-            rng = np.random.default_rng(self.seed)
-
-            trl = np.array(sorted(self.trl_all))
-            rng.shuffle(trl)
-
-            n_val = min(5, len(trl))
-
-            full_val = sorted(trl[:n_val].tolist())
-            full_tr = sorted(trl[n_val:].tolist())
-
-        else:
-            if not isfile(self.splits_file):
-                maybe_mkdir_p(self.base)
-
-                splits = generate_crossval_split(list(np.sort(self.trl_all)), seed=self.seed, n_splits=5)
-
-                save_json(splits, self.splits_file)
-
-            else:
-                splits = load_json(self.splits_file)
-
-            fold = int(self.fold)
-
-            full_tr = list(sorted(splits[fold]["train"]))
-            full_val = list(sorted(splits[fold]["val"]))
-
+        full_tr = list(sorted(self.train_all))
+        full_val = list(sorted(self.val_all))
         full_test = list(sorted(self.ts_all))
 
-        full_tru = list(sorted(self.tru_all))
+        # ------------------------------------------------------------
+        # Synthesize the labeled/unlabeled partition
+        #
+        # MVSeg2023 is fully labeled, so the unlabeled pool is made by
+        # withholding labels rather than read from the dataset. The
+        # shuffle is seeded and drawn ONCE over the whole train split,
+        # then truncated -- which makes the subsets nested (the cases
+        # chosen at 0.1 are a prefix of those chosen at 0.2), so a
+        # labeled_fraction sweep varies how much supervision there is,
+        # not which cases supply it.
+        #
+        # Nothing strips the segmentations on disk: a case is "unlabeled"
+        # purely because it is routed to the unlabeled loader, whose
+        # targets never reach a loss (see the LightningModule's
+        # _pseudo_loss, which reads only data_views).
+        # ------------------------------------------------------------
+        shuffled_tr = np.array(sorted(full_tr))
+        np.random.default_rng(self.seed).shuffle(shuffled_tr)
+
+        n_labeled = max(1, int(round(self.labeled_fraction * len(shuffled_tr))))
+
+        full_labeled = list(sorted(shuffled_tr[:n_labeled].tolist()))
+        full_tru = list(sorted(shuffled_tr[n_labeled:].tolist()))
+
+        full_tr = full_labeled
+
+        self.has_unlabeled = len(full_tru) > 0
 
         # ------------------------------------------------------------
         # Rank-local split
@@ -356,6 +384,8 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
 
         print(
             f"\n[rank {global_rank}/{world_size}] "
+            f"labeled_fraction={self.labeled_fraction} "
+            f"({len(full_tr)}/{len(full_tr) + len(full_tru)} train cases labeled) | "
             f"TrL={len(tr_cases)} | "
             f"TrU={len(tru_cases)} | "
             f"ValRaw={len(val_cases)} | "
@@ -391,8 +421,13 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
             self.folder, tr_cases, folder_with_segs_from_previous_stage=self.prev_stage_folder
         )
 
-        self.dataset_train_unlabeled = self.ds_class(
-            self.folder, tru_cases, folder_with_segs_from_previous_stage=self.prev_stage_folder
+        # At labeled_fraction=1.0 there is no unlabeled pool, so no
+        # unlabeled dataset/loader is built at all and training runs
+        # purely supervised through this same code path.
+        self.dataset_train_unlabeled = (
+            self.ds_class(self.folder, tru_cases, folder_with_segs_from_previous_stage=self.prev_stage_folder)
+            if self.has_unlabeled
+            else None
         )
 
         # ------------------------------------------------------------
@@ -416,7 +451,10 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
             split="test",
             file_ending=self.file_ending,
             num_channels=self.num_channels,
-            has_gt=False,
+            # MVSeg2023's test split ships real masks, which the prep
+            # script keeps in labelsTs -- so the held-out set is scorable
+            # rather than prediction-only.
+            has_gt=True,
             plans_manager=self.pm,
             configuration_manager=self.cm,
             dataset_json=self.dataset_json,
@@ -430,7 +468,7 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
         if self.dataset_train_labeled is None:
             raise RuntimeError("dataset_train_labeled is None. setup() did not run correctly.")
 
-        if self.dataset_train_unlabeled is None:
+        if self.has_unlabeled and self.dataset_train_unlabeled is None:
             raise RuntimeError("dataset_train_unlabeled is None. setup() did not run correctly.")
 
         _, _, init_ps, _ = self._get_da_params_from_nnunet()
@@ -458,6 +496,9 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
             transforms=labeled_tfm,
         )
 
+        if not self.has_unlabeled:
+            return CombinedLoader({"labeled": self._make_augmenter(labeled_loader)}, mode="max_size_cycle")
+
         unlabeled_loader = MultiViewUnlabeledDataLoader(
             data=self.dataset_train_unlabeled,
             batch_size=self.batch_size,
@@ -478,32 +519,36 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
 
         return CombinedLoader({"labeled": labeled_iter, "unlabeled": unlabeled_iter}, mode="max_size_cycle")
 
+    def _raw_case_loader(self, dataset):
+        return DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
+            collate_fn=nnunet_raw_case_collate,
+        )
+
     def val_dataloader(self):
+        """
+        The 30 official val cases only.
+
+        This used to return [val_loader, test_loader], which meant every
+        validation epoch also ran full sliding-window inference over the
+        held-out test set -- 40 extra volumes per epoch, scored by
+        nothing. The test set now has its own loader and is only touched
+        by `engine.py test`.
+        """
+
         if self.raw_dataset_val is None:
             raise RuntimeError("raw_dataset_val is None. setup() did not run correctly.")
+
+        return self._raw_case_loader(self.raw_dataset_val)
+
+    def test_dataloader(self):
+        """The 40 official test cases, which MVSeg2023 ships labeled."""
 
         if self.raw_dataset_test is None:
             raise RuntimeError("raw_dataset_test is None. setup() did not run correctly.")
 
-        val_loader = DataLoader(
-            self.raw_dataset_val,
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=True,
-            collate_fn=nnunet_raw_case_collate,
-        )
-
-        prediction_loader = DataLoader(
-            self.raw_dataset_test,
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=True,
-            collate_fn=nnunet_raw_case_collate,
-        )
-
-        return [val_loader, prediction_loader]
-
-    def test_dataloader(self):
-        return self.val_dataloader()
+        return self._raw_case_loader(self.raw_dataset_test)

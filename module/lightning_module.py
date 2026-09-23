@@ -20,17 +20,11 @@ class SSLnnUNetLightningModule(L.LightningModule):
         self.cfg = litmodule_cfg
         self.enable_deep_supervision = True
 
-        self.is_t3_vid = str(self.cfg.prefix) == "t3_vid"
-        self.convert_to_255 = self.is_t3_vid
-
-        self.submission_output_format = "png" if self.is_t3_vid else "nii.gz"
-
         self.nnunet = NNUnetSetup(
             litmodule_cfg, enable_deep_supervision=self.enable_deep_supervision, trainer_name=self.__class__.__name__
         )
         self.dataset_name = self.nnunet.dataset_name
         self.dataset_json = self.nnunet.dataset_json
-        self.keep_classes = [self.dataset_json["labels"]["class_10"]] if self.is_t3_vid else None
 
         self.tracked_labels = [(self.dataset_json["labels"][name], name) for name in self.cfg.tracked_labels]
         self.all_labels = sorted(
@@ -39,26 +33,19 @@ class SSLnnUNetLightningModule(L.LightningModule):
 
         # Read from os.environ at construction time, not imported from
         # nnunetv2.paths at module level -- that constant is only bound
-        # once, on the first `import module` anywhere in the process.
-        # `predict all` calls _build_objects once per experiment (ct, tee,
-        # video) in the same process, each with its own
-        # set_nnunet_env(cfg) update, but a module-level import means only
-        # the FIRST experiment's nnUNet_results value would ever be picked
-        # up here -- silently misdirecting the 2nd/3rd experiment's
-        # training_progress.png/validation/prediction/submission into the
-        # 1st experiment's folder even though checkpoints (sourced from
-        # the Hydra cfg directly) land in the right place.
+        # once, on the first `import module` anywhere in the process, so
+        # a module-level import could pick up a stale value if something
+        # imports `module` before engine.py's set_nnunet_env(cfg) call.
         self.actual_validation_output_base = (
             Path(os.environ["nnUNet_results"])
             / self.dataset_name
             / (self.cfg.plans_identifier + "__" + self.cfg.configuration)
         )
 
-        self.fold_output_folder = self.actual_validation_output_base / f"fold_{self.cfg.fold}"
-        self.actual_validation_output_folder = self.fold_output_folder / "validation"
-        self.actual_prediction_output_folder = self.fold_output_folder / "prediction"
-        self.actual_submission_output_folder = self.fold_output_folder / "submission"
-        self.progress_png_file = self.fold_output_folder / "training_progress.png"
+        self.output_folder = self.actual_validation_output_base
+        self.actual_validation_output_folder = self.output_folder / "validation"
+        self.actual_test_output_folder = self.output_folder / "test"
+        self.progress_png_file = self.output_folder / "training_progress.png"
 
         self.ddp = DDPHelper()
         self.metrics = MetricsTracker(tracked_labels=self.tracked_labels, all_labels=self.all_labels)
@@ -110,9 +97,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
         unwrapped `.module`), or DDP gradient sync breaks.
         """
         if self.current_epoch < self.cfg.pseudo_warmup_epochs:
-            zero = torch.zeros((), device=self.device)
-            nan_per_class = torch.full((len(self.all_labels),), float("nan"), device=self.device)
-            return zero, zero, nan_per_class
+            return self._zero_pseudo()
 
         net = self.network.module if hasattr(self.network, "module") else self.network
         old_deep_supervision = net.decoder.deep_supervision
@@ -131,9 +116,25 @@ class SSLnnUNetLightningModule(L.LightningModule):
         finally:
             net.decoder.deep_supervision = old_deep_supervision
 
+    def _zero_pseudo(self):
+        """Inactive pseudo-loss: zero loss, zero confident fraction, all-NaN per class."""
+        zero = torch.zeros((), device=self.device)
+        nan_per_class = torch.full((len(self.all_labels),), float("nan"), device=self.device)
+        return zero, zero, nan_per_class
+
     def training_step(self, batch, batch_idx):
         sup_loss, _, _ = self._supervised_loss(batch["labeled"])
-        pseudo_loss, pseudo_confident_frac, pseudo_confident_frac_per_class = self._pseudo_loss(batch["unlabeled"])
+
+        # At labeled_fraction=1.0 the datamodule builds no unlabeled
+        # loader at all, so the CombinedLoader yields only "labeled" and
+        # this reduces to plain supervised training -- the baseline an
+        # SSL run has to beat, through the identical code path.
+        if "unlabeled" in batch:
+            pseudo_loss, pseudo_confident_frac, pseudo_confident_frac_per_class = self._pseudo_loss(
+                batch["unlabeled"]
+            )
+        else:
+            pseudo_loss, pseudo_confident_frac, pseudo_confident_frac_per_class = self._zero_pseudo()
         total_loss = sup_loss + self.cfg.lambda_pseudo * pseudo_loss
         self.metrics.update_step_training_metrics(
             train_loss=total_loss.detach(),
@@ -144,48 +145,43 @@ class SSLnnUNetLightningModule(L.LightningModule):
         )
         return total_loss
 
-    def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        if self.trainer.sanity_checking:
-            return None
+    def _eval_step(self, batch, batch_idx, subfolder):
+        """
+        Sliding-window inference on one raw case, written as a zip and
+        scored against its ground truth.
+
+        Validation and test differ only in which subfolder the zip lands
+        in. Both are scored: MVSeg2023 releases the test split labeled,
+        so there is no longer an unscored prediction-only path.
+        """
 
         prediction = self.nnunet.predictor.run_prediction(
             network=self.network, device=self.device, batch=batch, batch_idx=batch_idx
         )
 
         rank_output_folder = self.ddp.rank_output_folder(
-            trainer=self.trainer, fold_output_folder=self.fold_output_folder
+            trainer=self.trainer, output_folder=self.output_folder
         )
-
-        if dataloader_idx == 0:
-            self.nnunet.predictor.write_prediction_case_zip(
-                prediction=prediction,
-                zip_dir=rank_output_folder / "validation",
-                include_gt=True,
-                reset_direction=self.is_t3_vid,
-            )
-            metrics = self.metrics.compute_metrics(prediction, voxel_spacing=prediction["gt_properties"]["spacing"])
-            self.metrics.update_step_val_metrics(metrics=metrics)
-            return prediction
 
         self.nnunet.predictor.write_prediction_case_zip(
             prediction=prediction,
-            zip_dir=rank_output_folder / "prediction",
-            include_gt=False,
-            reset_direction=self.is_t3_vid,
+            zip_dir=rank_output_folder / subfolder,
+            include_gt=True,
         )
 
-        self.nnunet.predictor.write_submission_prediction(
-            prediction=prediction,
-            output_folder=rank_output_folder / "submission",
-            convert_to_255=self.convert_to_255,
-            keep_classes=self.keep_classes,
-            submission_output_format=self.submission_output_format,
-        )
+        metrics = self.metrics.compute_metrics(prediction, voxel_spacing=prediction["gt_properties"]["spacing"])
+        self.metrics.update_step_val_metrics(metrics=metrics)
 
         return prediction
 
-    def test_step(self, batch, batch_idx, dataloader_idx=0):
-        return self.validation_step(batch, batch_idx, dataloader_idx)
+    def validation_step(self, batch, batch_idx):
+        if self.trainer.sanity_checking:
+            return None
+
+        return self._eval_step(batch, batch_idx, "validation")
+
+    def test_step(self, batch, batch_idx):
+        return self._eval_step(batch, batch_idx, "test")
 
     def _eval_epoch_end(self, stage, save_training_progress, print_val_metrics=False):
         if self.trainer.sanity_checking:
@@ -219,14 +215,11 @@ class SSLnnUNetLightningModule(L.LightningModule):
                 history=self.metrics.compute_epoch_history(),
                 progress_png_file=self.progress_png_file,
                 dataset_name=self.dataset_name,
-                fold=self.cfg.fold,
                 dice_classwise_keys=self.metrics.dice_keys,
                 pseudo_confident_frac_classwise_keys=self.metrics.pseudo_confident_frac_keys,
             )
         self.metrics.reset_step_metrics()
-        self.ddp.merge_rank_outputs(
-            trainer=self.trainer, fold_output_folder=self.fold_output_folder, task_id=self.cfg.task_id
-        )
+        self.ddp.merge_rank_outputs(trainer=self.trainer, output_folder=self.output_folder)
 
     def on_validation_epoch_end(self):
         self._eval_epoch_end(stage="validation", save_training_progress=True)

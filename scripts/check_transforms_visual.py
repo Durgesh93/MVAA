@@ -2,8 +2,8 @@
 Visual sanity check for the real TrL/TrU training batch produced by
 SSLnnUNetDataModule.train_dataloader() -- pulls one batch, takes item 0,
 and dumps it as PNG(s) for a manual look: the labeled sample, the TrU weak
-view, and each TrU strong view (1..K-1). 3D tasks (CT, TEE) dump every
-z-slice as its own PNG; the 2D task (video) dumps a single PNG.
+view, and each TrU strong view (1..K-1). TEE is a 3D task, so every
+z-slice is dumped as its own PNG.
 
 CUDA is force-disabled below: this script never runs the network, only
 the dataloader, but SSLnnUNetDataModule.pin_memory defaults to
@@ -31,8 +31,6 @@ from utils import set_nnunet_env
 from datamodule import SSLnnUNetDataModule
 
 OUT_DIR = Path(__file__).resolve().parent / "transform_check"
-
-CONFIG_MAP = {"ct": "experiment_CT", "tee": "experiment_TEE", "video": "experiment_video"}
 
 
 def to_uint8_png(img_chw, out_path, vmin, vmax):
@@ -75,7 +73,7 @@ def dump_view(tensor, out_dir, name):
 
 
 def dump_task_batch(task_name, config_name):
-    cfg = build_config(config_name=config_name, overrides=["fold=all"])
+    cfg = build_config(config_name=config_name)
     set_nnunet_env(cfg)
 
     dm = SSLnnUNetDataModule(cfg.datamodule)
@@ -106,7 +104,6 @@ def dump_task_batch(task_name, config_name):
 if __name__ == "__main__":
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    for task_name, config_name in CONFIG_MAP.items():
-        dump_task_batch(task_name, config_name)
+    dump_task_batch("tee", "experiment_TEE")
 
     print(f"\nAll PNGs written under {OUT_DIR}")

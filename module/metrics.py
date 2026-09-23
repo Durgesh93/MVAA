@@ -45,13 +45,12 @@ class MetricsTracker(nn.Module):
     def __init__(self, tracked_labels, all_labels):
         """
         tracked_labels: list of (label_value, label_name) pairs (e.g.
-        [(1, "class_10")] for video) -- the dice/asd/hd/hd95-relevant
-        classes for this task, read from litmodule_cfg.tracked_labels
-        via lightning_module.py. Every tracked scalar metric (dice,
-        asd_mm, hd_mm, hd95_mm) is a mean over just these classes (e.g.
-        valve-only for video) since that's what checkpoint.monitor
-        selects on; dice_<name> additionally tracks each class
-        individually for the classwise plot.
+        [(1, "class_1")]) -- the dice/asd/hd/hd95-relevant classes for
+        this task, read from litmodule_cfg.tracked_labels via
+        lightning_module.py. Every tracked scalar metric (dice, asd_mm,
+        hd_mm, hd95_mm) is a mean over just these classes since that's
+        what checkpoint.monitor selects on; dice_<name> additionally
+        tracks each class individually for the classwise plot.
 
         all_labels: list of (label_value, label_name) pairs for every
         class in dataset_json["labels"], background and auxiliary

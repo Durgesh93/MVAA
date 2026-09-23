@@ -222,7 +222,6 @@ def resolve_prediction_ckpt(cfg, ckpt):
         Path(cfg.paths.nnunet_results)
         / cfg.dataset_id
         / f"{cfg.plans_identifier}__{cfg.configuration}"
-        / f"fold_{cfg.fold}"
         / "checkpoints"
     )
 
@@ -240,74 +239,13 @@ def resolve_prediction_ckpt(cfg, ckpt):
     return ckpt
 
 
-def validate_experiment_name(experiment, config_map):
-    """
-    Validate experiment name against CONFIG_MAP.
-    """
-
-    experiment = str(experiment).lower().strip()
-
-    if experiment not in config_map:
-        valid = ", ".join(config_map.keys())
-
-        raise ValueError(f"Unknown experiment '{experiment}'. Choose one of: {valid}")
-
-    return experiment, config_map[experiment]
-
-
-def collect_submission_files(cfg, fold_num):
-    """
-    Collect submission files for one experiment.
-
-    Format:
-        task1 -> *-pred.nii.gz
-        task2 -> *-pred.nii.gz
-        task3 -> *_label_bin.png
-    """
-
-    dataset_name = str(cfg.litmodule.dataset_id)
-
-    configuration = cfg.litmodule.configuration
-    plans_identifier = cfg.litmodule.plans_identifier
-    task_id = cfg.litmodule.task_id
-    prefix = cfg.litmodule.prefix
-
-    fold_output_folder = (
-        Path(cfg.paths.nnunet_results) / dataset_name / f"{plans_identifier}__{configuration}" / f"fold_{fold_num}"
-    )
-
-    submission_folder = fold_output_folder / "submission"
-
-    task_id_str = str(task_id).lower().strip()
-
-    if task_id_str == "task3":
-        prediction_pattern = "*_label_bin.png"
-
-    elif task_id_str in ["task1", "task2"]:
-        prediction_pattern = "*-pred.nii.gz"
-
-    else:
-        raise ValueError(f"Unsupported task_id={task_id}. Expected task1, task2, or task3.")
-
-    prediction_files = sorted(p for p in submission_folder.glob(prediction_pattern) if p.is_file())
-
-    if len(prediction_files) == 0:
-        raise FileNotFoundError(
-            f"No prediction files found in: {submission_folder}\n"
-            f"Task: {task_id}\n"
-            f"Expected pattern: {prediction_pattern}"
-        )
-
-    return {"prefix": prefix, "task_id": task_id, "prediction_files": prediction_files}
-
-
 # =============================================================================
 # Training progress plot
 # =============================================================================
 
 
 def save_training_progress_plot(
-    history, progress_png_file, dataset_name, fold, dice_classwise_keys=None, pseudo_confident_frac_classwise_keys=None
+    history, progress_png_file, dataset_name, dice_classwise_keys=None, pseudo_confident_frac_classwise_keys=None
 ):
     """
     Save training_progress.png from already-computed NumPy history.
@@ -315,8 +253,8 @@ def save_training_progress_plot(
     dice_classwise_keys: history keys (e.g. ["dice_class_1", "dice_class_2"])
     each holding one tracked class's dice -- when given, the "Dice" panel
     plots one line per class instead of the single aggregate "dice" mean,
-    so classwise performance (e.g. the submitted class vs. training-only
-    auxiliary classes) is visible directly in the plot.
+    so classwise performance (e.g. the checkpoint-monitored class vs.
+    training-only auxiliary classes) is visible directly in the plot.
 
     pseudo_confident_frac_classwise_keys: same idea for the "Pseudo
     confident pixel frac" panel, but covering every class (background and
@@ -476,7 +414,7 @@ def save_training_progress_plot(
 
     progress_png_file.parent.mkdir(parents=True, exist_ok=True)
 
-    fig.suptitle(f"Training progress | {dataset_name} | fold {fold}", fontsize=16)
+    fig.suptitle(f"Training progress | {dataset_name}", fontsize=16)
 
     fig.tight_layout(rect=[0, 0, 1, 0.97])
 
@@ -542,51 +480,47 @@ def safe_binary_segmentation_metrics(pred_mask, gt_mask, voxel_spacing):
 # =============================================================================
 
 
-def get_rank_output_folder(fold_output_folder, global_rank):
+# The two evaluation stages that write per-case zips: validation during
+# fit, test during `engine.py test`. Both are scored -- MVSeg2023 ships
+# its test split labeled, so there is no unscored prediction stage.
+EVAL_STAGES = ("validation", "test")
+
+
+def get_rank_output_folder(output_folder, global_rank):
     """
     Rank-local output folder for DDP.
     """
 
-    rank_folder = Path(fold_output_folder) / "_rank_outputs" / f"rank_{int(global_rank)}"
+    rank_folder = Path(output_folder) / "_rank_outputs" / f"rank_{int(global_rank)}"
 
     rank_folder.mkdir(parents=True, exist_ok=True)
 
     return rank_folder
 
 
-def cleanup_rank_outputs(fold_output_folder):
+def cleanup_rank_outputs(output_folder):
     """
-    Remove fold_all/_rank_outputs.
+    Remove the experiment's _rank_outputs tree.
     """
 
-    rank_root = Path(fold_output_folder) / "_rank_outputs"
+    rank_root = Path(output_folder) / "_rank_outputs"
 
     if rank_root.exists():
         shutil.rmtree(rank_root, ignore_errors=True)
 
 
-def merge_rank_folders(fold_output_folder, task_id, overwrite=True):
+def merge_rank_folders(output_folder, overwrite=True):
     """
-    Merge rank-local outputs into final folders.
+    Merge rank-local case zips into the final folders.
 
-    Submission format:
-        task1/task2 -> *-pred.nii.gz
-        task3       -> *_label_bin.png
+    Both eval stages are handled the same way -- validation during fit,
+    test during `engine.py test`. A stage that did not run contributes no
+    rank subfolder and is simply skipped, so this is not an error.
     """
 
-    fold_output_folder = Path(fold_output_folder)
+    output_folder = Path(output_folder)
 
-    rank_root = fold_output_folder / "_rank_outputs"
-
-    final_validation = fold_output_folder / "validation"
-    final_prediction = fold_output_folder / "prediction"
-    final_submission = fold_output_folder / "submission"
-
-    final_validation.mkdir(parents=True, exist_ok=True)
-
-    final_prediction.mkdir(parents=True, exist_ok=True)
-
-    final_submission.mkdir(parents=True, exist_ok=True)
+    rank_root = output_folder / "_rank_outputs"
 
     if not rank_root.exists():
         raise FileNotFoundError(f"Rank output root does not exist: {rank_root}")
@@ -596,92 +530,41 @@ def merge_rank_folders(fold_output_folder, task_id, overwrite=True):
     if len(rank_folders) == 0:
         raise RuntimeError(f"No rank folders found inside: {rank_root}")
 
-    task_id_str = str(task_id).lower().strip()
+    copied = {stage: 0 for stage in EVAL_STAGES}
 
-    if task_id_str == "task3":
-        submission_pattern = "*_label_bin.png"
-    else:
-        submission_pattern = "*-pred.nii.gz"
+    for stage in EVAL_STAGES:
+        final_dir = output_folder / stage
 
-    copied_validation = 0
-    copied_prediction = 0
-    copied_submission = 0
+        for rank_folder in rank_folders:
+            rank_stage = rank_folder / stage
 
-    for rank_folder in rank_folders:
-        rank_validation = rank_folder / "validation"
-        rank_prediction = rank_folder / "prediction"
-        rank_submission = rank_folder / "submission"
+            if not rank_stage.exists():
+                continue
 
-        # ------------------------------------------------------------
-        # Validation zips
-        # ------------------------------------------------------------
-        if rank_validation.exists():
-            for src in sorted(rank_validation.glob("*.zip")):
+            final_dir.mkdir(parents=True, exist_ok=True)
+
+            for src in sorted(rank_stage.glob("*.zip")):
                 if not src.is_file():
                     continue
 
-                dst = final_validation / src.name
+                dst = final_dir / src.name
 
                 if dst.exists() and not overwrite:
                     raise RuntimeError(f"Duplicate output file during rank merge: {dst}")
 
                 shutil.copy2(src, dst)
 
-                copied_validation += 1
+                copied[stage] += 1
 
-        # ------------------------------------------------------------
-        # Prediction zips
-        # ------------------------------------------------------------
-        if rank_prediction.exists():
-            for src in sorted(rank_prediction.glob("*.zip")):
-                if not src.is_file():
-                    continue
-
-                dst = final_prediction / src.name
-
-                if dst.exists() and not overwrite:
-                    raise RuntimeError(f"Duplicate output file during rank merge: {dst}")
-
-                shutil.copy2(src, dst)
-
-                copied_prediction += 1
-
-        # ------------------------------------------------------------
-        # Submission predictions
-        # ------------------------------------------------------------
-        if rank_submission.exists():
-            for src in sorted(rank_submission.glob(submission_pattern)):
-                if not src.is_file():
-                    continue
-
-                dst = final_submission / src.name
-
-                if dst.exists() and not overwrite:
-                    raise RuntimeError(f"Duplicate output file during rank merge: {dst}")
-
-                shutil.copy2(src, dst)
-
-                copied_submission += 1
-
-    if copied_submission == 0:
+    if sum(copied.values()) == 0:
         raise RuntimeError(
-            "No submission files were copied from rank outputs. "
-            "Expected files like:\n"
-            f"  {rank_root}/rank_*/submission/{submission_pattern}\n\n"
-            "This usually means prediction wrote to the wrong folder, "
+            "No output files were copied from rank outputs. Expected zips like:\n"
+            + "".join(f"  {rank_root}/rank_*/{stage}/*.zip\n" for stage in EVAL_STAGES)
+            + "\nThis usually means a stage wrote to the wrong folder, "
             "or rank 0 merged before other ranks finished writing."
         )
 
-    return {"validation": copied_validation, "prediction": copied_prediction, "submission": copied_submission}
-
-
-# =============================================================================
-# Segmentation -> 0/255 conversion
-# =============================================================================
-def convert_segmentation_to_255(segmentation):
-    # Matches the Codabench baseline scripts' convention: binary mask as
-    # plain 0/255 uint8.
-    return (segmentation > 0).astype(np.uint8) * 255
+    return copied
 
 
 # =============================================================================
@@ -691,10 +574,8 @@ def keep_largest_component(segmentation, foreground_labels):
     """
     For each foreground label, zero out every connected component of that
     label's binary mask except the largest one. Only appropriate for
-    labels whose anatomy is a single structure (e.g. CT/TEE valves) --
-    not for classes with legitimately multi-component ground truth (e.g.
-    video's equipment class, see the commit that removed this postprocessing
-    for video).
+    labels whose anatomy is a single structure, not for classes with
+    legitimately multi-component ground truth.
     """
     out = segmentation.copy()
     for label in foreground_labels:
@@ -743,9 +624,7 @@ def segment_color_string(segment_idx, palette=SEGMENT_COLOR_PALETTE):
 # whenever a mask's max value is exactly 255
 # (np.uint8 if np.max(seg) < 255 else np.uint16). We control the dtype
 # ourselves everywhere a segmentation is written, so this always writes
-# uint8 directly and skips that writer entirely. Used by both the Slicer
-# case zip writer and the Codabench submission writer, so both paths stay
-# consistent with each other.
+# uint8 directly and skips that writer entirely.
 # =============================================================================
 class SegmentationImageIO:
 
@@ -850,12 +729,12 @@ def write_prediction_case_zip(
 
         dst = case_tmp_dir / f"{case_id}_image_view_channel_{idx:04d}.nii.gz"
 
-        # reset_direction=True only for tasks whose raw nii.gz direction is
-        # a placeholder artifact (e.g. task3 video: nibabel writes with an
-        # identity affine, then SimpleITK/ITK applies its RAS -> LPS sign
-        # convention on read, producing a (-1, -1) direction with no real
-        # spatial meaning). Tasks with real scan geometry (CT/TEE) must
-        # keep their true spacing/origin/direction, so this defaults False.
+        # reset_direction=True only for raw nii.gz files whose direction is
+        # a placeholder artifact (e.g. written by nibabel with an identity
+        # affine, then SimpleITK/ITK applies its RAS -> LPS sign convention
+        # on read, producing a (-1, -1) direction with no real spatial
+        # meaning). CT's raw scans carry real scan geometry, so this
+        # defaults False and is never overridden.
         image = segmentation_io.read(src, reset_direction=reset_direction)
         segmentation_io.write_volume(image, dst)
 
@@ -1165,157 +1044,3 @@ def write_prediction_case_zip(
 
     return zip_file
 
-
-# =============================================================================
-# Submission prediction writer
-# =============================================================================
-def write_submission_prediction(
-    prediction,
-    output_folder,
-    configuration_manager,
-    convert_to_255=False,
-    keep_classes=None,
-    output_format="nii.gz",  # "nii.gz" or "png"
-    file_ending=".nii.gz",
-):
-    """
-    Write one predict_step output in rank-local submission format.
-
-    Supported output:
-        <case_id>-pred.nii.gz
-        <case_id>_label_bin.png
-
-    PNG is only allowed for 2D nnU-Net predictions.
-    """
-
-    case_id = prediction["case_id"]
-
-    output_folder = Path(output_folder)
-    output_folder.mkdir(parents=True, exist_ok=True)
-
-    output_format = str(output_format).lower().lstrip(".")
-
-    if output_format not in {"nii.gz", "png"}:
-        raise ValueError(f"Unsupported output_format={output_format}. Use 'nii.gz' or 'png'.")
-
-    segmentation = to_numpy(prediction["predicted_segments"])
-    segmentation = np.asarray(segmentation)
-
-    if segmentation.ndim == 4 and segmentation.shape[0] == 1:
-        segmentation = segmentation[0]
-
-    # More than one kept class -> RGB PNG, one color per class.
-    # Single kept class (or no filtering) -> single-channel {0, 255}, unchanged.
-    build_rgb = output_format == "png" and keep_classes is not None and len(keep_classes) > 1
-
-    if build_rgb:
-        segmentation = np.where(np.isin(segmentation, keep_classes), segmentation, 0).astype(segmentation.dtype)
-    elif keep_classes is not None:
-        segmentation = np.isin(segmentation, keep_classes).astype(segmentation.dtype)
-
-    plan_dim = len(configuration_manager.patch_size)
-
-    # ------------------------------------------------------------------
-    # NIfTI output
-    # ------------------------------------------------------------------
-    if output_format == "nii.gz":
-
-        segmentation = segmentation.astype(np.uint8)
-
-        if plan_dim == 2:
-            if segmentation.ndim == 2:
-                segmentation = segmentation[None, ...]
-
-            elif segmentation.ndim == 3:
-                if segmentation.shape[0] != 1:
-                    raise ValueError(f"2D nnU-Net writer expects [1, H, W], got {segmentation.shape}")
-
-            else:
-                raise ValueError(f"2D nnU-Net writer expects [H, W] or [1, H, W], got {segmentation.shape}")
-
-        elif plan_dim == 3:
-            if segmentation.ndim != 3:
-                raise ValueError(f"3D nnU-Net writer expects [D, H, W], got {segmentation.shape}")
-
-        else:
-            raise ValueError(f"Unsupported nnU-Net plan dimension: {configuration_manager.patch_size}")
-
-        pred_file = output_folder / f"{case_id}-pred{file_ending}"
-
-        tmp_pred_file = output_folder / (f"{case_id}-pred.tmp_{os.getpid()}{file_ending}")
-
-        sitk_stuff = prediction["properties"]["sitk_stuff"]
-
-        # 2D nnU-Net plans carry a dummy leading axis ([1, H, W]) for the
-        # sliding-window machinery; a 2D nii.gz file has no such axis.
-        segmentation_io.write_segmentation_file(
-            segmentation[0] if plan_dim == 2 else segmentation,
-            tmp_pred_file,
-            spacing=sitk_stuff["spacing"],
-            origin=sitk_stuff["origin"],
-            direction=sitk_stuff["direction"],
-        )
-
-        os.replace(tmp_pred_file, pred_file)
-
-        return pred_file
-
-    # ------------------------------------------------------------------
-    # PNG output
-    # ------------------------------------------------------------------
-    if output_format == "png":
-
-        if plan_dim != 2:
-            raise ValueError(
-                f"PNG output is only allowed for 2D nnU-Net plans. "
-                f"Got patch_size={configuration_manager.patch_size}"
-            )
-
-        if build_rgb:
-            if segmentation.ndim == 3 and segmentation.shape[0] == 1:
-                segmentation = segmentation[0]
-
-            if segmentation.ndim != 2:
-                raise ValueError(f"RGB PNG writer expects [H, W], got {segmentation.shape}")
-
-            rgb = np.zeros(segmentation.shape + (3,), dtype=np.uint8)
-
-            for color_idx, class_value in enumerate(keep_classes):
-                color = SEGMENT_COLOR_PALETTE[color_idx % len(SEGMENT_COLOR_PALETTE)]
-
-                rgb[segmentation == class_value] = tuple(int(round(c * 255)) for c in color)
-
-            pred_file = output_folder / f"{case_id}_label_bin.png"
-
-            tmp_pred_file = output_folder / (f"{case_id}_label_bin.tmp_{os.getpid()}.png")
-
-            segmentation_io.write_png(rgb, tmp_pred_file)
-
-            os.replace(tmp_pred_file, pred_file)
-
-            return pred_file
-
-        if convert_to_255:
-            segmentation = convert_segmentation_to_255(segmentation)
-        else:
-            segmentation = segmentation.astype(np.uint8)
-
-        if segmentation.ndim == 2:
-            segmentation = segmentation[None, ...]
-
-        elif segmentation.ndim == 3:
-            if segmentation.shape[0] != 1:
-                raise ValueError(f"PNG writer expects [H, W] or [1, H, W], got {segmentation.shape}")
-
-        else:
-            raise ValueError(f"PNG writer expects [H, W] or [1, H, W], got {segmentation.shape}")
-
-        pred_file = output_folder / f"{case_id}_label_bin.png"
-
-        tmp_pred_file = output_folder / (f"{case_id}_label_bin.tmp_{os.getpid()}.png")
-
-        segmentation_io.write_png(segmentation[0], tmp_pred_file)
-
-        os.replace(tmp_pred_file, pred_file)
-
-        return pred_file
