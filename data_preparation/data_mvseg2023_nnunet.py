@@ -290,6 +290,36 @@ def write_dataset(rows, dataset_id, output_dir, num_processes):
     return dataset_dir
 
 
+def clean_preprocessed(nnunet_preprocessed, dataset_id):
+    """
+    Remove this dataset's whole preprocessed folder before re-planning.
+
+    nnU-Net rewrites its per-configuration folders (nnUNetPlans_3d_fullres,
+    nnUNetPlans_2d) on every run, but gt_segmentations is populated by
+    plan_and_preprocess_api's `copy_file(..., update=True)` loop, which only
+    ever *adds* the cases listed in the current dataset.json -- it never
+    deletes. Re-running after a case-naming change therefore leaves the
+    previous dataset's ground truth sitting alongside the new (observed:
+    125 stale files from the old TrL/TrU scheme next to the 135 real ones).
+    Those are inert for training, which looks GT up by case name, but
+    compute_metrics_on_folder() and find_best_configuration() take the
+    *folder*, so stale entries can skew an aggregate metric.
+
+    prepare_output_dirs() already rmtree's the raw dataset folder
+    unconditionally; this makes the preprocessed side match, so a run is
+    idempotent rather than accumulating.
+    """
+
+    preprocessed_dir = Path(nnunet_preprocessed) / dataset_id
+
+    if not preprocessed_dir.exists():
+        return
+
+    log_warn(f"Removing existing preprocessed folder: {preprocessed_dir}")
+
+    shutil.rmtree(preprocessed_dir)
+
+
 def run_nnunet_plan_and_preprocess(dataset_id, num_processes):
     dataset_number = get_dataset_number(dataset_id)
 
