@@ -142,18 +142,21 @@ class SSLnnUNetLightningModule(L.LightningModule):
         )
         return total_loss
 
-    def _eval_step(self, batch, batch_idx, subfolder):
+    def _eval_step(self, batch, batch_idx, subfolder, use_tta):
         """
         Sliding-window inference on one raw case, written as a zip and
         scored against its ground truth.
 
-        Validation and test differ only in which subfolder the zip lands
-        in. Both are scored: MVSeg2023 releases the test split labeled,
-        so there is no longer an unscored prediction-only path.
+        Both stages are scored -- MVSeg2023 releases the test split
+        labeled, so there is no unscored prediction-only path. They differ
+        in the output subfolder and in TTA: validation runs a single plain
+        pass (use_tta=False) because it only has to rank checkpoints,
+        while test pays for the configured mirroring and tile overlap to
+        get the number worth reporting. See PredictionOps' docstring.
         """
 
         prediction = self.nnunet.predictor.run_prediction(
-            network=self.network, device=self.device, batch=batch, batch_idx=batch_idx
+            network=self.network, device=self.device, batch=batch, batch_idx=batch_idx, use_tta=use_tta
         )
 
         rank_output_folder = self.ddp.rank_output_folder(
@@ -175,10 +178,10 @@ class SSLnnUNetLightningModule(L.LightningModule):
         if self.trainer.sanity_checking:
             return None
 
-        return self._eval_step(batch, batch_idx, "validation")
+        return self._eval_step(batch, batch_idx, "validation", use_tta=False)
 
     def test_step(self, batch, batch_idx):
-        return self._eval_step(batch, batch_idx, "test")
+        return self._eval_step(batch, batch_idx, "test", use_tta=True)
 
     def _eval_epoch_end(self, stage, save_training_progress, print_val_metrics=False):
         if self.trainer.sanity_checking:

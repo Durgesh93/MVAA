@@ -59,6 +59,15 @@ class PredictionOps:
     are passed into run_prediction() per call since those live on the
     LightningModule (network is trained in place; device can change
     with `.to()`).
+
+    use_mirroring/tile_step_size are the TEST-time settings. They are not
+    used for validation, which passes use_tta=False and runs a single
+    non-overlapping pass instead: 3D mirroring is 2**3 forward passes per
+    tile and a 0.5 step size roughly octuples the tile count, so full TTA
+    costs ~64x a plain pass (measured: ~46 s/case vs the whole training
+    epoch taking ~2 min). That is worth paying once for a final score,
+    but per-epoch validation only has to rank checkpoints, and paying it
+    300 times meant ~115 h of validation for ~10 h of training.
     """
 
     def __init__(
@@ -88,11 +97,11 @@ class PredictionOps:
             return network.module
         return network
 
-    def _make_predictor(self, net, device):
+    def _make_predictor(self, net, device, use_mirroring, tile_step_size):
         predictor = nnUNetPredictor(
-            tile_step_size=self.tile_step_size,
+            tile_step_size=tile_step_size,
             use_gaussian=True,
-            use_mirroring=self.use_mirroring,
+            use_mirroring=use_mirroring,
             perform_everything_on_device=True,
             device=device,
             verbose=False,
@@ -109,7 +118,7 @@ class PredictionOps:
         predictor.list_of_parameters = [net.state_dict()]
         return predictor
 
-    def _predict_logits(self, network, device, data):
+    def _predict_logits(self, network, device, data, use_mirroring, tile_step_size):
         if self.cm.previous_stage_name is not None:
             raise RuntimeError(
                 f"Configuration {self.configuration_name} is cascaded, "
@@ -118,7 +127,7 @@ class PredictionOps:
         net = self._unwrap_network(network)
         old_deep_supervision = net.decoder.deep_supervision
         net.decoder.deep_supervision = False
-        predictor = self._make_predictor(net, device)
+        predictor = self._make_predictor(net, device, use_mirroring, tile_step_size)
         try:
             logits = predictor.predict_sliding_window_return_logits(data)
         finally:
@@ -140,9 +149,24 @@ class PredictionOps:
     # =========================================================================
     # Main prediction entry point
     # =========================================================================
-    def run_prediction(self, network, device, batch, batch_idx=None):
+    def run_prediction(self, network, device, batch, batch_idx=None, use_tta=True):
+        """
+        use_tta=False forces a single non-overlapping sliding-window pass
+        (no mirroring, step 1.0), which is what validation uses. True uses
+        the configured tta_use_mirroring / tta_tile_step_size.
+        """
+
+        use_mirroring = self.use_mirroring if use_tta else False
+        tile_step_size = self.tile_step_size if use_tta else 1.0
+
         item = batch[0]
-        logits = self._predict_logits(network=network, device=device, data=item["data"])
+        logits = self._predict_logits(
+            network=network,
+            device=device,
+            data=item["data"],
+            use_mirroring=use_mirroring,
+            tile_step_size=tile_step_size,
+        )
         predicted_segments, predicted_probs = self._restore_prediction_shape(logits=logits, properties=item["properties"])
         if self.postprocess_keep_largest_component:
             predicted_segments = _keep_largest_component(predicted_segments, self.lm.foreground_labels)

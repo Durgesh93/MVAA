@@ -110,6 +110,9 @@ litmodule:
   foreground_weight: 10.0
   tracked_labels: ["posterior_leaflet", "anterior_leaflet"]
   postprocess_keep_largest_component: true
+  # TEST-TIME ONLY. Validation always runs a single non-overlapping pass
+  # with no mirroring -- it exists to rank checkpoints, and full TTA there
+  # costs ~64x per case (~46 s vs a ~2 min training epoch).
   tta_use_mirroring: true
   tta_tile_step_size: 0.5
   patch_size_override: ${patch_size_override}
