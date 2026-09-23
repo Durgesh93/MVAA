@@ -38,6 +38,8 @@ from lightning.pytorch.strategies import DDPStrategy
 from lightning.fabric.plugins.environments import LightningEnvironment
 
 
+from typing import List
+
 from config import build_config
 
 from utils import (
@@ -132,7 +134,7 @@ def _build_trainer(cfg, prediction=False):
     return trainer
 
 
-def _build_objects(config_name, prediction=False):
+def _build_objects(config_name, prediction=False, overrides=None):
     """
     Both commands clear the output folder first; they differ only in
     clear_results' clear_checkpoints flag. train clears checkpoints too
@@ -140,7 +142,7 @@ def _build_objects(config_name, prediction=False):
     still be there when resolve_prediction_ckpt runs right after this.
     """
 
-    cfg = build_config(config_name=config_name)
+    cfg = build_config(config_name=config_name, overrides=list(overrides or []))
 
     set_nnunet_env(cfg)
 
@@ -162,14 +164,18 @@ def _build_objects(config_name, prediction=False):
     return cfg, datamodule, model, trainer
 
 
-def _run_training(config_name):
-    cfg, datamodule, model, trainer = _build_objects(config_name=config_name, prediction=False)
+def _run_training(config_name, overrides=None):
+    cfg, datamodule, model, trainer = _build_objects(
+        config_name=config_name, prediction=False, overrides=overrides
+    )
 
     trainer.fit(model=model, datamodule=datamodule)
 
 
-def _run_test(config_name, ckpt=CKPT):
-    cfg, datamodule, model, trainer = _build_objects(config_name=config_name, prediction=True)
+def _run_test(config_name, ckpt=CKPT, overrides=None):
+    cfg, datamodule, model, trainer = _build_objects(
+        config_name=config_name, prediction=True, overrides=overrides
+    )
 
     resolved_ckpt = resolve_prediction_ckpt(cfg=cfg, ckpt=ckpt)
 
@@ -235,17 +241,27 @@ def clear_results(cfg, clear_checkpoints=True):
 
 
 @app.command()
-def train():
+def train(
+    overrides: List[str] = typer.Argument(
+        None, help="Hydra-style config overrides, e.g. datamodule.labeled_fraction=0.5"
+    )
+):
+    """Train, validating on the 30 official val cases every epoch."""
     if _is_rank_zero():
         print()
         print(f"Config: {CONFIG_NAME}")
+        if overrides:
+            print(f"Overrides: {' '.join(overrides)}")
         print()
 
-    _run_training(config_name=CONFIG_NAME)
+    _run_training(config_name=CONFIG_NAME, overrides=overrides)
 
 
 @app.command()
-def test(ckpt: str = typer.Option(CKPT, "--ckpt", help="Checkpoint to use: best, last, or full .ckpt path.")):
+def test(
+    ckpt: str = typer.Option(CKPT, "--ckpt", help="Checkpoint to use: best, last, or full .ckpt path."),
+    overrides: List[str] = typer.Argument(None, help="Hydra-style config overrides."),
+):
     """Score the 40 official MVSeg2023 test cases with a trained checkpoint."""
     if _is_rank_zero():
         print()
@@ -253,7 +269,7 @@ def test(ckpt: str = typer.Option(CKPT, "--ckpt", help="Checkpoint to use: best,
         print(f"Checkpoint: {ckpt}")
         print()
 
-    _run_test(config_name=CONFIG_NAME, ckpt=ckpt)
+    _run_test(config_name=CONFIG_NAME, ckpt=ckpt, overrides=overrides)
 
 
 if __name__ == "__main__":
