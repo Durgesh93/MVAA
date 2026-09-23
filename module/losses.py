@@ -302,9 +302,9 @@ class AdaptiveConfidenceThreshold(nn.Module):
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         # class_ema/global_ema are lazily shaped by num_classes (see
-        # _maybe_init), so a freshly constructed module -- e.g. for
-        # predict/retrain, which load a checkpoint before any unlabeled batch
-        # has run -- still has them at their construction-time shape. Resize
+        # _maybe_init), so a freshly constructed module -- e.g. for `test`,
+        # which loads a checkpoint before any unlabeled batch has run --
+        # still has them at their construction-time shape. Resize
         # to whatever shape the checkpoint has *before* the default load
         # logic runs its shape check, so the real EMA values get restored
         # instead of tripping a size mismatch.

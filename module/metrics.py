@@ -19,10 +19,9 @@ it has no DDP collective (sync_on_compute=False, rank-0-only plotting),
 so it doesn't need MetricCollection's cross-metric batching -- but it
 still needs to be a registered nn.Module (ModuleDict, not a plain dict)
 so its accumulated per-epoch history is included in this LightningModule's
-state_dict and survives `retrain`'s trainer.fit(ckpt_path=...) resume. A
-plain dict here would silently lose the whole training_progress.png curve
-on every retrain, since Lightning's checkpoint save/restore only walks
-registered submodules/parameters/buffers. compute_epoch_history() always
+state_dict. Lightning's checkpoint save/restore only walks registered
+submodules/parameters/buffers, so a plain dict here would leave the whole
+training_progress.png curve out of every checkpoint. compute_epoch_history() always
 .cpu()s the result before handing it to matplotlib either way.
 
 Printing, self.log-ing, and writing the progress plot to disk are
