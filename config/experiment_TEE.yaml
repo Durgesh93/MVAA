@@ -130,25 +130,6 @@ litmodule:
   weight_decay: 0.00003
   num_epochs: ${trainer.max_epochs}
 
-  # OFF. The ssl_sweep_bnd_weakstrong grid put the boundary term at +0.5
-  # Dice at best -- inside seed noise on a 30-case val split -- while
-  # costing ~58% more wall-clock per epoch (~38 vs ~24 min): BoundaryLoss
-  # runs scipy's distance transform on CPU, per sample, per step. Bad trade,
-  # so the few-shot and SuperCM experiments run plain Dice+CE.
-  #
-  # The implementation stays (module/losses.py BoundaryLoss, Kervadec et al.
-  # 2019) and the two knobs below still work -- flip this to true to bring
-  # it back. CompoundLoss skips the term entirely while the weight is 0, so
-  # off costs nothing.
-  #
-  # Convex mix when on: (1 - w) * dice_ce + w * boundary, w ramped linearly
-  # from 0 to boundary_weight_max over boundary_ramp_epochs (see
-  # module/nnunet.py's update_boundary_weight). Note boundary_ramp_epochs
-  # defaults to max_epochs, which means w only reaches its maximum on the
-  # final epoch -- shorten it to give the term real epochs at full weight.
-  use_boundary: false
-  boundary_weight_max: 0.50
-  boundary_ramp_epochs: ${trainer.max_epochs}
 
   # Width of the per-voxel embedding the decoder emits (module/adapter.py).
   # Stock nnU-Net maps decoder features straight to the 3 class logits; the

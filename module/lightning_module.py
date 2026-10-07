@@ -90,9 +90,6 @@ class SSLnnUNetLightningModule(L.LightningModule):
         with embeddings_enabled(self.network):
             return self.network(x)
 
-    def on_train_epoch_start(self):
-        self.nnunet.update_boundary_weight(self.loss, self.current_epoch)
-
     @staticmethod
     def _highest_resolution(value):
         """

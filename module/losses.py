@@ -4,21 +4,19 @@ do_bg=False) + a foreground-weighted CE (_foreground_weighted_ce, not
 nnU-Net's own DC_and_CE_loss/RobustCrossEntropyLoss, which averages CE per
 voxel with no class weighting -- see _foreground_weighted_ce's docstring
 for why that's worth overriding for a task like CT where background is
-~98% of a crop), with an optional third BoundaryLoss (Kervadec et al.,
-2019) term mixed in via a convex combination once module/nnunet.py's
-epoch hook ramps its weight above 0.
+~98% of a crop).
 
 The Tversky / Focal / Focal-Tversky region+pixel variants tried across
 the phase 1-3 experiment branches didn't outperform plain Dice+CE, so
 this file doesn't reimplement that family or expose a configurable
-loss_type -- CompoundLoss always uses this Dice+CE combination, with
-BoundaryLoss as the only optional add-on.
+loss_type -- CompoundLoss always uses this Dice+CE combination.
 
-BoundaryLoss has no floor forcing any foreground prediction on its
-own (an all-background prediction can still score 0), so
-CompoundLoss only mixes it in at a small boundary_weight -- see
-litmodule.use_boundary / boundary_weight_max / boundary_ramp_epochs in
-the experiment configs and module/nnunet.py's epoch hook.
+A BoundaryLoss (Kervadec et al., 2019) third term lived here as an
+optional convex-combination add-on, ramped over epochs. Removed: the
+ssl_sweep_bnd_weakstrong grid put it at +0.5 Dice at best, inside seed
+noise on a 30-case val split, while costing ~58% more wall-clock per epoch
+(~38 vs ~24 min) because it ran scipy's distance transform on CPU per
+sample per step.
 
 A FixMatch-style WeakStrongPseudoLabelLoss and its FreeMatch
 AdaptiveConfidenceThreshold lived here too. Both were removed: the
@@ -34,9 +32,7 @@ wrapped here, because CompoundLoss is already inside nnU-Net's
 DeepSupervisionWrapper by the time training_step sees it.
 """
 
-import numpy as np
 import torch
-from scipy.ndimage import distance_transform_edt
 from torch import nn, Tensor
 
 from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss
@@ -93,103 +89,6 @@ def _foreground_weighted_ce(net_output: Tensor, target: Tensor, loss_mask=None, 
     return per_voxel_ce[valid].mean()
 
 
-def _onehot_target(x: Tensor, y: Tensor, do_bg: bool) -> Tensor:
-    """
-    One-hot-encode y to match x's channel layout (pass through as-is if
-    y is already one-hot), dropping the background channel unless
-    do_bg.
-    """
-
-    if x.ndim != y.ndim:
-        y = y.view((y.shape[0], 1, *y.shape[1:]))
-
-    if x.shape == y.shape:
-        # gt is probably already a one hot encoding
-        y_onehot = y.to(torch.float32)
-    else:
-        y_onehot = torch.zeros(x.shape, device=x.device, dtype=torch.float32)
-        y_onehot.scatter_(1, y.long(), 1)
-
-    if not do_bg:
-        y_onehot = y_onehot[:, 1:]
-
-    return y_onehot
-
-
-def _signed_distance_map(posmask: np.ndarray) -> np.ndarray:
-    """
-    Signed Euclidean distance transform of one binary foreground mask
-    (Kervadec et al., 2019): negative inside the foreground, positive
-    outside, ~0 right at the boundary. Empty/full masks (no boundary
-    to speak of) map to all-zero, so they contribute nothing.
-    """
-
-    if not posmask.any() or posmask.all():
-        return np.zeros_like(posmask, dtype=np.float32)
-
-    negmask = ~posmask
-
-    return (distance_transform_edt(negmask) * negmask - (distance_transform_edt(posmask) - 1) * posmask).astype(
-        np.float32
-    )
-
-
-class BoundaryLoss(nn.Module):
-    """
-    Boundary loss (Kervadec et al., 2019): mean_c sum_q phi_G(q) *
-    s_theta(q), where phi_G is the signed distance map of the
-    ground-truth mask (see _signed_distance_map) and s_theta is the
-    predicted softmax foreground probability. Linear in s_theta (phi_G
-    is a fixed, non-differentiable target computed under no_grad), so
-    unlike Dice it doesn't saturate as predictions approach the true
-    mask -- it keeps pushing on whichever pixels are still far from
-    the boundary on the wrong side.
-
-    Computed on-the-fly per batch via scipy's distance_transform_edt
-    (CPU, one call per batch item per class) rather than precomputed,
-    since augmentation changes the mask every step.
-
-    Has no floor forcing any foreground prediction on its own (an
-    all-background prediction can still score 0), so CompoundLoss only
-    mixes it in at a small boundary_weight, keeping most of the convex
-    combination on Dice+CE, which anchors the mask -- see
-    CompoundLoss.boundary_weight / set_boundary_weight.
-    """
-
-    def __init__(self, apply_nonlin=None, do_bg: bool = False):
-        super().__init__()
-
-        self.apply_nonlin = apply_nonlin
-        self.do_bg = do_bg
-
-    def forward(self, x: Tensor, y: Tensor, loss_mask=None) -> Tensor:
-        if self.apply_nonlin is not None:
-            x = self.apply_nonlin(x)
-
-        with torch.no_grad():
-            y_onehot = _onehot_target(x, y, self.do_bg)
-            y_onehot_np = y_onehot.cpu().numpy().astype(bool)
-
-            dist_np = np.stack(
-                [
-                    _signed_distance_map(y_onehot_np[b, c])
-                    for b in range(y_onehot_np.shape[0])
-                    for c in range(y_onehot_np.shape[1])
-                ]
-            ).reshape(y_onehot_np.shape)
-
-            dist = torch.from_numpy(dist_np).to(device=x.device, dtype=x.dtype)
-
-        if not self.do_bg:
-            x = x[:, 1:]
-
-        if loss_mask is not None:
-            num_valid = loss_mask.expand_as(x).sum().clamp_min(1)
-            return (dist * x * loss_mask).sum() / num_valid
-
-        return (dist * x).mean()
-
-
 class CompoundLoss(nn.Module):
     """
     nnU-Net's default Dice + CE combination, but with CE made foreground-
@@ -202,13 +101,6 @@ class CompoundLoss(nn.Module):
     1.0 (plain CE, no-op) -- set it via config for tasks where the rare
     class needs a boost.
 
-    Optional BoundaryLoss term mixed in via a convex combination:
-    (1 - boundary_weight) * dice_ce + boundary_weight * boundary.
-
-    boundary_cls: BoundaryLoss, or None (no boundary term -- the
-    common case). Mixed in at self.boundary_weight, which starts at 0.0
-    and is updated externally via set_boundary_weight (module/nnunet.py
-    ramps it up over epochs when litmodule.use_boundary is set).
     """
 
     def __init__(
@@ -216,28 +108,16 @@ class CompoundLoss(nn.Module):
         batch_dice: bool,
         ddp: bool,
         ignore_label=None,
-        boundary_cls=None,
-        boundary_kwargs=None,
         foreground_weight: float = 1.0,
     ):
         super().__init__()
 
         self.ignore_label = ignore_label
-        self.boundary_weight = 0.0
         self.foreground_weight = foreground_weight
 
         self.dc = MemoryEfficientSoftDiceLoss(
             apply_nonlin=softmax_helper_dim1, batch_dice=batch_dice, smooth=1e-5, do_bg=False, ddp=ddp
         )
-
-        self.boundary = (
-            boundary_cls(apply_nonlin=softmax_helper_dim1, **(boundary_kwargs or {}))
-            if boundary_cls is not None
-            else None
-        )
-
-    def set_boundary_weight(self, weight: float) -> None:
-        self.boundary_weight = weight
 
     def _dice_ce(self, net_output: Tensor, target: Tensor) -> Tensor:
         if self.ignore_label is not None:
@@ -257,24 +137,7 @@ class CompoundLoss(nn.Module):
         target must be b, c, x, y(, z) with c=1
         """
 
-        dice_ce = self._dice_ce(net_output, target)
-
-        if self.boundary is None or self.boundary_weight <= 0:
-            return _clip_loss(dice_ce)
-
-        if self.ignore_label is not None:
-            mask = (target != self.ignore_label).bool()
-            target_region = torch.where(mask, target, torch.zeros_like(target))
-
-            if mask.sum() == 0:
-                return _clip_loss(dice_ce)
-        else:
-            mask = None
-            target_region = target
-
-        boundary = self.boundary(net_output, target_region, loss_mask=mask)
-
-        return _clip_loss((1 - self.boundary_weight) * dice_ce + self.boundary_weight * boundary)
+        return _clip_loss(self._dice_ce(net_output, target))
 
 
 # =============================================================================

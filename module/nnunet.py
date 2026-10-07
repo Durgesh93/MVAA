@@ -42,7 +42,7 @@ from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.inference.export_prediction import convert_predicted_logits_to_segmentation_with_correct_shape
 
 from .adapter import EmbeddingAdapter
-from .losses import BoundaryLoss, ClusteringCMLoss, CompoundLoss
+from .losses import ClusteringCMLoss, CompoundLoss
 
 from utils import (
     write_prediction_case_zip as _write_prediction_case_zip,
@@ -313,23 +313,14 @@ class NNUnetSetup:
         shim = self._make_trainer_shim(is_ddp)
 
         assert not self.lm.has_regions, (
-            "CompoundLoss (Dice + class-balanced CE + optional BoundaryLoss) does "
+            "CompoundLoss (Dice + class-balanced CE) does "
             "not support region-based labels"
         )
-
-        if self.cfg.use_boundary:
-            boundary_cls = BoundaryLoss
-            boundary_kwargs = {"do_bg": False}
-        else:
-            boundary_cls = None
-            boundary_kwargs = None
 
         loss = CompoundLoss(
             batch_dice=self.cm.batch_dice,
             ddp=is_ddp,
             ignore_label=self.lm.ignore_label,
-            boundary_cls=boundary_cls,
-            boundary_kwargs=boundary_kwargs,
             foreground_weight=getattr(self.cfg, "foreground_weight", 1.0),
         )
 
@@ -382,26 +373,6 @@ class NNUnetSetup:
             ignore_label=self.lm.ignore_label,
         )
 
-    @staticmethod
-    def _unwrap_compound_loss(loss):
-        """The CompoundLoss inside the DeepSupervisionWrapper build_loss always returns."""
-        return loss.loss
-
-    def update_boundary_weight(self, loss, epoch: int) -> None:
-        """
-        Ramps CompoundLoss.boundary_weight linearly from 0 at epoch 0
-        to boundary_weight_max at boundary_ramp_epochs (held at max
-        beyond that). No-op if use_boundary is off. Called once per
-        epoch (see lightning_module.py's on_train_epoch_start) --
-        Dice+CE anchors training throughout the ramp so the
-        no-floor-on-its-own boundary term (see BoundaryLoss docstring)
-        never dominates early.
-        """
-        if not self.cfg.use_boundary:
-            return
-        ramp_epochs = max(int(self.cfg.boundary_ramp_epochs), 1)
-        weight = self.cfg.boundary_weight_max * min(epoch / ramp_epochs, 1.0)
-        self._unwrap_compound_loss(loss).set_boundary_weight(weight)
 
     def build_optimizer_and_scheduler(self, network):
         shim = type("S", (), {})()
