@@ -371,7 +371,7 @@ class NNUnetSetup:
             num_classes=self.lm.num_segmentation_heads,
             cm_mode=str(self.cfg.cm_mode),
             weight=float(self.cfg.cm_weight),
-            warmup_steps=int(self.cfg.cm_warmup_steps),
+            warmup_epochs=float(self.cfg.cm_warmup_epochs),
             ema_weight=float(self.cfg.cm_ema_weight),
             num_voxels=(None if num_voxels is None else int(num_voxels)),
             conf_thr=float(self.cfg.cm_conf_thr),

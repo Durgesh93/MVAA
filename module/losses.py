@@ -330,7 +330,7 @@ class ClusteringCMLoss(nn.Module):
         num_classes: int,
         cm_mode: str = "l",
         weight: float = 0.1,
-        warmup_steps: int = 500,
+        warmup_epochs: float = 5.0,
         ema_weight: float = 0.95,
         num_voxels=32768,
         conf_thr: float = 0.9,
@@ -353,7 +353,7 @@ class ClusteringCMLoss(nn.Module):
         self.num_classes = int(num_classes)
         self.cm_mode = cm_mode
         self.weight = float(weight)
-        self.warmup_steps = int(warmup_steps)
+        self.warmup_epochs = float(warmup_epochs)
         self.ema_weight = float(ema_weight)
         self.num_voxels = None if num_voxels is None else int(num_voxels)
         self.conf_thr = float(conf_thr)
@@ -385,25 +385,34 @@ class ClusteringCMLoss(nn.Module):
         """True when cm_mode sources centroids from the unlabeled stream."""
         return self.cm_mode in ("u", "l+u")
 
-    def weight_at(self, step: int) -> float:
+    def weight_at(self, epoch_progress: float) -> float:
         """
-        Linearly ramped loss weight, 0 -> self.weight over warmup_steps.
+        Linearly ramped loss weight, 0 -> self.weight over warmup_epochs.
 
-        Driven by the caller's step (Lightning's global_step) rather than an
-        internal counter. The 2D supercm project incremented its own buffer
-        inside this function and ALSO used that buffer to decide
-        hard-copy-vs-EMA for the centroids, so a warmup of 0 silently
-        disabled the EMA; keeping the two concerns separate avoids that.
+        epoch_progress is FRACTIONAL epochs elapsed, not an integer epoch
+        index: the caller divides Lightning's global_step by the number of
+        training batches per epoch (see the LightningModule's
+        _cm_epoch_progress). Measuring the ramp in epochs rather than steps
+        makes it independent of limit_train_batches -- "five epochs of
+        warmup" means the same thing whether an epoch is 250 steps or 500 --
+        while the fractional input keeps the ramp smooth per step instead of
+        a once-per-epoch staircase in the loss.
+
+        Driven by the caller rather than an internal counter. The 2D supercm
+        project incremented its own buffer inside this function and ALSO
+        used that buffer to decide hard-copy-vs-EMA for the centroids, so a
+        warmup of 0 silently disabled the EMA; keeping the two concerns
+        separate avoids that.
 
         The ramp matters because mu is meaningless before it has seen any
-        data: at weight 0 on step 0 the loss cannot pull embeddings toward
-        a zero vector.
+        data: at weight 0 on the first step the loss cannot pull embeddings
+        toward a zero vector.
         """
 
-        if self.warmup_steps <= 0:
+        if self.warmup_epochs <= 0:
             return self.weight
 
-        return self.weight * min(float(step) / float(self.warmup_steps), 1.0)
+        return self.weight * min(float(epoch_progress) / float(self.warmup_epochs), 1.0)
 
     # -------------------------------------------------------------------------
     # Flattening helpers

@@ -130,13 +130,23 @@ litmodule:
   weight_decay: 0.00003
   num_epochs: ${trainer.max_epochs}
 
-  # Convex mix: (1 - w) * dice_ce + w * boundary, with w ramped linearly
+  # OFF. The ssl_sweep_bnd_weakstrong grid put the boundary term at +0.5
+  # Dice at best -- inside seed noise on a 30-case val split -- while
+  # costing ~58% more wall-clock per epoch (~38 vs ~24 min): BoundaryLoss
+  # runs scipy's distance transform on CPU, per sample, per step. Bad trade,
+  # so the few-shot and SuperCM experiments run plain Dice+CE.
+  #
+  # The implementation stays (module/losses.py BoundaryLoss, Kervadec et al.
+  # 2019) and the two knobs below still work -- flip this to true to bring
+  # it back. CompoundLoss skips the term entirely while the weight is 0, so
+  # off costs nothing.
+  #
+  # Convex mix when on: (1 - w) * dice_ce + w * boundary, w ramped linearly
   # from 0 to boundary_weight_max over boundary_ramp_epochs (see
-  # module/nnunet.py's update_boundary_weight). Tying the ramp to
-  # max_epochs means w only reaches its maximum on the final epoch, so the
-  # boundary term spends the whole run at partial strength -- shorten
-  # boundary_ramp_epochs to give it real epochs at full weight.
-  use_boundary: true
+  # module/nnunet.py's update_boundary_weight). Note boundary_ramp_epochs
+  # defaults to max_epochs, which means w only reaches its maximum on the
+  # final epoch -- shorten it to give the term real epochs at full weight.
+  use_boundary: false
   boundary_weight_max: 0.50
   boundary_ramp_epochs: ${trainer.max_epochs}
 
@@ -183,9 +193,14 @@ litmodule:
   cm_mode: 'l'
 
   # Weight on the clustering term, linearly ramped 0 -> cm_weight over
-  # cm_warmup_steps. The ramp is not cosmetic: mu is the zero vector until
+  # cm_warmup_epochs. The ramp is not cosmetic: mu is the zero vector until
   # it has seen a batch, and pulling embeddings toward zero is actively
   # harmful.
+  #
+  # Measured in EPOCHS, not steps, so it means the same thing regardless of
+  # limit_train_batches. The ramp is still applied per step (the
+  # LightningModule feeds it fractional epochs), so there is no
+  # once-per-epoch jump in the loss.
   #
   # 0.1 is calibrated, not guessed. The energy is divided by embedding_dim
   # so it starts near 1.0 regardless of D, which puts it on the same scale
@@ -193,7 +208,7 @@ litmodule:
   # auxiliary weight of 0.1 against that same CompoundLoss harmless and
   # >=0.5 clearly damaging. Expect to sweep this first.
   cm_weight: 0.1
-  cm_warmup_steps: 500
+  cm_warmup_epochs: 5
   cm_ema_weight: 0.95
 
   # Voxels sampled per crop for the ENERGY term (null = all of them). The

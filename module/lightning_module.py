@@ -1,3 +1,4 @@
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict
@@ -139,6 +140,26 @@ class SSLnnUNetLightningModule(L.LightningModule):
         finally:
             network.decoder.deep_supervision = previous
 
+    def _cm_epoch_progress(self) -> float:
+        """
+        Fractional epochs elapsed, for the clustering weight's ramp.
+
+        Built from Lightning's own global_step so it survives a resume and
+        cannot drift from the optimiser's view of progress, divided by the
+        batches per epoch so that cm_warmup_epochs means epochs rather than
+        steps. num_training_batches is inf for an unbounded iterable
+        dataloader; datamodule.limit_train_batches makes it finite here, but
+        fall back to the integer epoch rather than returning inf (which
+        would clamp the ramp to full weight on step one).
+        """
+
+        batches = float(getattr(self.trainer, "num_training_batches", 0) or 0)
+
+        if not math.isfinite(batches) or batches <= 0:
+            return float(self.current_epoch)
+
+        return float(self.global_step) / batches
+
     def training_step(self, batch, batch_idx):
         """
         Supervised Dice+CE over the labeled crops plus the SuperCM-style
@@ -180,9 +201,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
             u_logits=self._highest_resolution(unlabeled_logits),
         )
 
-        # Lightning's own step counter, so the ramp survives a resume and
-        # cannot drift from the optimiser's view of training progress.
-        cm_weight = self.cm_loss.weight_at(self.global_step)
+        cm_weight = self.cm_loss.weight_at(self._cm_epoch_progress())
 
         total_loss = supervised_loss + cm_weight * cm_energy
 
