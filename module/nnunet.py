@@ -355,8 +355,6 @@ class NNUnetSetup:
         centroid einsum.
         """
 
-        num_voxels = getattr(self.cfg, "cm_num_voxels", None)
-
         return ClusteringCMLoss(
             embedding_dim=int(self.cfg.embedding_dim),
             num_classes=self.lm.num_segmentation_heads,
@@ -364,7 +362,6 @@ class NNUnetSetup:
             weight=float(self.cfg.cm_weight),
             warmup_epochs=float(self.cfg.cm_warmup_epochs),
             ema_weight=float(self.cfg.cm_ema_weight),
-            num_voxels=(None if num_voxels is None else int(num_voxels)),
             conf_thr=float(self.cfg.cm_conf_thr),
             topk_frac=float(self.cfg.cm_topk_frac),
             min_keep=int(self.cfg.cm_min_keep),

@@ -195,7 +195,6 @@ class ClusteringCMLoss(nn.Module):
         weight: float = 0.1,
         warmup_epochs: float = 5.0,
         ema_weight: float = 0.95,
-        num_voxels=32768,
         conf_thr: float = 0.9,
         topk_frac: float = 0.15,
         min_keep: int = 64,
@@ -218,7 +217,6 @@ class ClusteringCMLoss(nn.Module):
         self.weight = float(weight)
         self.warmup_epochs = float(warmup_epochs)
         self.ema_weight = float(ema_weight)
-        self.num_voxels = None if num_voxels is None else int(num_voxels)
         self.conf_thr = float(conf_thr)
         self.topk_frac = float(topk_frac)
         self.min_keep = int(min_keep)
@@ -424,10 +422,9 @@ class ClusteringCMLoss(nn.Module):
         streams: list of (x, y) with x (B, D, P) and y (B, C, P) already
         zeroed at excluded voxels, so no separate mask is needed here.
 
-        Runs on the FULL voxel set, not the subsample the energy uses: this
-        is under no_grad, so the einsum keeps nothing for backward and the
-        extra accuracy in the class means is free. Only the energy term
-        needs to be economical.
+        Under no_grad, so the einsum keeps nothing for backward -- the cost
+        is pure compute (B*D*C*P multiply-accumulates, ~2 GFLOP at a
+        112x96x128 patch) with no activation footprint at all.
 
         Under DDP the numerator and denominator are all-reduced before the
         division, so every rank ends up with the SAME centroids. Estimating
@@ -474,24 +471,21 @@ class ClusteringCMLoss(nn.Module):
     # -------------------------------------------------------------------------
     # Energy
     # -------------------------------------------------------------------------
-    def _subsample_indices(self, num_voxels: int, device):
-        """Shared voxel subset for the energy term, or None to use all of them."""
-
-        if self.num_voxels is None or self.num_voxels >= num_voxels:
-            return None
-
-        return torch.randperm(num_voxels, device=device)[: self.num_voxels]
-
     def _energy(self, x: Tensor, g: Tensor, valid: Tensor) -> Tensor:
         """
         mean over valid voxels of sum_k g_k ||x - mu_k||^2.
 
-        Expanded rather than computed from an explicit difference, so the
-        largest intermediate is (B, C, P) with C=3 instead of (B, D, P)
-        with D=128. The 2D supercm project's permute(...).reshape(-1, D)
-        materialises a full (B*P, D) copy that is then held for backward --
-        at a 112x96x128 patch that is ~350 MB per sample of avoidable
-        activation memory.
+        Every voxel contributes -- no subsampling. At a 112x96x128 patch and
+        batch 2 that is 2.75M voxels per step, which is affordable only
+        because of how this is written: expanded rather than computed from an
+        explicit difference, so the only tensors RETAINED for backward are
+        (B, C, P) with C=3. x.pow(2) is transiently (B, D, P) but is freed by
+        the sum, and backward needs x itself, which exists anyway as the
+        adapter's output.
+
+        The 2D supercm project instead did permute(...).reshape(-1, D),
+        materialising a full (B*P, D) copy that IS held for backward -- about
+        350 MB per sample at this patch size, on top of the embedding.
 
         sum_k g_k == 1 (g is a softmax), which is what lets the ||x||^2
         term come out of the class sum as a single (B, P) map.
@@ -528,6 +522,17 @@ class ClusteringCMLoss(nn.Module):
 
         if not self.normalize:
             per_voxel = per_voxel / float(self.embedding_dim)
+
+        # float32 for the reduction over voxels, whatever autocast handed us.
+        # Two reasons, both load-bearing now that every voxel contributes:
+        # summing 2.75M fp16 values loses most of the mantissa (fp16 carries
+        # ~3 decimal digits, and the running total dwarfs each addend), and
+        # _clip_loss cannot clamp a Half tensor to +/-1e6 at all -- it raises
+        # "value cannot be converted to type at::Half without overflow".
+        #
+        # Cheap: per_voxel is (B, P), so this is ~11 MB at a 112x96x128 patch,
+        # not the (B, D, P) embedding.
+        per_voxel = per_voxel.float()
 
         weights = valid.to(per_voxel.dtype)
 
@@ -588,13 +593,6 @@ class ClusteringCMLoss(nn.Module):
         total = None
 
         for x, g, valid in energy_terms:
-            indices = self._subsample_indices(x.shape[2], x.device)
-
-            if indices is not None:
-                x = x.index_select(2, indices)
-                g = g.index_select(2, indices)
-                valid = valid.index_select(1, indices)
-
             term = self._energy(x, g, valid)
             total = term if total is None else total + term
 

@@ -192,14 +192,6 @@ litmodule:
   cm_warmup_epochs: 5
   cm_ema_weight: 0.95
 
-  # Voxels sampled per crop for the ENERGY term (null = all of them). The
-  # centroid estimate always uses every valid voxel -- it runs under
-  # no_grad, so accuracy there is free. Only the energy keeps activations
-  # for backward, and a 112x96x128 patch is 1.38M voxels: at 128 channels
-  # that is ~350 MB per sample of avoidable memory. A clustering penalty is
-  # a statistical statement about the embedding distribution, so a few 10^4
-  # voxels per crop estimates it fine.
-  cm_num_voxels: 32768
 
   # Unlabeled pseudo-label filtering; ignored at cm_mode=l.
   #
