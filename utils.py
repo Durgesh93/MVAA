@@ -244,9 +244,7 @@ def resolve_prediction_ckpt(cfg, ckpt):
 # =============================================================================
 
 
-def save_training_progress_plot(
-    history, progress_png_file, dataset_name, dice_classwise_keys=None, pseudo_confident_frac_classwise_keys=None
-):
+def save_training_progress_plot(history, progress_png_file, dataset_name, dice_classwise_keys=None):
     """
     Save training_progress.png from already-computed NumPy history.
 
@@ -255,14 +253,6 @@ def save_training_progress_plot(
     plots one line per class instead of the single aggregate "dice" mean,
     so classwise performance (e.g. the checkpoint-monitored class vs.
     training-only auxiliary classes) is visible directly in the plot.
-
-    pseudo_confident_frac_classwise_keys: same idea for the "Pseudo
-    confident pixel frac" panel, but covering every class (background and
-    auxiliary classes included, not just tracked_labels) -- the aggregate
-    confident_frac is computed over every pixel regardless of class, so a
-    class occupying only a couple percent of a volume can be silently
-    filtered out (or not) with almost no visible effect on the aggregate,
-    which stays dominated by whatever the majority class is.
     """
 
     if "epoch" not in history:
@@ -276,8 +266,9 @@ def save_training_progress_plot(
     plot_keys = [
         ("train_loss", "Train loss", "min"),
         ("train_sup_loss", "Supervised loss", "min"),
-        ("train_pseudo_loss", "Pseudo loss", "min"),
-        ("train_pseudo_confident_frac", "Pseudo confident pixel frac", "max"),
+        ("train_cm_loss", "CM clustering energy", "min"),
+        ("train_cm_weight", "CM weight (ramped)", "max"),
+        ("train_cm_confident_frac", "CM confident voxel frac", "max"),
         ("dice", "Dice", "max"),
         ("asd_mm", "ASD mm", "min"),
         ("hd_mm", "HD mm", "min"),
@@ -300,11 +291,6 @@ def save_training_progress_plot(
     for ax, (key, title, best_mode) in zip(axes, plot_keys):
         if key == "dice" and dice_classwise_keys:
             series = {k.removeprefix("dice_"): np.asarray(history[k], dtype=float) for k in dice_classwise_keys}
-        elif key == "train_pseudo_confident_frac" and pseudo_confident_frac_classwise_keys:
-            series = {
-                k.removeprefix("train_pseudo_confident_frac_"): np.asarray(history[k], dtype=float)
-                for k in pseudo_confident_frac_classwise_keys
-            }
         else:
             series = {key: np.asarray(history[key], dtype=float)}
 

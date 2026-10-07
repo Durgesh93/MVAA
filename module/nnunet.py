@@ -41,7 +41,8 @@ from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.inference.export_prediction import convert_predicted_logits_to_segmentation_with_correct_shape
 
-from .losses import BoundaryLoss, CompoundLoss, WeakStrongPseudoLabelLoss
+from .adapter import EmbeddingAdapter
+from .losses import BoundaryLoss, ClusteringCMLoss, CompoundLoss
 
 from utils import (
     write_prediction_case_zip as _write_prediction_case_zip,
@@ -135,25 +136,42 @@ class PredictionOps:
             compute_gaussian.cache_clear()
         return logits
 
-    def _restore_prediction_shape(self, logits, properties):
-        predicted_segments, predicted_probs = convert_predicted_logits_to_segmentation_with_correct_shape(
+    def _restore_prediction_shape(self, logits, properties, return_probabilities=True):
+        """
+        Resample the logits back onto the case's original grid.
+
+        The probability maps are only ever consumed by the case zip's
+        per-class probability channels, so when nothing is being written they
+        are skipped: nnU-Net returns the segmentation alone in that case, and
+        holding a C-channel float volume at full original resolution is the
+        single largest allocation in the eval path.
+        """
+
+        result = convert_predicted_logits_to_segmentation_with_correct_shape(
             predicted_logits=logits.cpu(),
             plans_manager=self.pm,
             configuration_manager=self.cm,
             label_manager=self.lm,
             properties_dict=properties,
-            return_probabilities=True,
+            return_probabilities=return_probabilities,
         )
-        return predicted_segments, predicted_probs
+
+        if return_probabilities:
+            return result
+
+        return result, None
 
     # =========================================================================
     # Main prediction entry point
     # =========================================================================
-    def run_prediction(self, network, device, batch, batch_idx=None, use_tta=True):
+    def run_prediction(self, network, device, batch, batch_idx=None, use_tta=True, need_probs=True):
         """
         use_tta=False forces a single non-overlapping sliding-window pass
         (no mirroring, step 1.0), which is what validation uses. True uses
         the configured tta_use_mirroring / tta_tile_step_size.
+
+        need_probs=False skips building the full-resolution probability
+        volume, which only the case zip reads.
         """
 
         use_mirroring = self.use_mirroring if use_tta else False
@@ -167,7 +185,9 @@ class PredictionOps:
             use_mirroring=use_mirroring,
             tile_step_size=tile_step_size,
         )
-        predicted_segments, predicted_probs = self._restore_prediction_shape(logits=logits, properties=item["properties"])
+        predicted_segments, predicted_probs = self._restore_prediction_shape(
+            logits=logits, properties=item["properties"], return_probabilities=need_probs
+        )
         if self.postprocess_keep_largest_component:
             predicted_segments = _keep_largest_component(predicted_segments, self.lm.foreground_labels)
         item.update({"logits": logits, "predicted_segments": predicted_segments, "predicted_probs": predicted_probs})
@@ -225,8 +245,51 @@ class NNUnetSetup:
         return shim
 
     def build_network(self):
-        return nnUNetTrainer.build_network_architecture(
-            self.pm, self.cm, self.num_input_channels, self.lm.num_segmentation_heads, self.enable_deep_supervision
+        """
+        The nnU-Net trunk, optionally ending in an embedding adapter.
+
+        use_embedding_adapter=false gives stock nnU-Net: the decoder's
+        seg_layers map straight to num_segmentation_heads logits.
+
+        true builds the SAME trunk with embedding_dim output channels
+        instead and bolts a shared 1x1 classifier on top, so every voxel
+        carries an explicit embedding_dim-dimensional feature vector that a
+        clustering loss can reach (see module/adapter.py). The returned
+        module still emits class logits from forward(), so the loss, the
+        deep-supervision wrapper and nnUNetPredictor are unaffected.
+
+        The two are NOT checkpoint-compatible -- the adapter renames every
+        trunk parameter under "backbone." and adds "classifier." -- so
+        flipping the flag means retraining, not resuming.
+        """
+
+        if not bool(getattr(self.cfg, "use_embedding_adapter", False)):
+            return nnUNetTrainer.build_network_architecture(
+                self.pm, self.cm, self.num_input_channels, self.lm.num_segmentation_heads, self.enable_deep_supervision
+            )
+
+        embedding_dim = int(self.cfg.embedding_dim)
+
+        if embedding_dim < self.lm.num_segmentation_heads:
+            raise ValueError(
+                f"embedding_dim={embedding_dim} is below num_segmentation_heads="
+                f"{self.lm.num_segmentation_heads}. The classifier is a linear map off the "
+                "embedding, so a narrower embedding would bottleneck the logits."
+            )
+
+        backbone = nnUNetTrainer.build_network_architecture(
+            self.pm, self.cm, self.num_input_channels, embedding_dim, self.enable_deep_supervision
+        )
+
+        # Conv class read off the trunk's own seg_layers rather than
+        # hardcoded to Conv3d, so a 2d configuration needs no special case.
+        conv_op = type(backbone.decoder.seg_layers[0])
+
+        return EmbeddingAdapter(
+            backbone=backbone,
+            embedding_dim=embedding_dim,
+            num_classes=self.lm.num_segmentation_heads,
+            conv_op=conv_op,
         )
 
     def build_loss(self, is_ddp):
@@ -269,8 +332,43 @@ class NNUnetSetup:
 
         return loss
 
-    def build_pseudo_loss(self):
-        return WeakStrongPseudoLabelLoss(adaptive_momentum=self.cfg.pseudo_threshold_momentum)
+    def build_cm_loss(self):
+        """
+        The SuperCM-style clustering regularizer, or None when it is off.
+
+        num_classes and ignore_label are read off the label manager rather
+        than the yaml so they cannot drift from what the supervised loss and
+        the predictor use. embedding_dim comes from the config because it is
+        the same value build_network() hands the trunk -- the two have to
+        agree, and a mismatch surfaces immediately as a shape error in the
+        centroid einsum.
+        """
+
+        if not bool(getattr(self.cfg, "use_cm_loss", False)):
+            return None
+
+        if not bool(getattr(self.cfg, "use_embedding_adapter", False)):
+            raise ValueError(
+                "use_cm_loss=true needs use_embedding_adapter=true: without the adapter the "
+                "decoder emits class logits directly and there is no per-voxel embedding to cluster."
+            )
+
+        num_voxels = getattr(self.cfg, "cm_num_voxels", None)
+
+        return ClusteringCMLoss(
+            embedding_dim=int(self.cfg.embedding_dim),
+            num_classes=self.lm.num_segmentation_heads,
+            cm_mode=str(self.cfg.cm_mode),
+            weight=float(self.cfg.cm_weight),
+            warmup_steps=int(self.cfg.cm_warmup_steps),
+            ema_weight=float(self.cfg.cm_ema_weight),
+            num_voxels=(None if num_voxels is None else int(num_voxels)),
+            conf_thr=float(self.cfg.cm_conf_thr),
+            topk_frac=float(self.cfg.cm_topk_frac),
+            min_keep=int(self.cfg.cm_min_keep),
+            normalize=bool(getattr(self.cfg, "cm_normalize", False)),
+            ignore_label=self.lm.ignore_label,
+        )
 
     @staticmethod
     def _unwrap_compound_loss(loss):

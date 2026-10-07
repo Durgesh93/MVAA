@@ -4,13 +4,17 @@
 
 seed: 12345
 
-# Must differ from the parent branch's ssl_small_patch_size:
+# Must differ from the parent branch's ssl_tee:
 # paths.nnunet_results below resolves under dirs/data_storage/nnUNet,
 # which is the SAME physical scratch path for every MVAA branch (data
 # storage isn't branch-parameterized) -- reusing the parent's
 # experiment_name would read/overwrite its checkpoints and
 # validation/prediction outputs in place.
-experiment_name: ssl_tee
+#
+# A few-shot sweep writes one results folder per setting, so override this
+# per run (e.g. experiment_name=fewshot_tee_n05) rather than letting every
+# arm land on the same path.
+experiment_name: fewshot_tee
 
 # =============================================================================
 # Runtime / cluster-controlled values
@@ -65,29 +69,53 @@ datamodule:
   configuration: ${configuration}
   seed: ${seed}
   plans_identifier: ${plans_identifier}
-  K: 5
+  # TOTAL views the unlabeled loader builds per sample, weak view
+  # INCLUDED: K=2 is 1 weak + 1 strong, the loader's minimum. See
+  # datamodule/multiview_loader.py.
+  #
+  # The clustering loss is not a consistency loss: it reads ONE view of a
+  # crop (data_views[0], the geometric-only one), so the strong views are
+  # unused and K sits at the floor. Raise it again only if a weak/strong
+  # consistency term comes back -- each extra view is one more intensity
+  # pipeline per unlabeled sample per step, on the CPU side that was
+  # already the bottleneck.
+  #
+  # At cm_mode=l nothing reads the unlabeled loader at all.
+  K: 2
   transform_geometric: true
+
+  # Optimizer steps per epoch, per rank. Fixed rather than derived from
+  # the labeled/unlabeled pool sizes so that "epoch" means the same amount
+  # of training at every num_labeled -- see the datamodule's setup().
+  # Total updates for a run are limit_train_batches * trainer.max_epochs.
+  limit_train_batches: 500
   oversample_fg: 0.65
   patch_size_override: ${patch_size_override}
 
-  # Fraction of the 105 official MVSeg2023 train cases that keep their
-  # labels. MVSeg2023 is fully labeled, so unlike the old TrL/TrU scheme
-  # (which read a labeled/unlabeled partition straight out of
-  # dataset.json) the unlabeled pool has to be synthesized here: the
-  # remaining 1 - labeled_fraction cases are fed to the unlabeled branch
-  # with their targets never reaching a loss.
+  # How many of the 105 official MVSeg2023 train cases keep their labels.
+  # A COUNT, not a fraction: valid values are 1 .. 105, and the datamodule
+  # raises on anything outside that. This is the one knob this branch
+  # exists to sweep.
   #
-  # The draw is seeded and NESTED -- the cases picked at 0.1 are a subset
-  # of those picked at 0.2 -- so a labeled_fraction sweep varies only how
-  # much supervision is available, not which cases provide it.
+  # MVSeg2023 is fully labeled, so unlike the old TrL/TrU scheme (which
+  # read a labeled/unlabeled partition straight out of dataset.json) the
+  # unlabeled pool has to be synthesized here: the remaining
+  # 105 - num_labeled cases are routed to the unlabeled branch.
   #
-  # 1.0 leaves the unlabeled pool empty and trains the plain supervised
-  # baseline through this same code path, which is the comparison any
-  # SSL result has to beat.
+  # The draw is seeded and NESTED -- the cases picked at 5 are a prefix of
+  # those picked at 10 -- so the sweep varies only how much supervision is
+  # available, not which cases provide it.
+  #
+  # num_labeled=105 leaves the unlabeled pool empty, so one labeled case is
+  # recycled into it. Both dataloaders therefore always exist and
+  # training_step never has to test whether the unlabeled branch is there.
+  # That recycling is harmless here because nothing on this branch reads
+  # the unlabeled batch at all.
   #
   # The 30 official val and 40 official test cases are never touched by
-  # this split.
-  labeled_fraction: 0.2
+  # this split, so a num_labeled=1 run is still scored against the full
+  # 30-case val split.
+  num_labeled: 1
 
 # =============================================================================
 # LightningModule config
@@ -101,21 +129,149 @@ litmodule:
   initial_lr: 0.01
   weight_decay: 0.00003
   num_epochs: ${trainer.max_epochs}
+
+  # Convex mix: (1 - w) * dice_ce + w * boundary, with w ramped linearly
+  # from 0 to boundary_weight_max over boundary_ramp_epochs (see
+  # module/nnunet.py's update_boundary_weight). Tying the ramp to
+  # max_epochs means w only reaches its maximum on the final epoch, so the
+  # boundary term spends the whole run at partial strength -- shorten
+  # boundary_ramp_epochs to give it real epochs at full weight.
   use_boundary: true
-  boundary_weight_max: 0.20
+  boundary_weight_max: 0.50
   boundary_ramp_epochs: ${trainer.max_epochs}
-  lambda_pseudo: 0.20
-  pseudo_threshold_momentum: 0.999
-  pseudo_warmup_epochs: 5
+
+  # Per-voxel embedding adapter (module/adapter.py). false is stock
+  # nnU-Net, whose decoder maps straight to the 3 class logits. true builds
+  # the same trunk with embedding_dim channels and a shared 1x1 classifier
+  # on top, so every voxel carries an explicit 128-d feature vector for a
+  # clustering-style loss to work on, reachable via the LightningModule's
+  # forward_embeddings().
+  #
+  # There is no nonlinearity between the trunk and the classifier, so this
+  # is a full-rank reparameterization rather than added capacity: it should
+  # not move the supervised baseline on its own.
+  #
+  # Switching the flag changes every parameter name, so the two settings
+  # cannot share a checkpoint.
+  use_embedding_adapter: true
+  embedding_dim: 128
+
+  # ---------------------------------------------------------------------------
+  # SuperCM-style clustering regularizer (module/losses.py ClusteringCMLoss).
+  #
+  # Penalises sum_k g_k ||x - mu_k||^2 over voxels, where x is the 128-d
+  # embedding above, g is the network's own softmax, and mu_k is a class
+  # centroid re-estimated in closed form each step and EMA-blended. It
+  # tightens class clusters in embedding space; mu is a buffer, never
+  # optimised, so the only thing trained is the embedding itself.
+  #
+  # Requires use_embedding_adapter: true -- build_cm_loss raises otherwise.
+  # ---------------------------------------------------------------------------
+  use_cm_loss: true
+
+  # Where the centroid assignments come from:
+  #   l    ground-truth one-hot on the labeled crops. No pseudo-labelling
+  #        anywhere, and no unlabeled forward pass at all -- the cheapest
+  #        and most honest first question: does tightening clusters around
+  #        TRUE class means help?
+  #   u    confident pseudo-labels on the unlabeled crops.
+  #   l+u  both. The actual semi-supervised claim.
+  cm_mode: 'l'
+
+  # Weight on the clustering term, linearly ramped 0 -> cm_weight over
+  # cm_warmup_steps. The ramp is not cosmetic: mu is the zero vector until
+  # it has seen a batch, and pulling embeddings toward zero is actively
+  # harmful.
+  #
+  # 0.1 is calibrated, not guessed. The energy is divided by embedding_dim
+  # so it starts near 1.0 regardless of D, which puts it on the same scale
+  # as CompoundLoss; and the ssl_sweep_bnd_weakstrong grid found an
+  # auxiliary weight of 0.1 against that same CompoundLoss harmless and
+  # >=0.5 clearly damaging. Expect to sweep this first.
+  cm_weight: 0.1
+  cm_warmup_steps: 500
+  cm_ema_weight: 0.95
+
+  # Voxels sampled per crop for the ENERGY term (null = all of them). The
+  # centroid estimate always uses every valid voxel -- it runs under
+  # no_grad, so accuracy there is free. Only the energy keeps activations
+  # for backward, and a 112x96x128 patch is 1.38M voxels: at 128 channels
+  # that is ~350 MB per sample of avoidable memory. A clustering penalty is
+  # a statistical statement about the embedding distribution, so a few 10^4
+  # voxels per crop estimates it fine.
+  cm_num_voxels: 32768
+
+  # Unlabeled pseudo-label filtering; ignored at cm_mode=l.
+  #
+  # Selection is PER PREDICTED CLASS. A global top-k would be ~all
+  # background -- the leaflets are a couple of percent of a crop -- leaving
+  # the foreground centroids estimated from nothing. cm_min_keep is also
+  # the floor that keeps cm_conf_thr from emptying the set early in
+  # training, when nothing clears 0.9.
+  cm_conf_thr: 0.90
+  cm_topk_frac: 0.15
+  cm_min_keep: 64
+
+  # true switches the energy to spherical k-means (2 - 2cos), L2-normalising
+  # both embeddings and centroids. Scale-invariant, so the term cannot be
+  # satisfied by simply shrinking every embedding toward the origin -- worth
+  # trying if the Euclidean form collapses the embedding norms.
+  cm_normalize: false
+
   foreground_weight: 10.0
   tracked_labels: ["posterior_leaflet", "anterior_leaflet"]
   postprocess_keep_largest_component: true
+
+  # Per-case validation outputs: one zip per case holding the raw image, a
+  # probability map per class, the prediction, the ground truth and a Slicer
+  # scene -- 10-25 MB each, so ~450 MB for the 30-case val split, rewritten
+  # from scratch every validation epoch.
+  #
+  # Nothing downstream reads them. Checkpoint selection uses the logged
+  # metrics, and the metrics themselves are computed from the in-memory
+  # prediction, not from the files. They exist purely to eyeball a run in
+  # Slicer, so a sweep has no use for them at all.
+  #
+  # false also skips building the full-resolution probability volume, which
+  # only the zip's probability channels consume, and skips the rank-folder
+  # merge that exists solely to collect those zips.
+  #
+  # This applies to BOTH stages: with it off, `engine.py test` scores the test
+  # split and logs the metrics but writes no files either. Turn it back on for
+  # the run whose predictions you actually want to keep.
+  save_case_outputs: true
   # TEST-TIME ONLY. Validation always runs a single non-overlapping pass
   # with no mirroring -- it exists to rank checkpoints, and full TTA there
   # costs ~64x per case (~46 s vs a ~2 min training epoch).
   tta_use_mirroring: true
   tta_tile_step_size: 0.5
   patch_size_override: ${patch_size_override}
+
+# =============================================================================
+# Weights & Biases
+#
+# Credentials come from ~/.netrc (api.wandb.ai); the run directory comes from
+# $WANDB_DIR, which the LUMI workspace helper already exports. Only global
+# rank 0 opens a run -- Lightning's WandbLogger guards its experiment handle
+# with rank_zero_experiment, so the other seven ranks log nothing.
+#
+# mode: online writes straight to wandb.ai (LUMI compute nodes do have
+# outbound access). Switch to offline if a node cannot reach it, then run
+# `wandb sync $WANDB_DIR/wandb/offline-run-*` afterwards. disabled turns the
+# logger into a no-op without touching the rest of the config.
+#
+# enabled: false falls back to Lightning's logger=false, i.e. exactly the
+# behaviour this project had before W&B was added.
+# =============================================================================
+
+wandb:
+  enabled: true
+  entity: echo_vi
+  project: mvaa
+  tags: ["ssl_mvseg"]
+  mode: online
+  # Optional run grouping in the W&B UI; null leaves runs ungrouped.
+  group: null
 
 # =============================================================================
 # Trainer config
@@ -126,7 +282,15 @@ trainer:
   strategy: ${training_strategy}
   precision: 16-mixed
   log_every_n_steps: 1
-  check_val_every_n_epoch: 1
+  # Validation is a full sliding-window pass over all 30 val cases plus
+  # surface-distance metrics -- minutes of work that produces one scalar for
+  # checkpoint selection. At 500 steps per epoch there is enough real
+  # progress between epochs that scoring every 5th is plenty.
+  #
+  # NOTE: the training-side metrics (train_loss etc.) are reset in
+  # _eval_epoch_end, so they now aggregate over 5 epochs rather than 1. That
+  # smooths the logged curves; it does not change training.
+  check_val_every_n_epoch: 5
   enable_progress_bar: true
   enable_checkpointing: true
   deterministic: false

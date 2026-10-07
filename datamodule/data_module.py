@@ -6,13 +6,20 @@ train (105) / val (30) / test (40) partition, which is the only split the
 dataset defines and is used as-is.
 
 Every MVSeg2023 case is labeled, so the labeled/unlabeled partition is
-SYNTHESIZED rather than read: cfg.labeled_fraction of the train split
-keeps its labels (TrL) and the remainder becomes the unlabeled pool
-(TrU). The draw is seeded and nested across fractions. Nothing is
-stripped on disk -- a case is unlabeled only because it is routed to the
-unlabeled loader, whose targets never reach a loss. At
-labeled_fraction=1.0 the pool is empty, no unlabeled loader is built, and
-training is plain supervised.
+SYNTHESIZED rather than read: cfg.num_labeled cases of the train split
+keep their labels (TrL) and the remainder becomes the unlabeled pool
+(TrU). The draw is seeded and nested across sizes -- the cases picked at
+num_labeled=5 are a prefix of those picked at 10 -- so a sweep varies how
+much supervision there is, not which cases supply it. Nothing is stripped
+on disk: a case is unlabeled only because it is routed to the unlabeled
+loader.
+
+Whether that loader is read depends on litmodule.cm_mode: the clustering
+regularizer sources centroids from the labeled crops only at cm_mode=l (the
+default, where TrU goes untouched) and from the unlabeled crops at
+cm_mode=u / l+u. It is built either way -- see setup(), which floors the
+unlabeled pool at one case so both dataloaders always exist and
+training_step never has to test for the key.
 
 Train:
     preprocessed nnUNetDataset + nnUNetDataLoader for TrL, plus a
@@ -74,16 +81,33 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
         self.K = int(self.cfg.K)
         self.transform_geometric = bool(self.cfg.transform_geometric)
 
+        # On, and must stay in step with the LightningModule's copy -- they
+        # disagree and the first training step dies on shapes. This populates
+        # ds_scales, so DownsampleSegForDSTransform joins the geometric
+        # pipeline and a batch's "target" is a LIST, one entry per decoder
+        # stage, highest resolution first.
+        #
+        # The clustering loss only ever reads target[0] (see the
+        # LightningModule's _highest_resolution), so deep supervision costs
+        # it nothing: the coarser stages serve the supervised term, which is
+        # what nnU-Net tunes its defaults around.
         self.enable_deep_supervision = True
         self.oversample_fg = float(self.cfg.oversample_fg)
         self.print_case_ids = True
 
-        self.labeled_fraction = float(self.cfg.labeled_fraction)
+        # A COUNT of labeled training images, not a fraction. This branch
+        # sweeps the few-shot regime, where the settings worth running (1,
+        # 2, 5, 10 images) sit within a few percent of the 105-case train
+        # split -- a fraction would quantise them into each other and make
+        # "how many images do we actually need?" unanswerable.
+        #
+        # The upper bound is checked once train_all is known, below.
+        self.num_labeled = int(self.cfg.num_labeled)
 
-        if not 0.0 < self.labeled_fraction <= 1.0:
+        if self.num_labeled < 1:
             raise ValueError(
-                f"labeled_fraction must be in (0, 1], got {self.labeled_fraction}. "
-                "Use 1.0 for the fully supervised baseline (empty unlabeled pool)."
+                f"num_labeled must be >= 1, got {self.num_labeled}. "
+                "It is a count of labeled images, not a fraction."
             )
 
         # These are resolved automatically in setup(),
@@ -130,12 +154,19 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
         # cases is labeled -- unlike the old ssl_case_ids TrL/TrU/Ts key,
         # this says nothing about supervision, only provenance. The
         # labeled/unlabeled split is synthesized in setup() from
-        # cfg.labeled_fraction.
+        # cfg.num_labeled.
         case_ids = self.dataset_json["case_ids"]
 
         self.train_all = list(case_ids["train"])
         self.val_all = list(case_ids["val"])
         self.ts_all = list(case_ids["test"])
+
+        if self.num_labeled > len(self.train_all):
+            raise ValueError(
+                f"num_labeled={self.num_labeled} exceeds the {len(self.train_all)} cases "
+                f"in the official MVSeg2023 train split. The 30 val and 40 test cases "
+                f"are never available for training."
+            )
 
         self.ds_class = None
 
@@ -332,26 +363,49 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
         # withholding labels rather than read from the dataset. The
         # shuffle is seeded and drawn ONCE over the whole train split,
         # then truncated -- which makes the subsets nested (the cases
-        # chosen at 0.1 are a prefix of those chosen at 0.2), so a
-        # labeled_fraction sweep varies how much supervision there is,
-        # not which cases supply it.
+        # chosen at num_labeled=5 are a prefix of those chosen at 10), so
+        # a sweep varies how much supervision there is, not which cases
+        # supply it. That nesting is what makes a few-shot curve readable:
+        # going from 1 to 2 images adds an image, it does not redraw the
+        # experiment.
         #
         # Nothing strips the segmentations on disk: a case is "unlabeled"
         # purely because it is routed to the unlabeled loader, whose
-        # targets never reach a loss (see the LightningModule's
-        # _pseudo_loss, which reads only data_views).
+        # targets never reach a loss -- the clustering term reads only its
+        # data_views (see the LightningModule's training_step).
         # ------------------------------------------------------------
         shuffled_tr = np.array(sorted(full_tr))
         np.random.default_rng(self.seed).shuffle(shuffled_tr)
 
-        n_labeled = max(1, int(round(self.labeled_fraction * len(shuffled_tr))))
+        # num_labeled is validated >= 1 in __init__, so the labeled pool is
+        # never empty. The unlabeled pool CAN be, at num_labeled ==
+        # len(train_all), and the fallback below floors it at one case so
+        # that both dataloaders ALWAYS exist.
+        #
+        # Reusing an already-labeled case as the lone unlabeled case is
+        # sound because the unlabeled branch never reads targets -- it sees
+        # only data_views. It does mean that at num_labeled == len(train_all)
+        # a cm_mode=u / l+u run draws its "unlabeled" centroids from one
+        # already-labeled case, which is degenerate -- but so is asking for
+        # semi-supervised training with nothing held out.
+        #
+        # The point is one code path instead of two. Without this there was
+        # a has_unlabeled flag, a None dataset, a single-key CombinedLoader
+        # and an `"unlabeled" in batch` test in training_step: a branch only
+        # the top of the sweep ever took, and that nothing else exercised.
+        # split_by_rank already hands every rank the same case when there
+        # are fewer cases than ranks, so a one-case pool is safe under DDP
+        # -- which is exactly the num_labeled=1 setting this branch exists
+        # to measure.
+        n_labeled = self.num_labeled
 
         full_labeled = list(sorted(shuffled_tr[:n_labeled].tolist()))
         full_tru = list(sorted(shuffled_tr[n_labeled:].tolist()))
 
-        full_tr = full_labeled
+        if not full_tru:
+            full_tru = full_labeled[:1]
 
-        self.has_unlabeled = len(full_tru) > 0
+        full_tr = full_labeled
 
         # ------------------------------------------------------------
         # Rank-local split
@@ -367,25 +421,34 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
         # ------------------------------------------------------------
         # Train limit for infinite nnU-Net loaders
         #
-        # CombinedLoader(mode="max_size_cycle") cycles the smaller of
-        # TrL/TrU per rank to match the larger, so the epoch length must
-        # account for whichever is bigger -- not just TrL.
+        # Both loaders are infinite samplers, so an "epoch" is whatever
+        # number of steps we declare it to be. This used to be derived from
+        # the pool sizes -- ceil(max(TrL, TrU) per rank / batch_size) --
+        # which made epoch length a FUNCTION OF the labeled pool size: 4
+        # steps at half the split, 6 at a tenth (driven by the large
+        # unlabeled pool), 7 at all of it. A sweep at fixed max_epochs then
+        # gave each arm a different number of gradient updates, so the
+        # comparison measured optimisation budget as much as supervision,
+        # and the smallest pool could win purely by converging sooner.
+        # That confound is fatal to a few-shot curve, where the whole
+        # question is what supervision alone buys.
+        #
+        # A constant makes the epoch mean one thing everywhere, which is
+        # what nnU-Net itself does (250 iterations per epoch, fixed).
         # ------------------------------------------------------------
-        max_rank_cases = 0
+        self.limit_train_batches = int(self.cfg.limit_train_batches)
 
-        for rank in range(world_size):
-            rank_tr_cases = split_by_rank(full_tr, global_rank=rank, world_size=world_size)
-            rank_tru_cases = split_by_rank(full_tru, global_rank=rank, world_size=world_size)
-            max_rank_cases = max(max_rank_cases, len(rank_tr_cases), len(rank_tru_cases))
-
-        self.limit_train_batches = max(1, math.ceil(max_rank_cases / self.batch_size))
+        if self.limit_train_batches < 1:
+            raise ValueError(
+                f"limit_train_batches must be >= 1, got {self.limit_train_batches}."
+            )
 
         trainer.limit_train_batches = self.limit_train_batches
 
         print(
             f"\n[rank {global_rank}/{world_size}] "
-            f"labeled_fraction={self.labeled_fraction} "
-            f"({len(full_tr)}/{len(full_tr) + len(full_tru)} train cases labeled) | "
+            f"num_labeled={self.num_labeled} "
+            f"({len(full_tr)}/{len(self.train_all)} train cases labeled) | "
             f"TrL={len(tr_cases)} | "
             f"TrU={len(tru_cases)} | "
             f"ValRaw={len(val_cases)} | "
@@ -421,13 +484,8 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
             self.folder, tr_cases, folder_with_segs_from_previous_stage=self.prev_stage_folder
         )
 
-        # At labeled_fraction=1.0 there is no unlabeled pool, so no
-        # unlabeled dataset/loader is built at all and training runs
-        # purely supervised through this same code path.
-        self.dataset_train_unlabeled = (
-            self.ds_class(self.folder, tru_cases, folder_with_segs_from_previous_stage=self.prev_stage_folder)
-            if self.has_unlabeled
-            else None
+        self.dataset_train_unlabeled = self.ds_class(
+            self.folder, tru_cases, folder_with_segs_from_previous_stage=self.prev_stage_folder
         )
 
         # ------------------------------------------------------------
@@ -468,7 +526,7 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
         if self.dataset_train_labeled is None:
             raise RuntimeError("dataset_train_labeled is None. setup() did not run correctly.")
 
-        if self.has_unlabeled and self.dataset_train_unlabeled is None:
+        if self.dataset_train_unlabeled is None:
             raise RuntimeError("dataset_train_unlabeled is None. setup() did not run correctly.")
 
         _, _, init_ps, _ = self._get_da_params_from_nnunet()
@@ -495,9 +553,6 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
             probabilistic_oversampling=False,
             transforms=labeled_tfm,
         )
-
-        if not self.has_unlabeled:
-            return CombinedLoader({"labeled": self._make_augmenter(labeled_loader)}, mode="max_size_cycle")
 
         unlabeled_loader = MultiViewUnlabeledDataLoader(
             data=self.dataset_train_unlabeled,

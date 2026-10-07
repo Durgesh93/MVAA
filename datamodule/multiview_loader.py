@@ -35,6 +35,18 @@ class MultiViewUnlabeledDataLoader(nnUNetDataLoader):
     meant to generate a pseudo-label/confidence mask, the rest are meant to
     be trained against it. Requires num_views >= 2 (at least one weak and
     one strong view).
+
+    NOTE: the clustering loss that consumes this loader
+    (module/losses.py ClusteringCMLoss) is not a consistency loss -- it
+    reads data_views[0], the weak view, and nothing else. So the weak/strong
+    split is currently unused and datamodule.K sits at the minimum of 2.
+    Raise it again only if a weak/strong consistency term comes back; every
+    extra view is one more intensity pipeline per sample per step.
+
+    At litmodule.cm_mode=l (or use_cm_loss=false) nothing reads this loader
+    at all, but it is still built -- see the datamodule's setup(), which
+    floors the unlabeled pool at one case so both dataloaders always exist
+    and training_step never has to test for the key.
     """
 
     def __init__(self, *args, geometric_transforms, intensity_transforms, num_views, **kwargs):

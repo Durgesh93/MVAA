@@ -19,6 +19,19 @@ own (an all-background prediction can still score 0), so
 CompoundLoss only mixes it in at a small boundary_weight -- see
 litmodule.use_boundary / boundary_weight_max / boundary_ramp_epochs in
 the experiment configs and module/nnunet.py's epoch hook.
+
+A FixMatch-style WeakStrongPseudoLabelLoss and its FreeMatch
+AdaptiveConfidenceThreshold lived here too. Both were removed: the
+ssl_sweep_bnd_weakstrong grid found lambda_pseudo=0.1 indistinguishable
+from 0 and lambda_pseudo>=0.5 actively worse, so the term did not earn its
+keep.
+
+ClusteringCMLoss replaces it with a different semi-supervised idea --
+SuperCM-style clustering of the per-voxel embeddings that
+module/adapter.py exposes, rather than consistency between augmented
+views. It is combined with CompoundLoss by the LightningModule, not
+wrapped here, because CompoundLoss is already inside nnU-Net's
+DeepSupervisionWrapper by the time training_step sees it.
 """
 
 import numpy as np
@@ -50,9 +63,8 @@ def _foreground_weighted_ce(net_output: Tensor, target: Tensor, loss_mask=None, 
     at 1.0, every other class at foreground_weight), not renormalized by
     each class's own voxel count. Ground-truth labels are trustworthy here
     (real annotations, not pseudo-labels), so biasing the gradient toward
-    the rare class (e.g. CT's mitral valve, ~2% of voxels) is safe -- unlike
-    the pseudo-label branch (WeakStrongPseudoLabelLoss), there's no risk of
-    amplifying a wrong self-generated guess.
+    the rare class (e.g. CT's mitral valve, ~2% of voxels) is safe: there
+    is no self-generated guess here that a heavier weight could amplify.
 
     A per-class-averaged-then-uniformly-combined version of this was tried
     and reverted (2026-07-23 session): renormalizing by each class's own
@@ -265,164 +277,433 @@ class CompoundLoss(nn.Module):
         return _clip_loss((1 - self.boundary_weight) * dice_ce + self.boundary_weight * boundary)
 
 
-class AdaptiveConfidenceThreshold(nn.Module):
+# =============================================================================
+# SuperCM-style clustering regularizer
+# =============================================================================
+
+
+class ClusteringCMLoss(nn.Module):
     """
-    FreeMatch-style (Wang et al. 2023, arxiv 2205.07246) self-adaptive
-    per-class confidence threshold, replacing a single flat cutoff.
+    Soft-k-means ("clustering module") regularizer on per-voxel embeddings.
 
-    Maintains a global EMA of the batch's mean max-confidence (regardless
-    of predicted class) and a per-class EMA of confidence conditioned on
-    argmax == c, both updated from the *entire* unlabeled batch every step
-    -- not just pixels that already cleared some bar -- since the point is
-    to track how confidence is trending even for classes not clearing it
-    yet. The per-class threshold is the global EMA scaled by that class's
-    confidence relative to the best-tracked class (MaxNorm): a class the
-    network is relatively unsure about gets a lower bar than a flat
-    threshold would give it, while never exceeding the global EMA. Both
-    EMAs start at 1/num_classes (uniform-prior confidence), so thresholds
-    start low and rise as the network's real confidence rises -- this
-    supplements rather than replaces the hard `pseudo_warmup_epochs` gate
-    in lightning_module.py, which still fully zeroes the loss early on.
+    Penalises mean_voxels sum_k g_k * ||x - mu_k||^2, where x is the
+    embedding_dim-dimensional embedding a voxel carries (see
+    module/adapter.py), g is the network's own softmax over the class
+    logits at that voxel, and mu_k is a class centroid. Minimising it pulls
+    every voxel's embedding toward the centroid of whichever class the
+    network already believes it belongs to, which tightens the class
+    clusters without needing a label at that voxel -- the SuperCM idea.
 
-    Buffers are lazily (re)initialized on first use / on a class-count
-    change so this doesn't need num_classes at construction time.
+    The centroids are NOT learned by gradient. They are re-estimated in
+    closed form every step as the assignment-weighted mean
+    mu_k = sum_p y_pk x_p / sum_p y_pk, then EMA-blended into the stored
+    value. mu is therefore a buffer, not a parameter, and carries no
+    gradient: the only thing this loss trains is the embedding itself.
+
+    cm_mode picks where the assignments y for that estimate come from:
+        "l"   : ground truth one-hot on the labeled crops. The honest
+                first experiment -- it asks whether tightening clusters
+                around TRUE class means helps at all, with no
+                pseudo-labelling anywhere in the loop.
+        "u"   : confident pseudo-labels on the unlabeled crops.
+        "l+u" : both, concatenated. The actual semi-supervised claim.
+    "l" needs no unlabeled forward pass at all, so it costs one extra
+    einsum per step and nothing else -- see needs_unlabeled.
+
+    Cross-entropy is deliberately NOT part of this module. The supervised
+    term here is nnU-Net's own DeepSupervisionWrapper(CompoundLoss), which
+    the LightningModule already owns; folding a second CE in (as the 2D
+    supercm project's SuperCMLoss does) would just shadow it. The
+    LightningModule forms total = sup_loss + weight_at(step) * energy.
+
+    Shapes: embeddings (B, D, *spatial), logits (B, C, *spatial), target
+    (B, 1, *spatial) integer class ids. Under deep supervision the caller
+    passes the highest-resolution stage only -- the coarser stages are
+    downsampled views of the same embedding space, and pooling them into
+    one set of centroids would weight a 7x6x8 map as heavily as the
+    full-resolution one.
     """
 
-    def __init__(self, momentum: float = 0.999):
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_classes: int,
+        cm_mode: str = "l",
+        weight: float = 0.1,
+        warmup_steps: int = 500,
+        ema_weight: float = 0.95,
+        num_voxels=32768,
+        conf_thr: float = 0.9,
+        topk_frac: float = 0.15,
+        min_keep: int = 64,
+        normalize: bool = False,
+        ignore_label=None,
+        eps: float = 1e-6,
+    ):
         super().__init__()
-        self.momentum = momentum
-        self.register_buffer("global_ema", torch.zeros(()))
-        self.register_buffer("class_ema", torch.zeros(0))
 
-    def _maybe_init(self, num_classes, device, dtype):
-        if self.class_ema.numel() != num_classes:
-            init_value = 1.0 / num_classes
-            self.global_ema = torch.full((), init_value, device=device, dtype=dtype)
-            self.class_ema = torch.full((num_classes,), init_value, device=device, dtype=dtype)
+        if cm_mode not in ("l", "u", "l+u"):
+            raise ValueError(f"cm_mode must be one of 'l', 'u', 'l+u', got {cm_mode!r}")
 
-    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        # class_ema/global_ema are lazily shaped by num_classes (see
-        # _maybe_init), so a freshly constructed module -- e.g. for `test`,
-        # which loads a checkpoint before any unlabeled batch has run --
-        # still has them at their construction-time shape. Resize
-        # to whatever shape the checkpoint has *before* the default load
-        # logic runs its shape check, so the real EMA values get restored
-        # instead of tripping a size mismatch.
-        class_key, global_key = prefix + "class_ema", prefix + "global_ema"
+        if num_classes < 2:
+            raise ValueError(f"num_classes must be >= 2, got {num_classes}")
 
-        if class_key in state_dict and state_dict[class_key].shape != self.class_ema.shape:
-            self.class_ema = torch.empty_like(state_dict[class_key])
-            self.global_ema = torch.empty_like(state_dict[global_key])
+        self.embedding_dim = int(embedding_dim)
+        self.num_classes = int(num_classes)
+        self.cm_mode = cm_mode
+        self.weight = float(weight)
+        self.warmup_steps = int(warmup_steps)
+        self.ema_weight = float(ema_weight)
+        self.num_voxels = None if num_voxels is None else int(num_voxels)
+        self.conf_thr = float(conf_thr)
+        self.topk_frac = float(topk_frac)
+        self.min_keep = int(min_keep)
+        self.normalize = bool(normalize)
+        self.ignore_label = ignore_label
+        self.eps = float(eps)
 
-        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+        # Buffers, not parameters: closed-form estimated, never optimised.
+        # Registered so they ride along in the checkpoint -- a resumed run
+        # that re-initialised mu from scratch would hand the embedding a
+        # step-change in its target on the first batch after the restore.
+        self.register_buffer("mu", torch.zeros(self.num_classes, self.embedding_dim))
 
+        # Per-class, not a single flag. A class absent from the first batch
+        # (easy with two thin leaflets and a 1-2 case labeled pool) would
+        # otherwise have its centroid marked "initialised" at the zero
+        # vector and then EMA-crawl toward the truth for hundreds of steps,
+        # dragging every voxel of that class toward the origin meanwhile.
+        self.register_buffer("mu_initialized", torch.zeros(self.num_classes, dtype=torch.bool))
+
+    # -------------------------------------------------------------------------
+    # Scheduling
+    # -------------------------------------------------------------------------
+    @property
+    def needs_unlabeled(self) -> bool:
+        """True when cm_mode sources centroids from the unlabeled stream."""
+        return self.cm_mode in ("u", "l+u")
+
+    def weight_at(self, step: int) -> float:
+        """
+        Linearly ramped loss weight, 0 -> self.weight over warmup_steps.
+
+        Driven by the caller's step (Lightning's global_step) rather than an
+        internal counter. The 2D supercm project incremented its own buffer
+        inside this function and ALSO used that buffer to decide
+        hard-copy-vs-EMA for the centroids, so a warmup of 0 silently
+        disabled the EMA; keeping the two concerns separate avoids that.
+
+        The ramp matters because mu is meaningless before it has seen any
+        data: at weight 0 on step 0 the loss cannot pull embeddings toward
+        a zero vector.
+        """
+
+        if self.warmup_steps <= 0:
+            return self.weight
+
+        return self.weight * min(float(step) / float(self.warmup_steps), 1.0)
+
+    # -------------------------------------------------------------------------
+    # Flattening helpers
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def _flatten_spatial(tensor: Tensor) -> Tensor:
+        """(B, C, *spatial) -> (B, C, P). A view when the input is contiguous."""
+        return tensor.flatten(2)
+
+    def _valid_mask(self, labels: Tensor) -> Tensor:
+        """
+        (B, P) bool of voxels that may contribute, from the ignore label.
+
+        nnU-Net's RemoveLabelTansform maps the -1 padding to 0 before the
+        loss sees it, so this is only about a genuine configured
+        ignore_label; without one, everything is valid.
+        """
+
+        if self.ignore_label is None:
+            return torch.ones_like(labels, dtype=torch.bool)
+
+        return labels != int(self.ignore_label)
+
+    def _gt_assignments(self, target: Tensor):
+        """
+        Ground-truth one-hot assignments from an integer label map.
+
+        Returns (y, valid) with y (B, C, P) float and valid (B, P) bool.
+
+        NOTE this is where a verbatim port of the 2D supercm project breaks:
+        its _gt_onehot branches on the target's CHANNEL count, and an
+        nnU-Net target is (B, 1, *spatial), so it would take the binary
+        path and read the integer id 2 ("anterior_leaflet") as a
+        foreground probability of 2.0. The label map has to be expanded
+        against num_classes, not against its own channel dim.
+        """
+
+        labels = target[:, 0].reshape(target.shape[0], -1).long()
+        valid = self._valid_mask(labels)
+
+        # Ignored voxels are clamped into range purely so one_hot cannot
+        # fault on them; `valid` is what actually excludes them.
+        safe = labels.clamp(0, self.num_classes - 1)
+        y = nn.functional.one_hot(safe, num_classes=self.num_classes)
+        y = y.permute(0, 2, 1).to(torch.float32)
+
+        return y * valid.unsqueeze(1), valid
+
+    def _probabilities(self, logits: Tensor) -> Tensor:
+        """
+        (B, C, P) softmax over classes.
+
+        float32 regardless of autocast: these feed a centroid estimate that
+        is accumulated over ~10^6 voxels, where fp16 summation drifts.
+        """
+        return torch.softmax(self._flatten_spatial(logits).float(), dim=1)
+
+    # -------------------------------------------------------------------------
+    # Confident pseudo-label selection (unlabeled centroid source)
+    # -------------------------------------------------------------------------
     @torch.no_grad()
-    def update(self, confidence: Tensor, pseudo_label: Tensor, num_classes: int):
-        self._maybe_init(num_classes, confidence.device, confidence.dtype)
-
-        m = self.momentum
-        self.global_ema.mul_(m).add_(confidence.mean(), alpha=1 - m)
-
-        for c in range(num_classes):
-            class_mask = pseudo_label == c
-
-            if class_mask.any():
-                self.class_ema[c].mul_(m).add_(confidence[class_mask].mean(), alpha=1 - m)
-
-    def per_class_threshold(self, num_classes: int) -> Tensor:
-        self._maybe_init(num_classes, self.class_ema.device, self.class_ema.dtype)
-        normalized = self.class_ema / self.class_ema.max().clamp_min(1e-12)
-        return self.global_ema * normalized
-
-
-class WeakStrongPseudoLabelLoss(nn.Module):
-    """
-    FixMatch-style confidence-thresholded consistency loss for TrU samples.
-
-    Confidence-thresholded pseudo-label cross-entropy (Lee, 2013), sourced
-    from a weak/strong view pair rather than a single self-trained view: the
-    pseudo-label and confidence mask come from the weak view's own
-    prediction (geometric-only, no intensity aug -- computed under no_grad
-    by the caller), while the loss is the masked CE between that
-    pseudo-label and one or more strong (weak + intensity aug) views'
-    predictions. Two differently-augmented views of the same voxel-aligned
-    patch give a genuine augmentation-invariance signal, rather than a
-    network training to agree with its own single-view guess. Independent
-    of CompoundLoss/ignore_label (none of the 3 MVAA datasets define one) --
-    pixels below the confidence threshold are excluded entirely rather than
-    distilled from a likely-wrong guess.
-
-    Confidence threshold is per-class and EMA-tracked via
-    AdaptiveConfidenceThreshold -- see that class's docstring.
-
-    The CE itself is a single flat masked mean over confident voxels, no
-    class weighting or per-class averaging of any kind (tried twice --
-    per-class-averaged-then-uniformly-combined, then a static foreground
-    weight -- and reverted both times, 2026-07-23 session). Unlike
-    CompoundLoss's ground-truth-labeled CE, this loss's targets are the
-    model's own weak-view predictions -- deliberately *not* biasing it
-    toward foreground, since doing so on self-generated pseudo-labels
-    risks reinforcing whatever the model currently over/under-predicts
-    for the rare class rather than correcting it. The (already
-    class-conditioned) AdaptiveConfidenceThreshold is the only place this
-    loss discriminates between classes -- filtering *which* voxels count,
-    not how much each one is weighted once it does.
-    """
-
-    def __init__(self, adaptive_momentum: float = 0.999):
-        super().__init__()
-        self.adaptive_threshold = AdaptiveConfidenceThreshold(momentum=adaptive_momentum)
-
-    def forward(self, weak_logits: Tensor, strong_logits_list):
+    def _confident_assignments(self, probs: Tensor):
         """
-        Returns (loss, confident_frac, per_class_confident_frac).
+        Hard pseudo-label assignments restricted to confident voxels.
 
-        confident_frac is the aggregate fraction of weak-view pixels that
-        cleared the threshold (num_confident / confident_mask.numel()) --
-        but that aggregate is computed over every pixel regardless of
-        class, so for a class occupying only a couple percent of a
-        volume (e.g. CT's mitral valve, ~2% of voxels) it's almost
-        entirely a background-confidence artifact and stays pinned near
-        1.0 whether or not the rare foreground class's pseudo-labels are
-        actually trustworthy. per_class_confident_frac breaks the same
-        ratio out per class (indexed by class id, NaN where a class
-        doesn't appear in this batch's pseudo-labels at all -- torchmetrics'
-        MeanMetric silently drops NaN updates, so this is safe to feed
-        straight into per-step logging without a batch necessarily
-        containing every class) so callers can see whether the rare
-        classes are actually being filtered sensibly, not just the
-        dominant one. See lightning_module.py's _pseudo_loss.
+        Selection is PER PREDICTED CLASS, not over the patch as a whole.
+        A global top-k would be dominated by background: the leaflets are a
+        couple of percent of a crop, so topk_frac of all voxels is tens of
+        thousands of background voxels and possibly no leaflet voxel at
+        all, leaving the foreground centroids estimated from nothing.
+
+        Returns (y, keep) with y (B, C, P) one-hot float and keep (B, P) bool.
         """
 
-        with torch.no_grad():
-            probs = torch.softmax(weak_logits, dim=1)
-            confidence, pseudo_label = probs.max(dim=1)
+        confidence, predicted = probs.max(dim=1)
 
-            num_classes = weak_logits.shape[1]
-            self.adaptive_threshold.update(confidence, pseudo_label, num_classes)
-            per_class_threshold = self.adaptive_threshold.per_class_threshold(num_classes)
-            threshold = per_class_threshold[pseudo_label]
+        y = nn.functional.one_hot(predicted, num_classes=self.num_classes)
+        y = y.permute(0, 2, 1).to(torch.float32)
 
-            confident_mask = confidence >= threshold
+        flat_keep = torch.zeros(confidence.numel(), dtype=torch.bool, device=confidence.device)
 
-            per_class_confident_frac = torch.full((num_classes,), float("nan"), device=weak_logits.device)
-            for c in range(num_classes):
-                class_mask = pseudo_label == c
-                class_count = class_mask.sum()
-                if class_count > 0:
-                    per_class_confident_frac[c] = (confident_mask & class_mask).sum().float() / class_count.float()
+        # One sync for all class counts rather than one per class.
+        counts = torch.bincount(predicted.reshape(-1), minlength=self.num_classes).tolist()
 
-        num_confident = confident_mask.sum()
-        confident_frac = num_confident.float() / confident_mask.numel()
+        flat_confidence = confidence.reshape(-1)
+        flat_predicted = predicted.reshape(-1)
 
-        if num_confident == 0:
-            zero = torch.zeros((), device=weak_logits.device, dtype=weak_logits.dtype)
-            return zero, confident_frac, per_class_confident_frac
+        for class_id, count in enumerate(counts):
+            if count == 0:
+                continue
 
-        view_losses = []
+            is_class = flat_predicted == class_id
 
-        for strong_logits in strong_logits_list:
-            per_pixel_ce = nn.functional.cross_entropy(strong_logits, pseudo_label, reduction="none")
-            view_losses.append(per_pixel_ce[confident_mask].mean())
+            # -1 sorts below every real probability, so topk can only pick
+            # voxels predicted as this class.
+            scores = torch.where(is_class, flat_confidence, torch.full_like(flat_confidence, -1.0))
 
-        return torch.stack(view_losses).mean(), confident_frac, per_class_confident_frac
+            k = min(count, max(self.min_keep, int(round(self.topk_frac * count))))
+
+            selected = torch.topk(scores, k=k, largest=True).indices
+
+            flat_keep[selected] = True
+
+        keep = flat_keep.view_as(confidence)
+
+        # Intersect with the absolute threshold, but only if that leaves
+        # enough voxels to estimate anything -- early in training nothing
+        # clears 0.9 and an empty centroid update is worse than a noisy one.
+        thresholded = keep & (confidence >= self.conf_thr)
+
+        if int(thresholded.sum()) >= self.min_keep:
+            keep = thresholded
+
+        return y * keep.unsqueeze(1), keep
+
+    # -------------------------------------------------------------------------
+    # Centroid estimation
+    # -------------------------------------------------------------------------
+    @torch.no_grad()
+    def update_centroids(self, streams):
+        """
+        Re-estimate mu from (embeddings_flat, assignments) pairs and EMA it in.
+
+        streams: list of (x, y) with x (B, D, P) and y (B, C, P) already
+        zeroed at excluded voxels, so no separate mask is needed here.
+
+        Runs on the FULL voxel set, not the subsample the energy uses: this
+        is under no_grad, so the einsum keeps nothing for backward and the
+        extra accuracy in the class means is free. Only the energy term
+        needs to be economical.
+
+        Under DDP the numerator and denominator are all-reduced before the
+        division, so every rank ends up with the SAME centroids. Estimating
+        them per rank would make the loss a different function on each rank
+        -- gradients would still sync, but they would be gradients of eight
+        different objectives.
+        """
+
+        numerator = torch.zeros_like(self.mu)
+        denominator = torch.zeros(self.num_classes, device=self.mu.device, dtype=self.mu.dtype)
+
+        for x, y in streams:
+            x = x.to(self.mu.dtype)
+            y = y.to(self.mu.dtype)
+            numerator += torch.einsum("bdp,bcp->cd", x, y)
+            denominator += y.sum(dim=(0, 2))
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(numerator)
+            torch.distributed.all_reduce(denominator)
+
+        present = denominator > self.eps
+
+        if not bool(present.any()):
+            return
+
+        estimate = numerator[present] / denominator[present].unsqueeze(1)
+
+        rows = present.nonzero(as_tuple=True)[0]
+        fresh = ~self.mu_initialized[rows]
+
+        # First sight of a class: take the estimate outright. An EMA from
+        # the zero vector would need ~100 steps at ema_weight=0.95 to get
+        # anywhere near the true mean.
+        blended = torch.where(
+            fresh.unsqueeze(1),
+            estimate,
+            self.ema_weight * self.mu[rows] + (1.0 - self.ema_weight) * estimate,
+        )
+
+        self.mu[rows] = blended
+        self.mu_initialized[rows] = True
+
+    # -------------------------------------------------------------------------
+    # Energy
+    # -------------------------------------------------------------------------
+    def _subsample_indices(self, num_voxels: int, device):
+        """Shared voxel subset for the energy term, or None to use all of them."""
+
+        if self.num_voxels is None or self.num_voxels >= num_voxels:
+            return None
+
+        return torch.randperm(num_voxels, device=device)[: self.num_voxels]
+
+    def _energy(self, x: Tensor, g: Tensor, valid: Tensor) -> Tensor:
+        """
+        mean over valid voxels of sum_k g_k ||x - mu_k||^2.
+
+        Expanded rather than computed from an explicit difference, so the
+        largest intermediate is (B, C, P) with C=3 instead of (B, D, P)
+        with D=128. The 2D supercm project's permute(...).reshape(-1, D)
+        materialises a full (B*P, D) copy that is then held for backward --
+        at a 112x96x128 patch that is ~350 MB per sample of avoidable
+        activation memory.
+
+        sum_k g_k == 1 (g is a softmax), which is what lets the ||x||^2
+        term come out of the class sum as a single (B, P) map.
+
+        The result is divided by embedding_dim, so it is a mean squared
+        distance PER DIMENSION rather than a raw squared distance in
+        128-space. That is only a reparameterisation of the loss weight,
+        but it is the difference between a weight that means something and
+        one that does not: unscaled, this energy starts around D (=128) at
+        initialisation, so the 0.1-ish auxiliary weight that the
+        ssl_sweep_bnd_weakstrong grid found workable against CompoundLoss
+        (itself O(1)) would have put the clustering term at ~14x the
+        supervised one. Dividing by D makes the weight independent of
+        embedding_dim and directly comparable to that sweep's lambda scale.
+
+        normalize=True is exempt: spherical k-means already yields
+        2 - 2cos(x, mu) in [0, 4], so it needs no rescaling and keeps the
+        same weight ballpark.
+        """
+
+        mu = self.mu.to(x.dtype)
+
+        if self.normalize:
+            x = nn.functional.normalize(x, dim=1)
+            mu = nn.functional.normalize(mu, dim=1)
+
+        g = g.to(x.dtype)
+
+        x_squared = x.pow(2).sum(dim=1)
+        x_dot_mu = torch.einsum("bdp,cd->bcp", x, mu)
+        mu_squared = mu.pow(2).sum(dim=1).view(1, -1, 1)
+
+        per_voxel = x_squared - 2.0 * (g * x_dot_mu).sum(dim=1) + (g * mu_squared).sum(dim=1)
+
+        if not self.normalize:
+            per_voxel = per_voxel / float(self.embedding_dim)
+
+        weights = valid.to(per_voxel.dtype)
+
+        return (per_voxel * weights).sum() / weights.sum().clamp_min(1.0)
+
+    # -------------------------------------------------------------------------
+    # Forward
+    # -------------------------------------------------------------------------
+    def forward(self, embeddings: Tensor, logits: Tensor, target: Tensor, u_embeddings=None, u_logits=None):
+        """
+        Returns (energy, stats).
+
+        energy is UNWEIGHTED -- the caller scales it by weight_at(step).
+        stats holds detached scalars for logging.
+
+        The centroid update happens here, before the energy, so the energy
+        is measured against centroids that have seen this batch. That
+        ordering matches the 2D supercm project and matters most on the
+        very first steps, where an un-updated mu is still the zero vector.
+        """
+
+        if self.needs_unlabeled and (u_embeddings is None or u_logits is None):
+            raise ValueError(f"cm_mode={self.cm_mode!r} needs the unlabeled stream, but none was passed.")
+
+        x_labeled = self._flatten_spatial(embeddings)
+        g_labeled = self._probabilities(logits)
+        y_labeled, valid_labeled = self._gt_assignments(target)
+
+        streams = []
+        stats = {}
+
+        if self.cm_mode in ("l", "l+u"):
+            streams.append((x_labeled, y_labeled))
+
+        x_unlabeled = g_unlabeled = None
+
+        if u_embeddings is not None and u_logits is not None:
+            x_unlabeled = self._flatten_spatial(u_embeddings)
+            g_unlabeled = self._probabilities(u_logits)
+
+            if self.cm_mode in ("u", "l+u"):
+                y_unlabeled, keep = self._confident_assignments(g_unlabeled)
+                streams.append((x_unlabeled, y_unlabeled))
+                stats["cm_confident_frac"] = keep.to(torch.float32).mean().detach()
+
+        self.update_centroids(streams)
+
+        # The energy is applied to every stream that was forwarded, not
+        # just the ones feeding the centroids: an unlabeled crop's voxels
+        # are exactly the ones with no supervision, so pulling them toward
+        # a cluster is the whole point. With cm_mode="l" there is no
+        # unlabeled forward at all and this reduces to the labeled crops.
+        energy_terms = [(x_labeled, g_labeled, valid_labeled)]
+
+        if x_unlabeled is not None:
+            energy_terms.append((x_unlabeled, g_unlabeled, torch.ones_like(g_unlabeled[:, 0], dtype=torch.bool)))
+
+        total = None
+
+        for x, g, valid in energy_terms:
+            indices = self._subsample_indices(x.shape[2], x.device)
+
+            if indices is not None:
+                x = x.index_select(2, indices)
+                g = g.index_select(2, indices)
+                valid = valid.index_select(1, indices)
+
+            term = self._energy(x, g, valid)
+            total = term if total is None else total + term
+
+        total = _clip_loss(total / float(len(energy_terms)))
+
+        stats["cm_loss"] = total.detach()
+
+        return total, stats

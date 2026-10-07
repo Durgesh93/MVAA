@@ -41,7 +41,7 @@ from utils import safe_binary_segmentation_metrics, to_numpy
 
 
 class MetricsTracker(nn.Module):
-    def __init__(self, tracked_labels, all_labels):
+    def __init__(self, tracked_labels):
         """
         tracked_labels: list of (label_value, label_name) pairs (e.g.
         [(1, "class_1")]) -- the dice/asd/hd/hd95-relevant classes for
@@ -50,29 +50,17 @@ class MetricsTracker(nn.Module):
         hd_mm, hd95_mm) is a mean over just these classes since that's
         what checkpoint.monitor selects on; dice_<name> additionally
         tracks each class individually for the classwise plot.
-
-        all_labels: list of (label_value, label_name) pairs for every
-        class in dataset_json["labels"], background and auxiliary
-        classes included -- unlike tracked_labels, this is not filtered
-        to the checkpoint-monitored classes. Used only for
-        train_pseudo_confident_frac_<name>, since a class occupying a
-        couple percent of a volume can make the aggregate confident_frac
-        look saturated (dominated by trivially-easy background) while
-        saying nothing about whether that rare class's pseudo-labels are
-        actually being filtered sensibly -- see WeakStrongPseudoLabelLoss.
         """
         super().__init__()
 
         self.tracked_labels = tracked_labels
-        self.all_labels = all_labels
         self.dice_keys = [f"dice_{name}" for _, name in tracked_labels]
-        self.pseudo_confident_frac_keys = [f"train_pseudo_confident_frac_{name}" for _, name in all_labels]
         self.tracked_metric_keys = [
             "train_loss",
             "train_sup_loss",
-            "train_pseudo_loss",
-            "train_pseudo_confident_frac",
-            *self.pseudo_confident_frac_keys,
+            "train_cm_loss",
+            "train_cm_weight",
+            "train_cm_confident_frac",
             "dice",
             *self.dice_keys,
             "asd_mm",
@@ -83,18 +71,15 @@ class MetricsTracker(nn.Module):
         self.step_metrics = MetricCollection(
             {key: MeanMetric(sync_on_compute=True) for key in self.tracked_metric_keys}
         )
-        # nan_strategy="disable": train_pseudo_confident_frac_<name> is
-        # legitimately NaN for an entire epoch when a class never appears in
-        # any step (e.g. every class during pseudo_warmup_epochs). CatMetric's
-        # default nan_strategy="warn" silently *drops* NaN entries instead of
-        # keeping a placeholder -- since this dict tracks one value per epoch
-        # in lockstep with the "epoch" key, a dropped entry desyncs this
-        # key's array length from "epoch"'s, and compute() on a
-        # never-updated CatMetric returns a bare empty list, not a tensor,
-        # which crashes compute_epoch_history's `.detach()`. "disable" keeps
-        # every epoch's entry (NaN included), so arrays stay aligned and the
-        # plotting code's existing `~np.isnan(values)` masking handles the
-        # gaps correctly instead of crashing.
+        # nan_strategy="disable" rather than CatMetric's default "warn",
+        # which silently *drops* a NaN entry instead of keeping a
+        # placeholder. This dict tracks one value per epoch in lockstep with
+        # the "epoch" key, so a dropped entry desyncs that key's array length
+        # from "epoch"'s, and compute() on a never-updated CatMetric returns
+        # a bare empty list rather than a tensor, which crashes
+        # compute_epoch_history's `.detach()`. "disable" keeps every epoch's
+        # entry (NaN included), so the arrays stay aligned and the plotting
+        # code's `~np.isnan(values)` masking handles any gaps.
         self.epoch_metrics = nn.ModuleDict(
             {key: CatMetric(sync_on_compute=False, nan_strategy="disable") for key in self.epoch_metric_keys}
         )
@@ -164,22 +149,34 @@ class MetricsTracker(nn.Module):
     def update_step_training_metrics(
         self,
         train_loss,
-        train_sup_loss,
-        train_pseudo_loss,
-        train_pseudo_confident_frac,
-        train_pseudo_confident_frac_per_class,
+        train_sup_loss=None,
+        train_cm_loss=None,
+        train_cm_weight=None,
+        train_cm_confident_frac=None,
     ):
-        values = {
-            "train_loss": train_loss,
-            "train_sup_loss": train_sup_loss,
-            "train_pseudo_loss": train_pseudo_loss,
-            "train_pseudo_confident_frac": train_pseudo_confident_frac,
-        }
-        for label_id, name in self.all_labels:
-            values[f"train_pseudo_confident_frac_{name}"] = train_pseudo_confident_frac_per_class[label_id]
+        """
+        Only train_loss is always present.
 
-        for key, value in values.items():
-            self.step_metrics[key].update(value)
+        The clustering scalars are None whenever litmodule.use_cm_loss is
+        off, and train_cm_confident_frac additionally whenever cm_mode
+        sources no pseudo-labels (cm_mode="l"). A MeanMetric that is never
+        updated computes to NaN, which the LightningModule's logging loop
+        skips and the progress plot masks out -- so an inactive panel stays
+        empty instead of plotting a misleading zero line.
+        """
+
+        self.step_metrics["train_loss"].update(train_loss)
+
+        optional = {
+            "train_sup_loss": train_sup_loss,
+            "train_cm_loss": train_cm_loss,
+            "train_cm_weight": train_cm_weight,
+            "train_cm_confident_frac": train_cm_confident_frac,
+        }
+
+        for key, value in optional.items():
+            if value is not None:
+                self.step_metrics[key].update(value)
 
     def update_step_val_metrics(self, metrics):
         tracked_mean = metrics["tracked_mean"]

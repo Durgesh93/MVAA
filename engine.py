@@ -23,6 +23,7 @@ Usage:
 """
 
 import multiprocessing
+import os
 import shutil
 from pathlib import Path
 
@@ -107,6 +108,49 @@ def _select_cluster_environment(trainer_cfg):
     return trainer_cfg
 
 
+def _build_wandb_logger(cfg, prediction=False):
+    """
+    Build the W&B logger, or return False for Lightning's "no logger".
+
+    Returning False rather than None matters: None makes Lightning fall back
+    to its default TensorBoardLogger, which would start writing event files
+    nobody asked for.
+
+    The run is named after experiment_name so a W&B run lines up with the
+    results folder on disk; `engine.py test` gets a "-test" suffix so scoring
+    the held-out split does not overwrite the training run's history.
+    """
+
+    wb = cfg.get("wandb", None)
+
+    if wb is None or not bool(wb.get("enabled", False)):
+        return False
+
+    from lightning.pytorch.loggers import WandbLogger
+
+    # $WANDB_DIR is exported by the LUMI workspace helper and points at
+    # scratch. Without it WandbLogger would default to "." and scatter
+    # wandb/ directories through the checkout.
+    save_dir = os.environ.get("WANDB_DIR") or str(Path(cfg.paths.nnunet_data_root).parent / "wandb")
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+    run_name = str(cfg.experiment_name) + ("-test" if prediction else "")
+
+    return WandbLogger(
+        name=run_name,
+        save_dir=save_dir,
+        project=str(wb.project),
+        entity=str(wb.entity),
+        tags=list(wb.tags),
+        group=(str(wb.group) if wb.get("group", None) else None),
+        mode=str(wb.mode),
+        job_type=("test" if prediction else "train"),
+        # Checkpoints are 250 MB each and already live in nnUNet_results;
+        # uploading them would add nothing and cost the quota.
+        log_model=False,
+    )
+
+
 def _build_trainer(cfg, prediction=False):
     """
     Build Lightning Trainer.
@@ -118,6 +162,10 @@ def _build_trainer(cfg, prediction=False):
     trainer_cfg = OmegaConf.to_container(cfg.trainer, resolve=True)
 
     trainer_cfg = _select_cluster_environment(trainer_cfg)
+
+    # Overrides the config's `logger: false` placeholder. The Trainer needs a
+    # Logger instance, which cannot be expressed in the yaml.
+    trainer_cfg["logger"] = _build_wandb_logger(cfg, prediction=prediction)
 
     callbacks = []
 
@@ -160,6 +208,11 @@ def _build_objects(config_name, prediction=False, overrides=None):
     model = SSLnnUNetLightningModule(cfg.litmodule)
 
     trainer = _build_trainer(cfg, prediction=prediction)
+
+    # Record the fully resolved config on the run, so a W&B run answers
+    # "what was this?" without cross-referencing the SLURM log.
+    if trainer.logger and not isinstance(trainer.logger, bool):
+        trainer.logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
 
     return cfg, datamodule, model, trainer
 
@@ -243,7 +296,7 @@ def clear_results(cfg, clear_checkpoints=True):
 @app.command()
 def train(
     overrides: List[str] = typer.Argument(
-        None, help="Hydra-style config overrides, e.g. datamodule.labeled_fraction=0.5"
+        None, help="Hydra-style config overrides, e.g. datamodule.num_labeled=5"
     )
 ):
     """Train, validating on the 30 official val cases every epoch."""
