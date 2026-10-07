@@ -65,7 +65,15 @@ class SSLnnUNetLightningModule(L.LightningModule):
         self.loss = None
 
     def setup(self, stage=None):
-        is_ddp = int(self.trainer.world_size) > 1
+        # "Are DDP collectives live", not "is world_size > 1". The two differ
+        # at world_size 1 under strategy=ddp, and the difference is fatal:
+        # build_loss zeroes the deepest deep-supervision weight when is_ddp is
+        # False, which leaves that stage's seg_layer out of the loss entirely.
+        # DDP then aborts with "parameters that were not used in producing the
+        # loss" -- nnU-Net's 1e-6 instead of 0 exists precisely to keep those
+        # parameters in the graph, and it has to key off the wrapper actually
+        # being there rather than off how many ranks there are.
+        is_ddp = torch.distributed.is_available() and torch.distributed.is_initialized()
         self.loss = self.nnunet.build_loss(is_ddp=is_ddp)
 
     def forward(self, x):
