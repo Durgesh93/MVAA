@@ -287,7 +287,11 @@ wandb:
 # =============================================================================
 
 trainer:
-  max_epochs: 300
+  # 80 epochs at ~24 min each (the rate ssl_sweep_bnd_weakstrong measured
+  # without the boundary term) is ~32 h, which fits inside standard-g's 48 h
+  # ceiling with margin. 300 would have been ~5 days and needed requeueing.
+  # litmodule.num_epochs interpolates this, so the LR schedule follows.
+  max_epochs: 80
   strategy: ${training_strategy}
   precision: 16-mixed
   log_every_n_steps: 1
