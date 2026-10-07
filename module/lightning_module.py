@@ -11,7 +11,6 @@ from .ddp import DDPHelper
 from .nnunet import NNUnetSetup
 
 from utils import get_train_batch_data_target, to_tensor
-from utils import save_training_progress_plot as write_training_progress_plot
 
 
 class SSLnnUNetLightningModule(L.LightningModule):
@@ -20,23 +19,10 @@ class SSLnnUNetLightningModule(L.LightningModule):
 
         self.cfg = litmodule_cfg
 
-        # On: one head per decoder stage, and build_loss therefore wraps
-        # CompoundLoss in DeepSupervisionWrapper. Must stay in step with the
-        # datamodule's copy, which decides whether the target is a tensor or
-        # a list -- they disagree and the first training step dies on shapes.
-        #
-        # This is nnU-Net's own default and a real contributor to its
-        # numbers on thin structures like the leaflets. It also keeps every
-        # seg_layer in the graph: with deep supervision off the decoder only
-        # applies seg_layers[-1], leaving the rest without gradients, which
-        # trips DDP as engine.py builds it (no find_unused_parameters).
-        #
-        # The clustering loss is unaffected -- it reads stage 0 only.
-        self.enable_deep_supervision = True
-
-        self.nnunet = NNUnetSetup(
-            litmodule_cfg, enable_deep_supervision=self.enable_deep_supervision, trainer_name=self.__class__.__name__
-        )
+        # Deep supervision is unconditional -- see NNUnetSetup.__init__. The
+        # network returns one head per decoder stage and the datamodule one
+        # target per stage to match; the clustering loss reads stage 0 only.
+        self.nnunet = NNUnetSetup(litmodule_cfg, trainer_name=self.__class__.__name__)
         self.dataset_name = self.nnunet.dataset_name
         self.dataset_json = self.nnunet.dataset_json
 
@@ -55,7 +41,6 @@ class SSLnnUNetLightningModule(L.LightningModule):
         self.output_folder = self.actual_validation_output_base
         self.actual_validation_output_folder = self.output_folder / "validation"
         self.actual_test_output_folder = self.output_folder / "test"
-        self.progress_png_file = self.output_folder / "training_progress.png"
 
         self.ddp = DDPHelper()
         self.metrics = MetricsTracker(tracked_labels=self.tracked_labels)
@@ -89,7 +74,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
         """
         (embeddings, logits) for one batch of crops.
 
-        Requires litmodule.use_embedding_adapter; raises otherwise. Nothing
+        The network is always an EmbeddingAdapter, so this always works. Nothing
         in this branch's training_step calls it yet -- it is the hook a
         clustering-style loss attaches to, in the role pre_heatmaps plays in
         the supercm project.
@@ -156,28 +141,27 @@ class SSLnnUNetLightningModule(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """
-        Supervised Dice+CE over the labeled crops, plus the optional
-        SuperCM-style clustering regularizer on the per-voxel embeddings.
+        Supervised Dice+CE over the labeled crops plus the SuperCM-style
+        clustering regularizer on the per-voxel embeddings.
 
-        With litmodule.use_cm_loss off this is labeled-only training and
-        batch["unlabeled"] goes unread. That key is always present -- the
+        One code path, always. A purely supervised run is cm_weight=0, not a
+        different branch: the centroids are still tracked and the energy
+        still logged, it just contributes no gradient. That keeps a baseline
+        and a SuperCM run byte-identical in everything but the weight.
+
+        Both terms share ONE forward pass -- forward_embeddings returns the
+        embeddings and the logits together -- so the clustering term costs no
+        extra trunk evaluation on the labeled crops. A second pass is added
+        only when cm_mode asks for unlabeled centroids (u / l+u); at
+        cm_mode=l there is none, which makes the whole regularizer about one
+        einsum per step.
+
+        batch["unlabeled"] is always present even when unread -- the
         datamodule floors the unlabeled pool at one case so the
-        CombinedLoader never drops it.
-
-        With it on, both terms share ONE forward pass: forward_embeddings
-        returns the embeddings and the logits together, so the clustering
-        term costs no extra trunk evaluation on the labeled crops. A second
-        pass is added only when cm_mode asks for unlabeled centroids
-        (u / l+u); at cm_mode=l there is none, which makes the whole
-        regularizer about one einsum per step.
+        CombinedLoader never drops the key.
         """
 
         data, target = get_train_batch_data_target(batch["labeled"], device=self.device)
-
-        if self.cm_loss is None:
-            loss = self.loss(self.network(data), target)
-            self.metrics.update_step_training_metrics(train_loss=loss.detach())
-            return loss
 
         embeddings, logits = self.forward_embeddings(data)
 
@@ -263,7 +247,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
             batch, batch_idx, "test", use_tta=True, write_case_zip=bool(self.cfg.save_case_outputs)
         )
 
-    def _eval_epoch_end(self, stage, save_training_progress, merge_case_outputs, print_val_metrics=False):
+    def _eval_epoch_end(self, stage, merge_case_outputs, print_val_metrics=False):
         if self.trainer.sanity_checking:
             self.metrics.reset_step_metrics()
             return
@@ -308,14 +292,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
         if do_print:
             print("=" * 80)
             print()
-        self.metrics.update_epoch_metrics(synced_metrics=synced_metrics, current_epoch=self.current_epoch)
-        if self.trainer.is_global_zero and save_training_progress:
-            write_training_progress_plot(
-                history=self.metrics.compute_epoch_history(),
-                progress_png_file=self.progress_png_file,
-                dataset_name=self.dataset_name,
-                dice_classwise_keys=self.metrics.dice_keys,
-            )
+
         self.metrics.reset_step_metrics()
         # Only when this stage actually wrote per-case zips: merge_rank_folders
         # raises if _rank_outputs is missing, and nothing creates it when the
@@ -327,14 +304,12 @@ class SSLnnUNetLightningModule(L.LightningModule):
     def on_validation_epoch_end(self):
         self._eval_epoch_end(
             stage="validation",
-            save_training_progress=True,
             merge_case_outputs=bool(self.cfg.save_case_outputs),
         )
 
     def on_test_epoch_end(self):
         self._eval_epoch_end(
             stage="test",
-            save_training_progress=False,
             print_val_metrics=True,
             merge_case_outputs=bool(self.cfg.save_case_outputs),
         )

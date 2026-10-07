@@ -12,10 +12,10 @@
 # it. The 30 official val cases (scored here) and 40 test cases are never
 # touched by the split.
 #
-# EVERYTHING not listed below comes from config/experiment_TEE.yaml. In
-# particular use_embedding_adapter stays TRUE, so these runs have the exact
-# same architecture as the SuperCM arms that follow and the later comparison
-# isolates the clustering term alone.
+# EVERYTHING not listed below comes from config/experiment_TEE.yaml. The
+# embedding adapter is unconditional, so these runs have the exact same
+# architecture as the SuperCM arms that follow and the later comparison
+# isolates the clustering gradient alone.
 #
 # Create it with:
 #   wandb sweep scripts/sweep_supervised_fewshot.yaml
@@ -52,13 +52,12 @@ parameters:
   # ---------------------------------------------------------------------------
   # THE CLUSTERING TERM, ZEROED.
   #
-  # cm_weight=0 rather than use_cm_loss=false, deliberately. Both give a
-  # purely supervised gradient, but this keeps the IDENTICAL code path to the
-  # SuperCM arms: one forward through forward_embeddings, centroids still
-  # re-estimated each step under no_grad, energy still computed -- just
-  # multiplied by zero before it reaches the total. So the only difference
-  # between this baseline and a SuperCM run is the gradient contribution
-  # itself, not which branch of training_step executes.
+  # The clustering module is always built; cm_weight=0 is how it is turned
+  # off. The forward through forward_embeddings still happens, centroids are
+  # still re-estimated each step under no_grad, the energy is still computed
+  # -- it is just multiplied by zero before reaching the total. So the only
+  # difference between this baseline and a SuperCM run is the gradient
+  # contribution itself.
   #
   # It also means train_cm_loss is still logged, which is free information:
   # it shows what the clustering energy WOULD have been on a model trained
@@ -68,8 +67,8 @@ parameters:
   # Cost is negligible -- one einsum over 32768 sampled voxels with grad,
   # one over the full patch without.
   #
-  # Use litmodule.use_cm_loss=false instead if you want the term gone
-  # entirely (no embeddings forward, no centroid tracking, nothing logged).
+  # cm_weight is the ONLY switch -- there is no use_cm_loss flag. The module
+  # is always built, so this and a SuperCM run are the same code path.
   # ---------------------------------------------------------------------------
   litmodule.cm_weight:
     value: 0
@@ -92,7 +91,7 @@ parameters:
   #
   # Everything else -- limit_train_batches=500, K=2, enable_checkpointing,
   # use_boundary, boundary_weight_max=0.5, boundary_ramp_epochs,
-  # use_embedding_adapter -- is left exactly as config/experiment_TEE.yaml
+  # embedding_dim, cm_mode -- is left exactly as config/experiment_TEE.yaml
   # has it.
   # ---------------------------------------------------------------------------
   trainer.max_epochs:

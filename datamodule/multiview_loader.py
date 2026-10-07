@@ -43,10 +43,10 @@ class MultiViewUnlabeledDataLoader(nnUNetDataLoader):
     Raise it again only if a weak/strong consistency term comes back; every
     extra view is one more intensity pipeline per sample per step.
 
-    At litmodule.cm_mode=l (or use_cm_loss=false) nothing reads this loader
-    at all, but it is still built -- see the datamodule's setup(), which
-    floors the unlabeled pool at one case so both dataloaders always exist
-    and training_step never has to test for the key.
+    At litmodule.cm_mode=l (the default) nothing reads this loader at all,
+    but it is still built -- see the datamodule's setup(), which floors the
+    unlabeled pool at one case so both dataloaders always exist and
+    training_step never has to test for the key.
     """
 
     def __init__(self, *args, geometric_transforms, intensity_transforms, num_views, **kwargs):

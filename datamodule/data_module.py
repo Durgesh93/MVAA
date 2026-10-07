@@ -81,17 +81,6 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
         self.K = int(self.cfg.K)
         self.transform_geometric = bool(self.cfg.transform_geometric)
 
-        # On, and must stay in step with the LightningModule's copy -- they
-        # disagree and the first training step dies on shapes. This populates
-        # ds_scales, so DownsampleSegForDSTransform joins the geometric
-        # pipeline and a batch's "target" is a LIST, one entry per decoder
-        # stage, highest resolution first.
-        #
-        # The clustering loss only ever reads target[0] (see the
-        # LightningModule's _highest_resolution), so deep supervision costs
-        # it nothing: the coarser stages serve the supervised term, which is
-        # what nnU-Net tunes its defaults around.
-        self.enable_deep_supervision = True
         self.oversample_fg = float(self.cfg.oversample_fg)
         self.print_case_ids = True
 
@@ -190,10 +179,21 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
     # ------------------------------------------------------------------
 
     def _get_deep_supervision_scales_from_nnunet(self):
+        """
+        One downsampling scale per decoder stage, from nnU-Net's own helper.
+
+        Deep supervision is unconditional (see NNUnetSetup.__init__), so this
+        always returns a list rather than None, which keeps
+        DownsampleSegForDSTransform in the geometric pipeline and makes a
+        batch's "target" a LIST -- one entry per stage, highest resolution
+        first. The LightningModule's loss consumes all of them and the
+        clustering loss takes target[0].
+        """
+
         shim = type("S", (), {})()
 
         shim.configuration_manager = self.cm
-        shim.enable_deep_supervision = self.enable_deep_supervision
+        shim.enable_deep_supervision = True
 
         return nnUNetTrainer._get_deep_supervision_scales(shim)
 

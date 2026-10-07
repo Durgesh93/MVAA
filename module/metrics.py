@@ -14,28 +14,20 @@ device placement handle this (rather than a manual .to(device) call
 before every update) is the same "boring", idiomatic way any other
 torchmetrics-based Metric is wired into a LightningModule.
 
-epoch_metrics is an nn.ModuleDict of CatMetric, not a MetricCollection:
-it has no DDP collective (sync_on_compute=False, rank-0-only plotting),
-so it doesn't need MetricCollection's cross-metric batching -- but it
-still needs to be a registered nn.Module (ModuleDict, not a plain dict)
-so its accumulated per-epoch history is included in this LightningModule's
-state_dict. Lightning's checkpoint save/restore only walks registered
-submodules/parameters/buffers, so a plain dict here would leave the whole
-training_progress.png curve out of every checkpoint. compute_epoch_history() always
-.cpu()s the result before handing it to matplotlib either way.
+A per-epoch history of these scalars used to be accumulated here too, in
+an nn.ModuleDict of CatMetric so it rode along in the checkpoint, purely
+to redraw training_progress.png each validation epoch. W&B tracks the same
+scalars, so both the plot and the history are gone.
 
-Printing, self.log-ing, and writing the progress plot to disk are
-Lightning/IO concerns and live directly on SSLnnUNetLightningModule
-instead (see lightning_module.py), which reads this tracker's state
-via compute_step_metrics()/compute_epoch_history().
+Printing and self.log-ing are Lightning/IO concerns and live directly on
+SSLnnUNetLightningModule instead (see lightning_module.py), which reads
+this tracker's state via compute_step_metrics().
 """
 
 import numpy as np
-import torch
 from torch import nn
 
 from torchmetrics import MeanMetric, MetricCollection
-from torchmetrics.aggregation import CatMetric
 
 from utils import safe_binary_segmentation_metrics, to_numpy
 
@@ -67,21 +59,8 @@ class MetricsTracker(nn.Module):
             "hd_mm",
             "hd95_mm",
         ]
-        self.epoch_metric_keys = ["epoch", *self.tracked_metric_keys]
         self.step_metrics = MetricCollection(
             {key: MeanMetric(sync_on_compute=True) for key in self.tracked_metric_keys}
-        )
-        # nan_strategy="disable" rather than CatMetric's default "warn",
-        # which silently *drops* a NaN entry instead of keeping a
-        # placeholder. This dict tracks one value per epoch in lockstep with
-        # the "epoch" key, so a dropped entry desyncs that key's array length
-        # from "epoch"'s, and compute() on a never-updated CatMetric returns
-        # a bare empty list rather than a tensor, which crashes
-        # compute_epoch_history's `.detach()`. "disable" keeps every epoch's
-        # entry (NaN included), so the arrays stay aligned and the plotting
-        # code's `~np.isnan(values)` masking handles any gaps.
-        self.epoch_metrics = nn.ModuleDict(
-            {key: CatMetric(sync_on_compute=False, nan_strategy="disable") for key in self.epoch_metric_keys}
         )
 
     def compute_step_metrics(self):
@@ -157,9 +136,8 @@ class MetricsTracker(nn.Module):
         """
         Only train_loss is always present.
 
-        The clustering scalars are None whenever litmodule.use_cm_loss is
-        off, and train_cm_confident_frac additionally whenever cm_mode
-        sources no pseudo-labels (cm_mode="l"). A MeanMetric that is never
+        train_cm_confident_frac is None whenever cm_mode sources no
+        pseudo-labels (cm_mode="l", the default). A MeanMetric that is never
         updated computes to NaN, which the LightningModule's logging loop
         skips and the progress plot masks out -- so an inactive panel stays
         empty instead of plotting a misleading zero line.
@@ -191,14 +169,3 @@ class MetricsTracker(nn.Module):
 
         for key, value in values.items():
             self.step_metrics[key].update(value)
-
-    def update_epoch_metrics(self, synced_metrics, current_epoch):
-        epoch_tensor = torch.tensor([current_epoch], dtype=torch.float32, device=self.epoch_metrics["epoch"].device)
-        self.epoch_metrics["epoch"].update(epoch_tensor)
-        for key in self.tracked_metric_keys:
-            value = synced_metrics[key]
-            self.epoch_metrics[key].update(value)
-
-    def compute_epoch_history(self):
-        history = {key: metric.compute() for key, metric in self.epoch_metrics.items()}
-        return {key: value.detach().cpu().numpy() for key, value in history.items()}

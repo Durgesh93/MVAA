@@ -10,18 +10,12 @@ Rule:
 """
 
 import os
-import math
 import shutil
 import zipfile
 from pathlib import Path
 import numpy as np
 import torch
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.ticker import MultipleLocator, MaxNLocator
 
 from medpy.metric.binary import dc, asd, hd, hd95
 from skimage.io import imsave as skimage_imsave
@@ -237,176 +231,6 @@ def resolve_prediction_ckpt(cfg, ckpt):
         return str(best_ckpts[0])
 
     return ckpt
-
-
-# =============================================================================
-# Training progress plot
-# =============================================================================
-
-
-def save_training_progress_plot(history, progress_png_file, dataset_name, dice_classwise_keys=None):
-    """
-    Save training_progress.png from already-computed NumPy history.
-
-    dice_classwise_keys: history keys (e.g. ["dice_class_1", "dice_class_2"])
-    each holding one tracked class's dice -- when given, the "Dice" panel
-    plots one line per class instead of the single aggregate "dice" mean,
-    so classwise performance (e.g. the checkpoint-monitored class vs.
-    training-only auxiliary classes) is visible directly in the plot.
-    """
-
-    if "epoch" not in history:
-        return
-
-    epochs = np.asarray(history["epoch"])
-
-    if epochs.size == 0:
-        return
-
-    plot_keys = [
-        ("train_loss", "Train loss", "min"),
-        ("train_sup_loss", "Supervised loss", "min"),
-        ("train_cm_loss", "CM clustering energy", "min"),
-        ("train_cm_weight", "CM weight (ramped)", "max"),
-        ("train_cm_confident_frac", "CM confident voxel frac", "max"),
-        ("dice", "Dice", "max"),
-        ("asd_mm", "ASD mm", "min"),
-        ("hd_mm", "HD mm", "min"),
-        ("hd95_mm", "HD95 mm", "min"),
-    ]
-
-    plot_keys = [item for item in plot_keys if item[0] in history]
-
-    if len(plot_keys) == 0:
-        return
-
-    n_plots = len(plot_keys)
-    n_cols = math.ceil(math.sqrt(n_plots))
-    n_rows = math.ceil(n_plots / n_cols)
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(13 * n_cols, 11 * n_rows))
-
-    axes = np.asarray(axes).reshape(-1)
-
-    for ax, (key, title, best_mode) in zip(axes, plot_keys):
-        if key == "dice" and dice_classwise_keys:
-            series = {k.removeprefix("dice_"): np.asarray(history[k], dtype=float) for k in dice_classwise_keys}
-        else:
-            series = {key: np.asarray(history[key], dtype=float)}
-
-        ax.set_title(title, fontsize=13)
-
-        ax.set_xlabel("Epoch")
-
-        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-
-        ax.grid(True, which="major", linestyle="-", linewidth=0.7, alpha=0.45)
-
-        ax.grid(True, which="minor", linestyle=":", linewidth=0.5, alpha=0.30)
-
-        all_ys = []
-
-        for series_label, values in series.items():
-            mask = ~np.isnan(values)
-
-            xs = epochs[mask]
-            ys = values[mask]
-
-            if len(xs) == 0:
-                continue
-
-            all_ys.append(ys)
-
-            last_value = ys[-1]
-
-            if best_mode == "min":
-                best_value = ys.min()
-                best_word = "best/min"
-            else:
-                best_value = ys.max()
-                best_word = "best/max"
-
-            label_prefix = f"{series_label}: " if len(series) > 1 else ""
-
-            ax.plot(
-                xs,
-                ys,
-                marker="o",
-                linewidth=1.8,
-                markersize=4,
-                label=(f"{label_prefix}last={last_value:.4f}, " f"{best_word}={best_value:.4f}"),
-            )
-
-        if len(all_ys) == 0:
-            ax.text(0.5, 0.5, "No values yet", ha="center", va="center", transform=ax.transAxes)
-            continue
-
-        ys = np.concatenate(all_ys)
-
-        if key == "dice":
-            ymin = max(0.0, float(ys.min()) - 0.02)
-
-            ymax = min(1.0, float(ys.max()) + 0.02)
-
-            if ymax - ymin < 0.05:
-                center = (ymin + ymax) / 2
-                ymin = max(0.0, center - 0.03)
-                ymax = min(1.0, center + 0.03)
-
-            ax.set_ylim(ymin, ymax)
-
-            ax.yaxis.set_major_locator(MultipleLocator(0.01))
-
-            ax.yaxis.set_minor_locator(MultipleLocator(0.005))
-
-        elif key in ["asd_mm", "hd_mm", "hd95_mm"]:
-            ymin = max(0.0, float(ys.min()) * 0.95)
-
-            ymax = float(ys.max()) * 1.05
-
-            if ymax <= ymin:
-                ymax = ymin + 1.0
-
-            ax.set_ylim(ymin, ymax)
-
-            ax.yaxis.set_major_locator(MaxNLocator(nbins=8))
-
-            ax.yaxis.set_minor_locator(MaxNLocator(nbins=16))
-
-        else:
-            ymin = float(ys.min())
-            ymax = float(ys.max())
-
-            margin = 0.05 * max(abs(ymax - ymin), 1e-6)
-
-            ymin = ymin - margin
-            ymax = ymax + margin
-
-            if ymax <= ymin:
-                ymax = ymin + 1.0
-
-            ax.set_ylim(ymin, ymax)
-
-            ax.yaxis.set_major_locator(MaxNLocator(nbins=8))
-
-            ax.yaxis.set_minor_locator(MaxNLocator(nbins=16))
-
-        ax.legend(loc="best", fontsize=10)
-
-    for ax in axes[len(plot_keys) :]:
-        ax.axis("off")
-
-    progress_png_file = Path(progress_png_file)
-
-    progress_png_file.parent.mkdir(parents=True, exist_ok=True)
-
-    fig.suptitle(f"Training progress | {dataset_name}", fontsize=16)
-
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
-
-    fig.savefig(progress_png_file, dpi=180)
-
-    plt.close(fig)
 
 
 # =============================================================================

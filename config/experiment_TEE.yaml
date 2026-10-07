@@ -140,20 +140,23 @@ litmodule:
   boundary_weight_max: 0.50
   boundary_ramp_epochs: ${trainer.max_epochs}
 
-  # Per-voxel embedding adapter (module/adapter.py). false is stock
-  # nnU-Net, whose decoder maps straight to the 3 class logits. true builds
-  # the same trunk with embedding_dim channels and a shared 1x1 classifier
-  # on top, so every voxel carries an explicit 128-d feature vector for a
-  # clustering-style loss to work on, reachable via the LightningModule's
-  # forward_embeddings().
+  # Width of the per-voxel embedding the decoder emits (module/adapter.py).
+  # Stock nnU-Net maps decoder features straight to the 3 class logits; the
+  # adapter emits embedding_dim channels instead and a shared 1x1 classifier
+  # maps those to the logits, so every voxel carries an explicit 128-d
+  # feature vector for the clustering loss to work on, reachable via the
+  # LightningModule's forward_embeddings().
   #
-  # There is no nonlinearity between the trunk and the classifier, so this
-  # is a full-rank reparameterization rather than added capacity: it should
-  # not move the supervised baseline on its own.
+  # The adapter is unconditional -- there is no flag. There is no
+  # nonlinearity between the trunk and the classifier, so the composition is
+  # still a linear map to logits and 128 >> 3 keeps it full rank: it buys an
+  # embedding space to put a loss on, not expressiveness. A purely
+  # supervised run simply sets cm_weight: 0. One architecture, one code
+  # path, and a baseline that differs from a SuperCM run by nothing but that
+  # weight.
   #
-  # Switching the flag changes every parameter name, so the two settings
-  # cannot share a checkpoint.
-  use_embedding_adapter: true
+  # Consequence: parameter names are "backbone.*" and "classifier.*", so
+  # stock nnU-Net checkpoints need remapping rather than loading.
   embedding_dim: 128
 
   # ---------------------------------------------------------------------------
@@ -165,9 +168,10 @@ litmodule:
   # tightens class clusters in embedding space; mu is a buffer, never
   # optimised, so the only thing trained is the embedding itself.
   #
-  # Requires use_embedding_adapter: true -- build_cm_loss raises otherwise.
+  # Always built. cm_weight: 0 is how you turn it off -- the centroids are
+  # still tracked and train_cm_loss still logged, it just contributes no
+  # gradient. That is what the supervised baseline sweep does.
   # ---------------------------------------------------------------------------
-  use_cm_loss: true
 
   # Where the centroid assignments come from:
   #   l    ground-truth one-hot on the labeled crops. No pseudo-labelling

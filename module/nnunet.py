@@ -205,9 +205,22 @@ class PredictionOps:
 
 
 class NNUnetSetup:
-    def __init__(self, litmodule_cfg, enable_deep_supervision=True, trainer_name="NNUnetSetup"):
+    def __init__(self, litmodule_cfg, trainer_name="NNUnetSetup"):
         self.cfg = litmodule_cfg
-        self.enable_deep_supervision = enable_deep_supervision
+
+        # Unconditional, so there is no flag and nothing to keep in step with
+        # the datamodule (a disagreement there used to kill the first
+        # training step on shapes). It is nnU-Net's own default and a real
+        # contributor on thin structures like the leaflets, and it keeps
+        # every seg_layer in the graph -- with it off the decoder applies
+        # only seg_layers[-1], leaving the rest without gradients, which
+        # trips DDP as engine.py builds it (no find_unused_parameters).
+        #
+        # The attribute stays because nnU-Net's own
+        # _get_deep_supervision_scales() reads it off the trainer shim.
+        #
+        # The clustering loss is indifferent: it reads stage 0 only.
+        self.enable_deep_supervision = True
 
         self.dataset_name = maybe_convert_to_dataset_name(litmodule_cfg.dataset_id)
         self.base = join(nnUNet_preprocessed, self.dataset_name)
@@ -246,27 +259,31 @@ class NNUnetSetup:
 
     def build_network(self):
         """
-        The nnU-Net trunk, optionally ending in an embedding adapter.
+        The nnU-Net trunk, ending in an embedding adapter.
 
-        use_embedding_adapter=false gives stock nnU-Net: the decoder's
-        seg_layers map straight to num_segmentation_heads logits.
+        Stock nnU-Net's decoder seg_layers map straight to
+        num_segmentation_heads logits. Here the SAME trunk is built with
+        embedding_dim output channels and a shared 1x1 classifier bolted on
+        top, so every voxel carries an explicit embedding_dim-dimensional
+        feature vector the clustering loss can reach (see
+        module/adapter.py). The returned module still emits class logits
+        from forward(), so the loss, the deep-supervision wrapper and
+        nnUNetPredictor are unaffected.
 
-        true builds the SAME trunk with embedding_dim output channels
-        instead and bolts a shared 1x1 classifier on top, so every voxel
-        carries an explicit embedding_dim-dimensional feature vector that a
-        clustering loss can reach (see module/adapter.py). The returned
-        module still emits class logits from forward(), so the loss, the
-        deep-supervision wrapper and nnUNetPredictor are unaffected.
+        This is unconditional. There is no nonlinearity between the trunk
+        and the classifier, so their composition is still a linear map to
+        logits and embedding_dim (128) >> num_classes (3) keeps it full
+        rank: the adapter buys an embedding space to put a loss on, not
+        expressiveness, and a purely supervised run is free to ignore it
+        (cm_weight=0). Keeping it always on means one architecture and one
+        code path, so a supervised baseline and a SuperCM run differ only in
+        the clustering weight.
 
-        The two are NOT checkpoint-compatible -- the adapter renames every
-        trunk parameter under "backbone." and adds "classifier." -- so
-        flipping the flag means retraining, not resuming.
+        Checkpoints are NOT compatible with stock nnU-Net -- the adapter
+        renames every trunk parameter under "backbone." and adds
+        "classifier." -- so pretrained stock weights need remapping, not
+        just loading.
         """
-
-        if not bool(getattr(self.cfg, "use_embedding_adapter", False)):
-            return nnUNetTrainer.build_network_architecture(
-                self.pm, self.cm, self.num_input_channels, self.lm.num_segmentation_heads, self.enable_deep_supervision
-            )
 
         embedding_dim = int(self.cfg.embedding_dim)
 
@@ -316,25 +333,28 @@ class NNUnetSetup:
             foreground_weight=getattr(self.cfg, "foreground_weight", 1.0),
         )
 
-        if self.enable_deep_supervision:
-            deep_supervision_scales = shim._get_deep_supervision_scales()
+        deep_supervision_scales = shim._get_deep_supervision_scales()
 
-            weights = np.array([1 / (2**i) for i in range(len(deep_supervision_scales))])
+        weights = np.array([1 / (2**i) for i in range(len(deep_supervision_scales))])
 
-            if is_ddp:
-                weights[-1] = 1e-6
-            else:
-                weights[-1] = 0
+        if is_ddp:
+            weights[-1] = 1e-6
+        else:
+            weights[-1] = 0
 
-            weights = weights / weights.sum()
+        weights = weights / weights.sum()
 
-            loss = DeepSupervisionWrapper(loss, weights)
-
-        return loss
+        return DeepSupervisionWrapper(loss, weights)
 
     def build_cm_loss(self):
         """
-        The SuperCM-style clustering regularizer, or None when it is off.
+        The SuperCM-style clustering regularizer.
+
+        Always built, like the adapter it depends on. Disable its effect
+        with cm_weight=0, which is what the supervised baseline sweep does:
+        the centroids are still tracked and the energy still logged, but it
+        contributes no gradient, so the baseline and a SuperCM run take the
+        identical code path and differ only in that weight.
 
         num_classes and ignore_label are read off the label manager rather
         than the yaml so they cannot drift from what the supervised loss and
@@ -343,15 +363,6 @@ class NNUnetSetup:
         agree, and a mismatch surfaces immediately as a shape error in the
         centroid einsum.
         """
-
-        if not bool(getattr(self.cfg, "use_cm_loss", False)):
-            return None
-
-        if not bool(getattr(self.cfg, "use_embedding_adapter", False)):
-            raise ValueError(
-                "use_cm_loss=true needs use_embedding_adapter=true: without the adapter the "
-                "decoder emits class logits directly and there is no per-voxel embedding to cluster."
-            )
 
         num_voxels = getattr(self.cfg, "cm_num_voxels", None)
 
@@ -372,8 +383,8 @@ class NNUnetSetup:
 
     @staticmethod
     def _unwrap_compound_loss(loss):
-        """The underlying CompoundLoss, unwrapped from DeepSupervisionWrapper if present."""
-        return loss.loss if isinstance(loss, DeepSupervisionWrapper) else loss
+        """The CompoundLoss inside the DeepSupervisionWrapper build_loss always returns."""
+        return loss.loss
 
     def update_boundary_weight(self, loss, epoch: int) -> None:
         """

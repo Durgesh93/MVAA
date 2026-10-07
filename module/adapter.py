@@ -110,7 +110,8 @@ def embeddings_enabled(network):
     if not isinstance(adapter, EmbeddingAdapter):
         raise TypeError(
             f"embeddings_enabled() needs an EmbeddingAdapter, got {type(adapter).__name__}. "
-            "Set litmodule.use_embedding_adapter=true to build one."
+            "NNUnetSetup.build_network() always returns one, so this means the network was "
+            "replaced or built elsewhere."
         )
 
     previous = adapter.return_embeddings
