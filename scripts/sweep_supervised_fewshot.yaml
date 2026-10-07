@@ -1,0 +1,137 @@
+# =============================================================================
+# Experiment 1 of the few-shot series: the SUPERVISED BASELINE CURVE.
+#
+# How does TEE mitral-leaflet Dice vary with the number of labeled training
+# images, using nothing but supervision? Dice+CE (CompoundLoss) with the
+# BoundaryLoss term active. No SSL loss, no clustering regularizer. This is
+# the curve every later SuperCM result has to be read against.
+#
+# 11 runs. num_labeled is a COUNT of the 105 official MVSeg2023 train cases,
+# and the draws are NESTED -- the cases at 20 are a prefix of those at 30 --
+# so the sweep varies how much supervision exists, not which cases supply
+# it. The 30 official val cases (scored here) and 40 test cases are never
+# touched by the split.
+#
+# Create it with:
+#   wandb sweep scripts/sweep_supervised_fewshot.yaml
+# or paste into the W&B web UI (Sweeps -> Create Sweep). Then:
+#   wandb agent echo_vi/mvaa/<sweep_id>
+#
+# RUNTIME. The ssl_sweep_bnd_weakstrong grid measured ~38 min/epoch with the
+# boundary term on at 500 steps/epoch, and ~24 min/epoch with it off -- the
+# difference is BoundaryLoss's scipy distance transform, on CPU, per sample
+# per step. At 50 epochs that is ~20 h per run, so ~220 h of GPU time for the
+# 11 arms. Size the job walltime accordingly, or halve limit_train_batches to
+# nnU-Net's own default of 250.
+# =============================================================================
+
+program: engine.py
+method: grid
+
+metric:
+  name: dice
+  goal: maximize
+
+description: >-
+  Supervised baseline few-shot curve on MVSeg2023 TEE: Dice+CE+boundary,
+  no SSL and no clustering regularizer, num_labeled 10..105.
+
+# `wandb agent` cannot call engine.py directly -- `py` is a shell function
+# from the LUMI workspace env, and the agent clobbers WANDB_DIR. sweep_run.sh
+# fixes both and assigns each run its own experiment_name.
+command:
+  - ${env}
+  - bash
+  - /project/project_465003462/durgeshk/projects/MVAA/fewshot_tee/scripts/sweep_run.sh
+  - ${args_no_hyphens}
+
+parameters:
+
+  # ---------------------------------------------------------------------------
+  # THE AXIS. 10..100 by 10, plus the full split.
+  # ---------------------------------------------------------------------------
+  datamodule.num_labeled:
+    values: [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 105]
+
+  # ---------------------------------------------------------------------------
+  # SUPERVISED ONLY.
+  #
+  # use_cm_loss=false drops the clustering term; the unlabeled loader is
+  # still built (the datamodule floors it at one case so both dataloaders
+  # always exist) but nothing reads it.
+  #
+  # use_embedding_adapter=false gives STOCK nnU-Net -- the decoder maps
+  # straight to the 3 class logits, no 128-d embedding layer. That makes
+  # this curve the clean reference number.
+  #
+  # NOTE the consequence: a later SuperCM arm differs from this baseline by
+  # TWO things, the adapter and the CM loss. The adapter is meant to be a
+  # no-op (no nonlinearity between trunk and classifier, so their
+  # composition is still linear, and 128 >> 3 keeps it full rank), but that
+  # is a claim, not a measurement. To test it and get the matched control
+  # for free, change this to:
+  #     values: [false, true]
+  # which doubles the sweep to 22 runs.
+  # ---------------------------------------------------------------------------
+  litmodule.use_cm_loss:
+    value: false
+  litmodule.use_embedding_adapter:
+    value: false
+
+  # ---------------------------------------------------------------------------
+  # BOUNDARY TERM ACTIVE.
+  #
+  # Convex mix: (1 - w) * dice_ce + w * boundary, with w ramped linearly from
+  # 0 to boundary_weight_max over boundary_ramp_epochs.
+  #
+  # boundary_ramp_epochs=15 (not the config's ${trainer.max_epochs}) so the
+  # weight actually REACHES its maximum with 35 epochs left to act. Tied to
+  # max_epochs it would only arrive on the final epoch, which is not the
+  # setting ssl_sweep_bnd_weakstrong validated. Delete this line to go back
+  # to the config default.
+  # ---------------------------------------------------------------------------
+  litmodule.use_boundary:
+    value: true
+  litmodule.boundary_weight_max:
+    value: 0.5
+  litmodule.boundary_ramp_epochs:
+    value: 15
+
+  # ---------------------------------------------------------------------------
+  # BUDGET. Matches ssl_sweep_bnd_weakstrong so the numbers are comparable.
+  #
+  # limit_train_batches is FIXED, not derived from the labeled pool size.
+  # That is the point: derived, every arm would get a different number of
+  # gradient updates and the curve would measure optimisation budget as much
+  # as supervision -- fatal when the whole question is what supervision buys.
+  #
+  # Validation is a full sliding-window pass over all 30 val cases plus
+  # surface-distance metrics, so it is scored every 10th epoch, not every
+  # epoch.
+  #
+  # save_case_outputs=false skips the ~450 MB of per-case zips per validation
+  # epoch, and with them the full-resolution probability volume that only
+  # those zips read. Nothing downstream needs them: checkpoint selection and
+  # the logged metrics both come from the in-memory prediction.
+  # ---------------------------------------------------------------------------
+  trainer.max_epochs:
+    value: 50
+  datamodule.limit_train_batches:
+    value: 500
+  trainer.check_val_every_n_epoch:
+    value: 10
+  litmodule.save_case_outputs:
+    value: false
+
+  # Checkpoints are kept (~250 MB per arm, ~2.8 GB total, on scratch) so
+  # these baselines can be scored on the held-out 40-case test split later
+  # with `engine.py test` instead of being retrained. Set to false if you
+  # only ever want the validation curve.
+  trainer.enable_checkpointing:
+    value: true
+
+  # K=2 is the loader's minimum. No loss here reads the unlabeled views, and
+  # each extra view is another intensity pipeline per sample per step on the
+  # CPU side that was already the bottleneck.
+  datamodule.K:
+    value: 2
