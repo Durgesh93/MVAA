@@ -437,10 +437,27 @@ class ClusteringCMLoss(nn.Module):
         denominator = torch.zeros(self.num_classes, device=self.mu.device, dtype=self.mu.dtype)
 
         for x, y in streams:
-            x = x.to(self.mu.dtype)
-            y = y.to(self.mu.dtype)
-            numerator += torch.einsum("bdp,bcp->cd", x, y)
-            denominator += y.sum(dim=(0, 2))
+            # autocast explicitly OFF, and fp32 forced on the operands.
+            #
+            # `x.to(self.mu.dtype)` on its own is NOT enough and silently did
+            # nothing useful: torch.einsum is on autocast's fp16 list, so
+            # inside an autocast region autocast casts both operands straight
+            # back to fp16 and accumulates there, overriding the cast. This
+            # einsum reduces over EVERY voxel in the batch -- 1.38M at a
+            # 112x96x128 patch -- and fp16 tops out at 65504, so the running
+            # total saturates to inf almost immediately.
+            #
+            # That is exactly how mu became inf in the first sweep. The forward
+            # then clipped the energy to LOSS_CLIP_VALUE, but d(energy)/d(g)
+            # carried mu_squared = inf, so the backward produced 0 * inf = NaN
+            # in 102 of 110 parameter tensors -- at cm_weight=0 as well, since
+            # 0.0 * inf is also NaN. AMP's GradScaler then skipped every
+            # optimizer step and no run learned anything.
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                x32 = x.float()
+                y32 = y.float()
+                numerator += torch.einsum("bdp,bcp->cd", x32, y32)
+                denominator += y32.sum(dim=(0, 2))
 
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.all_reduce(numerator)
@@ -452,6 +469,21 @@ class ClusteringCMLoss(nn.Module):
             return
 
         estimate = numerator[present] / denominator[present].unsqueeze(1)
+
+        # Fail loudly rather than poison the run. A non-finite centroid makes
+        # the forward energy clip to LOSS_CLIP_VALUE -- which looks like a
+        # merely large number in the logs -- while the backward carries
+        # 0 * inf = NaN into every parameter, so AMP's GradScaler skips every
+        # optimizer step and the model silently never trains. That cost a
+        # 10-run sweep ~5 h each before anyone noticed the Dice was frozen at
+        # its initialisation value. An unrecoverable loss is worth a crash.
+        if not torch.isfinite(estimate).all():
+            raise RuntimeError(
+                "ClusteringCMLoss: non-finite centroid estimate. The reduction over voxels "
+                "overflowed -- check that update_centroids still runs with autocast disabled "
+                "and fp32 operands (torch.einsum is on autocast's fp16 list and will silently "
+                "override an explicit .float() cast)."
+            )
 
         rows = present.nonzero(as_tuple=True)[0]
         fresh = ~self.mu_initialized[rows]
@@ -506,37 +538,37 @@ class ClusteringCMLoss(nn.Module):
         same weight ballpark.
         """
 
-        mu = self.mu.to(x.dtype)
-
-        if self.normalize:
-            x = nn.functional.normalize(x, dim=1)
-            mu = nn.functional.normalize(mu, dim=1)
-
-        g = g.to(x.dtype)
-
-        x_squared = x.pow(2).sum(dim=1)
-        x_dot_mu = torch.einsum("bdp,cd->bcp", x, mu)
-        mu_squared = mu.pow(2).sum(dim=1).view(1, -1, 1)
-
-        per_voxel = x_squared - 2.0 * (g * x_dot_mu).sum(dim=1) + (g * mu_squared).sum(dim=1)
-
-        if not self.normalize:
-            per_voxel = per_voxel / float(self.embedding_dim)
-
-        # float32 for the reduction over voxels, whatever autocast handed us.
-        # Two reasons, both load-bearing now that every voxel contributes:
-        # summing 2.75M fp16 values loses most of the mantissa (fp16 carries
-        # ~3 decimal digits, and the running total dwarfs each addend), and
-        # _clip_loss cannot clamp a Half tensor to +/-1e6 at all -- it raises
-        # "value cannot be converted to type at::Half without overflow".
+        # autocast explicitly OFF and everything in fp32, for the same reason
+        # as update_centroids: a loss term has no business running in fp16, and
+        # leaning on autocast's per-op dtype policy is precisely what broke the
+        # centroid einsum. The saving would be negligible next to the network,
+        # and the failure mode is silent.
         #
-        # Cheap: per_voxel is (B, P), so this is ~11 MB at a 112x96x128 patch,
-        # not the (B, D, P) embedding.
-        per_voxel = per_voxel.float()
+        # Upcasting the embedding costs ~1.4 GB at a 112x96x128 patch and batch
+        # 2, against the ~49 GiB of headroom measured on an MI250X. Also note
+        # _clip_loss cannot clamp a Half tensor to +/-1e6 at all: it raises
+        # "value cannot be converted to type at::Half without overflow".
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x = x.float()
+            g = g.float()
+            mu = self.mu.float()
 
-        weights = valid.to(per_voxel.dtype)
+            if self.normalize:
+                x = nn.functional.normalize(x, dim=1)
+                mu = nn.functional.normalize(mu, dim=1)
 
-        return (per_voxel * weights).sum() / weights.sum().clamp_min(1.0)
+            x_squared = x.pow(2).sum(dim=1)
+            x_dot_mu = torch.einsum("bdp,cd->bcp", x, mu)
+            mu_squared = mu.pow(2).sum(dim=1).view(1, -1, 1)
+
+            per_voxel = x_squared - 2.0 * (g * x_dot_mu).sum(dim=1) + (g * mu_squared).sum(dim=1)
+
+            if not self.normalize:
+                per_voxel = per_voxel / float(self.embedding_dim)
+
+            weights = valid.to(per_voxel.dtype)
+
+            return (per_voxel * weights).sum() / weights.sum().clamp_min(1.0)
 
     # -------------------------------------------------------------------------
     # Forward
