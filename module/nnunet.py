@@ -377,6 +377,7 @@ class NNUnetSetup:
             conf_thr=float(self.cfg.cm_conf_thr),
             topk_frac=float(self.cfg.cm_topk_frac),
             min_keep=int(self.cfg.cm_min_keep),
+            use_soft_pseudo=bool(getattr(self.cfg, "cm_use_soft_pseudo", False)),
             normalize=bool(getattr(self.cfg, "cm_normalize", False)),
             ignore_label=self.lm.ignore_label,
         )

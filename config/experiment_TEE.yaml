@@ -216,6 +216,23 @@ litmodule:
   cm_topk_frac: 0.15
   cm_min_keep: 64
 
+  # What a kept unlabeled voxel contributes to the centroid estimate.
+  #
+  # false (default) -- argmax one-hot: a voxel counts toward exactly one
+  # centroid. true -- the raw class probabilities: every voxel contributes
+  # to every centroid, weighted by p_c.
+  #
+  # Soft has a degenerate regime worth understanding before switching it on.
+  # Early in training p ~ 1/3 everywhere, so all three centroids converge on
+  # the global mean of the features and collapse onto each other; the energy
+  # then reduces to ||x - mu_bar||^2 and pulls every embedding toward a
+  # single point regardless of class. The confidence filter is what holds
+  # that back, so do not pair this with a loosened cm_conf_thr.
+  #
+  # Ignored at cm_mode=l, which uses ground-truth one-hot and never calls
+  # the pseudo-label path at all.
+  cm_use_soft_pseudo: false
+
   # true switches the energy to spherical k-means (2 - 2cos), L2-normalising
   # both embeddings and centroids. Scale-invariant, so the term cannot be
   # satisfied by simply shrinking every embedding toward the origin -- worth

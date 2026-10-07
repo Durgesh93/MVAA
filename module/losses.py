@@ -336,6 +336,7 @@ class ClusteringCMLoss(nn.Module):
         conf_thr: float = 0.9,
         topk_frac: float = 0.15,
         min_keep: int = 64,
+        use_soft_pseudo: bool = False,
         normalize: bool = False,
         ignore_label=None,
         eps: float = 1e-6,
@@ -358,6 +359,7 @@ class ClusteringCMLoss(nn.Module):
         self.conf_thr = float(conf_thr)
         self.topk_frac = float(topk_frac)
         self.min_keep = int(min_keep)
+        self.use_soft_pseudo = bool(use_soft_pseudo)
         self.normalize = bool(normalize)
         self.ignore_label = ignore_label
         self.eps = float(eps)
@@ -465,7 +467,7 @@ class ClusteringCMLoss(nn.Module):
     @torch.no_grad()
     def _confident_assignments(self, probs: Tensor):
         """
-        Hard pseudo-label assignments restricted to confident voxels.
+        Pseudo-label assignments restricted to confident voxels.
 
         Selection is PER PREDICTED CLASS, not over the patch as a whole.
         A global top-k would be dominated by background: the leaflets are a
@@ -473,13 +475,35 @@ class ClusteringCMLoss(nn.Module):
         thousands of background voxels and possibly no leaflet voxel at
         all, leaving the foreground centroids estimated from nothing.
 
-        Returns (y, keep) with y (B, C, P) one-hot float and keep (B, P) bool.
+        use_soft_pseudo picks what the kept voxels contribute:
+
+          False (default) -- argmax one-hot. A voxel counts toward exactly
+            the centroid of the class it was assigned.
+
+          True -- the raw probabilities. Every voxel contributes to EVERY
+            centroid, weighted by p_c. Smoother, but it has a degenerate
+            regime: early in training p ~ 1/C everywhere, so all C centroids
+            converge on the global mean of the features and collapse onto
+            each other. The energy then reduces to ||x - mu_bar||^2, which
+            pulls every embedding toward one point regardless of class --
+            actively destroying the structure this loss exists to sharpen.
+            The confidence filter is what keeps that in check, so if you
+            turn this on, do not also loosen conf_thr.
+
+        Either way the result is zeroed outside the confident set, so
+        excluded voxels contribute to neither the numerator nor the
+        denominator of the centroid estimate.
+
+        Returns (y, keep) with y (B, C, P) float and keep (B, P) bool.
         """
 
         confidence, predicted = probs.max(dim=1)
 
-        y = nn.functional.one_hot(predicted, num_classes=self.num_classes)
-        y = y.permute(0, 2, 1).to(torch.float32)
+        if self.use_soft_pseudo:
+            y = probs
+        else:
+            y = nn.functional.one_hot(predicted, num_classes=self.num_classes)
+            y = y.permute(0, 2, 1).to(torch.float32)
 
         flat_keep = torch.zeros(confidence.numel(), dtype=torch.bool, device=confidence.device)
 
