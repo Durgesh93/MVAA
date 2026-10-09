@@ -173,23 +173,29 @@ litmodule:
   #   l+u  both. The actual semi-supervised claim.
   cm_mode: 'l'
 
-  # Weight on the clustering term, linearly ramped 0 -> cm_weight over
-  # cm_warmup_epochs. The ramp is not cosmetic: mu is the zero vector until
-  # it has seen a batch, and pulling embeddings toward zero is actively
-  # harmful.
+  # Final weight on the clustering term. It is scaled linearly across the
+  # WHOLE run -- 0 on the first step, cm_weight on the last -- so there is no
+  # separate warmup length. The ramp IS the schedule: the clustering
+  # constraint tightens as the supervised fit sharpens, rather than arriving
+  # at full strength in the first few epochs and then pinning the embedding
+  # geometry for the remaining ones.
   #
-  # Measured in EPOCHS, not steps, so it means the same thing regardless of
-  # limit_train_batches. The ramp is still applied per step (the
-  # LightningModule feeds it fractional epochs), so there is no
-  # once-per-epoch jump in the loss.
+  # Driven by the fraction of training completed (global_step /
+  # estimated_stepping_batches, see the LightningModule's _cm_progress), so
+  # it is smooth per step and independent of both max_epochs and
+  # limit_train_batches.
   #
-  # 0.1 is calibrated, not guessed. The energy is divided by embedding_dim
-  # so it starts near 1.0 regardless of D, which puts it on the same scale
-  # as CompoundLoss; and the ssl_sweep_bnd_weakstrong grid found an
-  # auxiliary weight of 0.1 against that same CompoundLoss harmless and
-  # >=0.5 clearly damaging. Expect to sweep this first.
-  cm_weight: 0.1
-  cm_warmup_epochs: 5
+  # It still covers what the old warmup was for: mu is the zero vector until
+  # it has seen a batch, and a weight of 0 on the first step means the loss
+  # cannot pull embeddings toward it.
+  #
+  # Scale reference: the energy is divided by embedding_dim so it starts near
+  # 1.0 regardless of D, putting it on the same O(1) scale as CompoundLoss.
+  # For context, ssl_sweep_bnd_weakstrong found a CONSTANT auxiliary weight
+  # of 0.1 against that same CompoundLoss harmless and >=0.5 damaging -- but
+  # a ramped weight averages half its final value over the run and only
+  # reaches it at the very end, so those numbers are not directly comparable.
+  cm_weight: 1.0
   cm_ema_weight: 0.95
 
 
@@ -287,11 +293,16 @@ wandb:
 # =============================================================================
 
 trainer:
-  # 80 epochs at ~24 min each (the rate ssl_sweep_bnd_weakstrong measured
-  # without the boundary term) is ~32 h, which fits inside standard-g's 48 h
-  # ceiling with margin. 300 would have been ~5 days and needed requeueing.
-  # litmodule.num_epochs interpolates this, so the LR schedule follows.
-  max_epochs: 80
+  # 200 epochs. Measured rate on a full standard-g node is ~8 min/epoch (the
+  # first sweep did 80 epochs in ~10.8 h), so ~27 h -- inside standard-g's
+  # 48 h ceiling, but with much less margin than 80 gave. Check the first arm
+  # against that before launching a whole grid.
+  #
+  # Two things interpolate this, so both rescale automatically:
+  #   litmodule.num_epochs  -> the PolyLR schedule
+  #   the clustering ramp   -> via estimated_stepping_batches, so cm_weight
+  #                            still reaches its final value on the last step
+  max_epochs: 200
   strategy: ${training_strategy}
   precision: 16-mixed
   log_every_n_steps: 1

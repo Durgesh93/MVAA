@@ -145,25 +145,30 @@ class SSLnnUNetLightningModule(L.LightningModule):
         finally:
             network.decoder.deep_supervision = previous
 
-    def _cm_epoch_progress(self) -> float:
+    def _cm_progress(self) -> float:
         """
-        Fractional epochs elapsed, for the clustering weight's ramp.
+        Fraction of training completed, in [0, 1], for the clustering ramp.
+
+        estimated_stepping_batches is the total number of optimizer steps for
+        the whole fit (max_epochs x batches per epoch), so this is a true
+        progress fraction rather than an epoch count -- the clustering weight
+        scales linearly from 0 on the first step to cm_weight on the last.
 
         Built from Lightning's own global_step so it survives a resume and
-        cannot drift from the optimiser's view of progress, divided by the
-        batches per epoch so that cm_warmup_epochs means epochs rather than
-        steps. num_training_batches is inf for an unbounded iterable
-        dataloader; datamodule.limit_train_batches makes it finite here, but
-        fall back to the integer epoch rather than returning inf (which
-        would clamp the ramp to full weight on step one).
+        cannot drift from the optimiser's view of progress. The quantity is
+        inf for an unbounded iterable dataloader; datamodule.limit_train_batches
+        makes it finite here, but fall back to the epoch fraction rather than
+        returning inf, which would clamp the weight to full on step one.
         """
 
-        batches = float(getattr(self.trainer, "num_training_batches", 0) or 0)
+        total_steps = float(getattr(self.trainer, "estimated_stepping_batches", 0) or 0)
 
-        if not math.isfinite(batches) or batches <= 0:
-            return float(self.current_epoch)
+        if math.isfinite(total_steps) and total_steps > 0:
+            return float(self.global_step) / total_steps
 
-        return float(self.global_step) / batches
+        max_epochs = float(self.trainer.max_epochs or 0)
+
+        return float(self.current_epoch) / max_epochs if max_epochs > 0 else 1.0
 
     def training_step(self, batch, batch_idx):
         """
@@ -206,7 +211,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
             u_logits=self._highest_resolution(unlabeled_logits),
         )
 
-        cm_weight = self.cm_loss.weight_at(self._cm_epoch_progress())
+        cm_weight = self.cm_loss.weight_at(self._cm_progress())
 
         total_loss = supervised_loss + cm_weight * cm_energy
 
