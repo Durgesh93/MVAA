@@ -35,6 +35,23 @@ cd "$REPO_ROOT" || exit 1
 # shellcheck disable=SC1090
 source "${ENV_STORAGE_BASE:-/project/project_465003462/durgeshk/envs/workspace}/platforms/lumi/main.sh" >/dev/null 2>&1 || true
 
+# Re-apply the ROCm/MIOpen environment AFTER sourcing main.sh.
+#
+# The sbatch wrapper already calls set_rocm_config, but sourcing main.sh here
+# re-runs the login-time setup, which resets the MIOpen cache paths. Before
+# this line the training process ended up with MIOpen's SQLite kernel
+# database on Lustre -- shared by every rank of every array task -- and at 176
+# ranks every one of them died with
+#   "Timeout while waiting for Database: .../miopen/gfx90a6e.ukdb"
+#   "RuntimeError: miopenStatusUnknownError"
+# about two minutes in, while SLURM reported the task COMPLETED 0:0 because
+# the agent treated the crashed run as finished.
+#
+# set_miopen_cache (helper.sh) is now shared by both call sites, so this is
+# belt-and-braces rather than the fix itself -- but the training process is
+# what actually needs the environment, so it should set it explicitly.
+set_rocm_config
+
 # Only pipefail: `set -u` breaks the workspace's own `py` function, which
 # reads unset variables (helper.sh: REPO_DIR), and `set -e` is unusable
 # for the same reason main.sh is sourced defensively above.
