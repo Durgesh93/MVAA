@@ -227,11 +227,33 @@ litmodule:
   # the pseudo-label path at all.
   cm_use_soft_pseudo: false
 
-  # true switches the energy to spherical k-means (2 - 2cos), L2-normalising
-  # both embeddings and centroids. Scale-invariant, so the term cannot be
-  # satisfied by simply shrinking every embedding toward the origin -- worth
-  # trying if the Euclidean form collapses the embedding norms.
-  cm_normalize: false
+  # TRUE, and this is not optional any more -- the Euclidean form is
+  # vacuous on this architecture.
+  #
+  # Measured on sweep yvw1emxi (22 runs, 200 epochs): with the Euclidean
+  # energy, train_cm_loss fell from ~0.02 to ~0.001 while train_sup_loss and
+  # Dice did not move at all (mean dDice over 11 label counts: -0.0004). The
+  # checkpoints show why -- the embedding shrank ~1.9x and the classifier
+  # grew 1.37x. Since logits = W*x, scaling x by 1/s and W by s leaves the
+  # logits bit-identical, so Dice+CE cannot see it, while ||x - mu||^2 falls
+  # as s^2. The network satisfied the regulariser by changing its own units.
+  #
+  # The 2D supercm project was immune because its head is
+  # torch.mean(pre_heatmaps, dim=1) -- no parameters, so no W to grow, so
+  # shrinking x shrinks the logit and BCE objects immediately. Introducing a
+  # learnable 128->3 classifier is what opened the degeneracy.
+  #
+  # Normalising both x and mu makes the energy 2 - 2cos(x, mu), bounded in
+  # [0, 4] and invariant to scale: measured on the real network it reads
+  # 0.94354 at scale 1.0, 0.5 and 0.1 alike, where the Euclidean form reads
+  # 0.679 / 0.170 / 0.007. Collinear collapse is not an escape either --
+  # identical directions give every voxel the same argmax, which Dice
+  # punishes hard.
+  #
+  # Note the /embedding_dim division is skipped when this is on (the energy
+  # is already O(1)), so cm_weight is on a comparable but not identical
+  # scale to the Euclidean runs.
+  cm_normalize: true
 
   foreground_weight: 10.0
   tracked_labels: ["posterior_leaflet", "anterior_leaflet"]

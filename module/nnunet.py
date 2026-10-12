@@ -297,6 +297,7 @@ class NNUnetSetup:
         backbone = nnUNetTrainer.build_network_architecture(
             self.pm, self.cm, self.num_input_channels, embedding_dim, self.enable_deep_supervision
         )
+        
 
         # Conv class read off the trunk's own seg_layers rather than
         # hardcoded to Conv3d, so a 2d configuration needs no special case.
