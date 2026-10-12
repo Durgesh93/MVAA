@@ -193,6 +193,7 @@ class ClusteringCMLoss(nn.Module):
         num_classes: int,
         cm_mode: str = "l",
         weight: float = 0.1,
+        start_epoch: float = 5.0,
         ema_weight: float = 0.95,
         conf_thr: float = 0.9,
         topk_frac: float = 0.15,
@@ -214,6 +215,7 @@ class ClusteringCMLoss(nn.Module):
         self.num_classes = int(num_classes)
         self.cm_mode = cm_mode
         self.weight = float(weight)
+        self.start_epoch = float(start_epoch)
         self.ema_weight = float(ema_weight)
         self.conf_thr = float(conf_thr)
         self.topk_frac = float(topk_frac)
@@ -244,31 +246,32 @@ class ClusteringCMLoss(nn.Module):
         """True when cm_mode sources centroids from the unlabeled stream."""
         return self.cm_mode in ("u", "l+u")
 
-    def weight_at(self, progress: float) -> float:
+    def weight_at(self, epoch: float) -> float:
         """
-        Loss weight scaled linearly across the WHOLE run: 0 at the first
-        step, self.weight at the last.
+        Off until start_epoch, then constant at self.weight. A step, not a ramp.
 
-        progress is the fraction of training completed, in [0, 1] -- the
-        caller divides Lightning's global_step by the total optimizer steps
-        for the fit (see the LightningModule's _cm_progress). There is no
-        separate warmup length any more: the ramp IS the schedule, so the
-        clustering constraint tightens as the supervised fit sharpens
-        instead of arriving at full strength in the first few epochs and
-        then pinning the embedding geometry for the rest of the run.
+        epoch is FRACTIONAL epochs elapsed -- the caller divides Lightning's
+        global_step by the batches per epoch (see the LightningModule's
+        _cm_epoch) -- so the term switches on exactly at start_epoch rather
+        than at an epoch boundary one way or the other.
 
-        It still covers what the old warmup was for -- mu is the zero vector
-        until it has seen a batch, and a weight of 0 on the first step means
-        the loss cannot pull embeddings toward it.
+        Replaces a linear ramp across the whole run. The ramp meant the
+        weight averaged half its nominal value and only reached it on the
+        final step, which makes "cm_weight = 1.0" hard to interpret and
+        confounds schedule with strength. A delayed constant separates them:
+        the term is either absent or at full strength, so a difference
+        against the cm_weight=0 arm is attributable to the term itself.
 
-        Driven by the caller rather than an internal counter. The 2D supercm
-        project incremented its own buffer inside this function and ALSO
-        used that buffer to decide hard-copy-vs-EMA for the centroids, so a
-        warmup of 0 silently disabled the EMA; keeping the two concerns
-        separate avoids that.
+        start_epoch exists because mu is meaningless before it has seen
+        data, and because the supervised loss needs a head start -- applying
+        a clustering constraint to an embedding that does not yet separate
+        the classes just fights the thing that would make it separate.
+        Centroids ARE still estimated during those first epochs (that
+        happens in forward, independent of this weight), so mu is already
+        warm when the term switches on.
         """
 
-        return self.weight * min(max(float(progress), 0.0), 1.0)
+        return self.weight if float(epoch) >= self.start_epoch else 0.0
 
     # -------------------------------------------------------------------------
     # Flattening helpers

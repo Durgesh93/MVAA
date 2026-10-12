@@ -361,6 +361,7 @@ class NNUnetSetup:
             num_classes=self.lm.num_segmentation_heads,
             cm_mode=str(self.cfg.cm_mode),
             weight=float(self.cfg.cm_weight),
+            start_epoch=float(self.cfg.cm_start_epoch),
             ema_weight=float(self.cfg.cm_ema_weight),
             conf_thr=float(self.cfg.cm_conf_thr),
             topk_frac=float(self.cfg.cm_topk_frac),

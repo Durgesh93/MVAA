@@ -173,29 +173,27 @@ litmodule:
   #   l+u  both. The actual semi-supervised claim.
   cm_mode: 'l'
 
-  # Final weight on the clustering term. It is scaled linearly across the
-  # WHOLE run -- 0 on the first step, cm_weight on the last -- so there is no
-  # separate warmup length. The ramp IS the schedule: the clustering
-  # constraint tightens as the supervised fit sharpens, rather than arriving
-  # at full strength in the first few epochs and then pinning the embedding
-  # geometry for the remaining ones.
+  # Clustering weight: OFF until cm_start_epoch, then CONSTANT at cm_weight.
+  # A step, not a ramp.
   #
-  # Driven by the fraction of training completed (global_step /
-  # estimated_stepping_batches, see the LightningModule's _cm_progress), so
-  # it is smooth per step and independent of both max_epochs and
-  # limit_train_batches.
+  # The previous setting ramped linearly across the whole run, which meant
+  # the weight averaged half its nominal value and only reached 1.0 on the
+  # final step -- so "cm_weight: 1.0" did not describe what the model
+  # actually experienced, and schedule was confounded with strength. With a
+  # delayed constant the term is either absent or at full strength, so any
+  # difference against the cm_weight=0 arm is attributable to the term.
   #
-  # It still covers what the old warmup was for: mu is the zero vector until
-  # it has seen a batch, and a weight of 0 on the first step means the loss
-  # cannot pull embeddings toward it.
+  # Driven by fractional epochs (global_step / batches-per-epoch, see the
+  # LightningModule's _cm_epoch), so it switches on exactly at
+  # cm_start_epoch rather than at the next epoch boundary.
   #
-  # Scale reference: the energy is divided by embedding_dim so it starts near
-  # 1.0 regardless of D, putting it on the same O(1) scale as CompoundLoss.
-  # For context, ssl_sweep_bnd_weakstrong found a CONSTANT auxiliary weight
-  # of 0.1 against that same CompoundLoss harmless and >=0.5 damaging -- but
-  # a ramped weight averages half its final value over the run and only
-  # reaches it at the very end, so those numbers are not directly comparable.
+  # Why delay at all: applying a clustering constraint to an embedding that
+  # does not yet separate the classes fights the supervised loss that would
+  # make it separate. The centroids are still estimated during those first
+  # epochs -- that happens in forward, independent of this weight -- so mu
+  # is already warm when the term switches on.
   cm_weight: 1.0
+  cm_start_epoch: 5
   cm_ema_weight: 0.95
 
 
@@ -328,15 +326,16 @@ trainer:
   strategy: ${training_strategy}
   precision: 16-mixed
   log_every_n_steps: 1
-  # Validation is a full sliding-window pass over all 30 val cases plus
-  # surface-distance metrics -- minutes of work that produces one scalar for
-  # checkpoint selection. At 500 steps per epoch there is enough real
-  # progress between epochs that scoring every 5th is plenty.
+  # Every epoch, so the effect of the clustering term switching on at
+  # cm_start_epoch is visible immediately rather than averaged into a
+  # 10-epoch bucket.
   #
-  # NOTE: the training-side metrics (train_loss etc.) are reset in
-  # _eval_epoch_end, so they now aggregate over 5 epochs rather than 1. That
-  # smooths the logged curves; it does not change training.
-  check_val_every_n_epoch: 5
+  # This is EXPENSIVE: a validation is a full sliding-window pass over all
+  # 30 val cases plus surface-distance metrics, measured at roughly 1 min
+  # per case, i.e. ~30 min -- against ~8 min for a training epoch. Per-epoch
+  # validation therefore costs about 4x the training itself. Keep max_epochs
+  # low, or set trainer.limit_val_batches to score a fixed subset of cases.
+  check_val_every_n_epoch: 1
   enable_progress_bar: true
   enable_checkpointing: true
   deterministic: false
