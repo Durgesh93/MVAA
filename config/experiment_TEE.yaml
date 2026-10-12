@@ -326,16 +326,23 @@ trainer:
   strategy: ${training_strategy}
   precision: 16-mixed
   log_every_n_steps: 1
-  # Every epoch, so the effect of the clustering term switching on at
-  # cm_start_epoch is visible immediately rather than averaged into a
-  # 10-epoch bucket.
+  # Validation is a full sliding-window pass over all 30 val cases plus
+  # surface-distance metrics -- about 1 min per case, so ~30 min, against
+  # ~8 min for a training epoch. Every 10th epoch keeps the total tractable:
   #
-  # This is EXPENSIVE: a validation is a full sliding-window pass over all
-  # 30 val cases plus surface-distance metrics, measured at roughly 1 min
-  # per case, i.e. ~30 min -- against ~8 min for a training epoch. Per-epoch
-  # validation therefore costs about 4x the training itself. Keep max_epochs
-  # low, or set trainer.limit_val_batches to score a fixed subset of cases.
-  check_val_every_n_epoch: 1
+  #   200 training epochs x  8 min  = ~27 h
+  #    20 validations     x 30 min  = ~10 h
+  #                                   ~37 h, inside the 48 h ceiling
+  #
+  # Validating every epoch instead would make validation ~4x the cost of
+  # training and put a 200-epoch arm near 127 h, dying at the wall around
+  # epoch 75.
+  #
+  # Consequence worth knowing: the first validation lands at epoch 9, which
+  # is AFTER the clustering term switches on at cm_start_epoch=5, so there is
+  # no pre-switch validation point within a run. The cm_weight=0 arm is the
+  # control for that comparison, not an earlier epoch of the same run.
+  check_val_every_n_epoch: 10
   enable_progress_bar: true
   enable_checkpointing: true
   deterministic: false
