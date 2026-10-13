@@ -192,6 +192,8 @@ class ClusteringCMLoss(nn.Module):
         embedding_dim: int,
         num_classes: int,
         cm_mode: str = "l",
+        form: str = "contrastive",
+        tau: float = 1.0,
         weight: float = 0.1,
         start_epoch: float = 5.0,
         ema_weight: float = 0.95,
@@ -214,6 +216,12 @@ class ClusteringCMLoss(nn.Module):
         self.embedding_dim = int(embedding_dim)
         self.num_classes = int(num_classes)
         self.cm_mode = cm_mode
+
+        if form not in ("contrastive", "attract"):
+            raise ValueError(f"form must be 'contrastive' or 'attract', got {form!r}")
+
+        self.form = form
+        self.tau = float(tau)
         self.weight = float(weight)
         self.start_epoch = float(start_epoch)
         self.ema_weight = float(ema_weight)
@@ -501,68 +509,79 @@ class ClusteringCMLoss(nn.Module):
     # -------------------------------------------------------------------------
     # Energy
     # -------------------------------------------------------------------------
-    def _energy(self, x: Tensor, g: Tensor, valid: Tensor) -> Tensor:
+    def _energy(self, x: Tensor, g: Tensor, y: Tensor, valid: Tensor) -> Tensor:
         """
-        mean over valid voxels of sum_k g_k ||x - mu_k||^2.
+        Squared distances to every centroid, turned into a loss two ways.
 
-        Every voxel contributes -- no subsampling. At a 112x96x128 patch and
-        batch 2 that is 2.75M voxels per step, which is affordable only
-        because of how this is written: expanded rather than computed from an
-        explicit difference, so the only tensors RETAINED for backward are
-        (B, C, P) with C=3. x.pow(2) is transiently (B, D, P) but is freed by
-        the sum, and backward needs x itself, which exists anyway as the
-        adapter's output.
+        form="contrastive" (default):
 
-        The 2D supercm project instead did permute(...).reshape(-1, D),
-        materialising a full (B*P, D) copy that IS held for backward -- about
-        350 MB per sample at this patch size, on top of the embedding.
+            -log softmax_k(-||x - mu_k||^2 / tau)[y]
 
-        sum_k g_k == 1 (g is a softmax), which is what lets the ||x||^2
-        term come out of the class sum as a single (B, P) map.
+        a soft-target cross-entropy over the negative squared distances, i.e.
+        "would a nearest-centroid classifier get this voxel right?". Both
+        attraction and repulsion come out of the one expression: the correct
+        class's distance has to be smallest RELATIVE to the others, so the
+        voxel must approach its own centroid AND recede from the rest.
 
-        The result is divided by embedding_dim, so it is a mean squared
-        distance PER DIMENSION rather than a raw squared distance in
-        128-space. That is only a reparameterisation of the loss weight,
-        but it is the difference between a weight that means something and
-        one that does not: unscaled, this energy starts around D (=128) at
-        initialisation, so the 0.1-ish auxiliary weight that the
-        ssl_sweep_bnd_weakstrong grid found workable against CompoundLoss
-        (itself O(1)) would have put the clustering term at ~14x the
-        supervised one. Dividing by D makes the weight independent of
-        embedding_dim and directly comparable to that sweep's lambda scale.
+        Bounded below by 0 and above by log(C) = 1.0986 for C=3, and that
+        upper bound is exactly what total collapse produces: parallel
+        centroids make every distance equal, the posterior uniform, and the
+        loss maximal. Collapse is the worst state available rather than the
+        best, which is the property the attract form lacks.
 
-        normalize=True is exempt: spherical k-means already yields
-        2 - 2cos(x, mu) in [0, 4], so it needs no rescaling and keeps the
-        same weight ballpark.
+        form="attract" (the old behaviour, kept so the earlier sweeps stay
+        reproducible):
+
+            sum_k g_k ||x - mu_k||^2
+
+        Attraction only. Measured on synthetic scenes at centroid
+        separations of 120/90/60/20/5/1 degrees it reads
+        0.6719/0.6657/0.6655/0.6623/0.6613/0.6633 -- flat to three decimals,
+        with its MINIMUM at 5 degrees. It cannot see between-class
+        separation, and marginally prefers collapse. Sweep 7yu5e5o5 duly
+        collapsed: within-class angle 1.0-1.3 deg (from 24-27), but
+        between-class centroid angle 12 deg (from 113), and Dice 0.002-0.021
+        WORSE than the cm_weight=0 control.
+
+        Shared machinery either way. Every voxel contributes -- no
+        subsampling -- so at a 112x96x128 patch and batch 2 that is 2.75M
+        voxels per step. The distance matrix is (B, C, P) with C=3, about
+        33 MB, and x.pow(2) is transiently (B, D, P) but freed by the sum;
+        backward needs x itself, which exists anyway as the adapter's
+        output. The 2D supercm project instead did permute(...).reshape(-1,
+        D), materialising a (B*P, D) copy that IS held for backward.
+
+        autocast is explicitly OFF and everything is fp32: a loss term gains
+        nothing from fp16 next to the network, and leaning on autocast's
+        per-op dtype policy is what silently broke the centroid einsum
+        before. _clip_loss also cannot clamp a Half tensor to +/-1e6 at all.
         """
 
-        # autocast explicitly OFF and everything in fp32, for the same reason
-        # as update_centroids: a loss term has no business running in fp16, and
-        # leaning on autocast's per-op dtype policy is precisely what broke the
-        # centroid einsum. The saving would be negligible next to the network,
-        # and the failure mode is silent.
-        #
-        # Upcasting the embedding costs ~1.4 GB at a 112x96x128 patch and batch
-        # 2, against the ~49 GiB of headroom measured on an MI250X. Also note
-        # _clip_loss cannot clamp a Half tensor to +/-1e6 at all: it raises
-        # "value cannot be converted to type at::Half without overflow".
         with torch.autocast(device_type=x.device.type, enabled=False):
             x = x.float()
             g = g.float()
+            y = y.float()
             mu = self.mu.float()
 
             if self.normalize:
                 x = nn.functional.normalize(x, dim=1)
                 mu = nn.functional.normalize(mu, dim=1)
 
-            x_squared = x.pow(2).sum(dim=1)
+            x_squared = x.pow(2).sum(dim=1).unsqueeze(1)
             x_dot_mu = torch.einsum("bdp,cd->bcp", x, mu)
             mu_squared = mu.pow(2).sum(dim=1).view(1, -1, 1)
 
-            per_voxel = x_squared - 2.0 * (g * x_dot_mu).sum(dim=1) + (g * mu_squared).sum(dim=1)
+            # (B, C, P): squared distance from every voxel to every centroid
+            dist_sq = (x_squared - 2.0 * x_dot_mu + mu_squared).clamp_min(0.0)
 
-            if not self.normalize:
-                per_voxel = per_voxel / float(self.embedding_dim)
+            if self.form == "contrastive":
+                log_posterior = nn.functional.log_softmax(-dist_sq / self.tau, dim=1)
+                per_voxel = -(y * log_posterior).sum(dim=1)
+            else:
+                per_voxel = (g * dist_sq).sum(dim=1)
+
+                if not self.normalize:
+                    per_voxel = per_voxel / float(self.embedding_dim)
 
             weights = valid.to(per_voxel.dtype)
 
@@ -597,7 +616,7 @@ class ClusteringCMLoss(nn.Module):
         if self.cm_mode in ("l", "l+u"):
             streams.append((x_labeled, y_labeled))
 
-        x_unlabeled = g_unlabeled = None
+        x_unlabeled = g_unlabeled = y_unlabeled = None
 
         if u_embeddings is not None and u_logits is not None:
             x_unlabeled = self._flatten_spatial(u_embeddings)
@@ -615,15 +634,25 @@ class ClusteringCMLoss(nn.Module):
         # are exactly the ones with no supervision, so pulling them toward
         # a cluster is the whole point. With cm_mode="l" there is no
         # unlabeled forward at all and this reduces to the labeled crops.
-        energy_terms = [(x_labeled, g_labeled, valid_labeled)]
+        # y is the target the contrastive form is trained against, and the
+        # same assignment the centroids were estimated from: ground truth on
+        # the labeled stream, confident pseudo-labels on the unlabeled one.
+        # The attract form ignores it and uses g instead.
+        energy_terms = [(x_labeled, g_labeled, y_labeled, valid_labeled)]
 
         if x_unlabeled is not None:
-            energy_terms.append((x_unlabeled, g_unlabeled, torch.ones_like(g_unlabeled[:, 0], dtype=torch.bool)))
+            # y_unlabeled is None unless cm_mode sourced pseudo-labels; fall
+            # back to the soft posterior so the contrastive form still has a
+            # target when the unlabeled stream is forwarded but not used for
+            # centroids.
+            ones = torch.ones_like(g_unlabeled[:, 0], dtype=torch.bool)
+            y_u = y_unlabeled if y_unlabeled is not None else g_unlabeled
+            energy_terms.append((x_unlabeled, g_unlabeled, y_u, ones))
 
         total = None
 
-        for x, g, valid in energy_terms:
-            term = self._energy(x, g, valid)
+        for x, g, y, valid in energy_terms:
+            term = self._energy(x, g, y, valid)
             total = term if total is None else total + term
 
         total = _clip_loss(total / float(len(energy_terms)))

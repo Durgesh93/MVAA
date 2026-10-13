@@ -173,6 +173,44 @@ litmodule:
   #   l+u  both. The actual semi-supervised claim.
   cm_mode: 'l'
 
+  # Functional form of the energy.
+  #
+  #   contrastive  -log softmax_k(-||x - mu_k||^2 / cm_tau)[y]
+  #                a soft-target cross-entropy over negative squared
+  #                distances: "would a nearest-centroid classifier get this
+  #                voxel right?". Attraction AND repulsion from one
+  #                expression -- the correct class's distance must be
+  #                smallest RELATIVE to the others. Bounded in [0, log C],
+  #                and log C = 1.0986 is exactly what total collapse gives,
+  #                so collapse is the WORST state rather than the best.
+  #
+  #   attract      sum_k g_k ||x - mu_k||^2, the original SuperCM energy.
+  #                Attraction only. Kept so sweeps yvw1emxi and 7yu5e5o5
+  #                remain reproducible, not because it works.
+  #
+  # Why the default changed. On synthetic scenes with centroid separation
+  # 120/90/60/20/5/1 deg the attract form reads
+  # 0.6719/0.6657/0.6655/0.6623/0.6613/0.6633 -- flat to three decimals,
+  # minimum at 5 deg. It cannot see between-class separation and marginally
+  # prefers collapse. Sweep 7yu5e5o5 collapsed accordingly: within-class
+  # angle 1.0-1.3 deg (from 24-27) but between-class centroid angle 12 deg
+  # (from 113), and Dice 0.002-0.021 WORSE than the cm_weight=0 control.
+  # The contrastive form on the same scenes reads
+  # 0.2475/0.3386/0.5740/0.9970/1.0870/1.0956 -- monotone, minimised at
+  # maximum separation.
+  #
+  # The centroids are unchanged: still the closed-form assignment-weighted
+  # mean of labeled voxels, still a buffer, still EMA-blended. Only the
+  # energy's functional form differs.
+  cm_form: contrastive
+
+  # Temperature on the distance logits. With cm_normalize the squared
+  # distances live in [0, 4], so tau=1 gives logits spanning 4 -- a
+  # reasonable default. Smaller sharpens the posterior. Better behaved than
+  # a beta balancing two separate terms, since it only sharpens one
+  # objective rather than trading two off.
+  cm_tau: 1.0
+
   # Clustering weight: OFF until cm_start_epoch, then CONSTANT at cm_weight.
   # A step, not a ramp.
   #

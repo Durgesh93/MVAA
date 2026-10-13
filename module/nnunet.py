@@ -360,6 +360,8 @@ class NNUnetSetup:
             embedding_dim=int(self.cfg.embedding_dim),
             num_classes=self.lm.num_segmentation_heads,
             cm_mode=str(self.cfg.cm_mode),
+            form=str(self.cfg.cm_form),
+            tau=float(self.cfg.cm_tau),
             weight=float(self.cfg.cm_weight),
             start_epoch=float(self.cfg.cm_start_epoch),
             ema_weight=float(self.cfg.cm_ema_weight),
