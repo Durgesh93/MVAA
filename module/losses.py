@@ -147,44 +147,26 @@ class CompoundLoss(nn.Module):
 
 class ClusteringCMLoss(nn.Module):
     """
-    Soft-k-means ("clustering module") regularizer on per-voxel embeddings.
+    SuperCM clustering regularizer on the per-voxel embeddings.
 
-    Penalises mean_voxels sum_k g_k * ||x - mu_k||^2, where x is the
-    embedding_dim-dimensional embedding a voxel carries (see
-    module/adapter.py), g is the network's own softmax over the class
-    logits at that voxel, and mu_k is a class centroid. Minimising it pulls
-    every voxel's embedding toward the centroid of whichever class the
-    network already believes it belongs to, which tightens the class
-    clusters without needing a label at that voxel -- the SuperCM idea.
+    Each class gets a centroid mu_k, re-estimated in closed form every step
+    as the assignment-weighted mean of the embeddings, EMA-blended, held in
+    a buffer -- never learned by gradient. The energy scores each voxel
+    against those centroids:
 
-    The centroids are NOT learned by gradient. They are re-estimated in
-    closed form every step as the assignment-weighted mean
-    mu_k = sum_p y_pk x_p / sum_p y_pk, then EMA-blended into the stored
-    value. mu is therefore a buffer, not a parameter, and carries no
-    gradient: the only thing this loss trains is the embedding itself.
+        attract      sum_k g_k ||x - mu_k||^2     g = softmax(Wx + b)
+        contrastive  -sum_k y_k log g_hat_k       g_hat = softmax(-d^2/tau)
 
-    cm_mode picks where the assignments y for that estimate come from:
-        "l"   : ground truth one-hot on the labeled crops. The honest
-                first experiment -- it asks whether tightening clusters
-                around TRUE class means helps at all, with no
-                pseudo-labelling anywhere in the loop.
-        "u"   : confident pseudo-labels on the unlabeled crops.
-        "l+u" : both, concatenated. The actual semi-supervised claim.
-    "l" needs no unlabeled forward pass at all, so it costs one extra
-    einsum per step and nothing else -- see needs_unlabeled.
+    cm_mode says where the assignments y come from: "l" ground truth on
+    labeled crops, "u" confident pseudo-labels on unlabeled ones, "l+u"
+    both. Only u/l+u need an unlabeled forward pass.
 
-    Cross-entropy is deliberately NOT part of this module. The supervised
-    term here is nnU-Net's own DeepSupervisionWrapper(CompoundLoss), which
-    the LightningModule already owns; folding a second CE in (as the 2D
-    supercm project's SuperCMLoss does) would just shadow it. The
-    LightningModule forms total = sup_loss + weight_at(step) * energy.
+    No cross-entropy here -- the LightningModule owns
+    DeepSupervisionWrapper(CompoundLoss) and forms
+    total = sup_loss + weight_at(step) * energy.
 
     Shapes: embeddings (B, D, *spatial), logits (B, C, *spatial), target
-    (B, 1, *spatial) integer class ids. Under deep supervision the caller
-    passes the highest-resolution stage only -- the coarser stages are
-    downsampled views of the same embedding space, and pooling them into
-    one set of centroids would weight a 7x6x8 map as heavily as the
-    full-resolution one.
+    (B, 1, *spatial). Caller passes the highest-resolution stage only.
     """
 
     def __init__(
@@ -233,17 +215,12 @@ class ClusteringCMLoss(nn.Module):
         self.ignore_label = ignore_label
         self.eps = float(eps)
 
-        # Buffers, not parameters: closed-form estimated, never optimised.
-        # Registered so they ride along in the checkpoint -- a resumed run
-        # that re-initialised mu from scratch would hand the embedding a
-        # step-change in its target on the first batch after the restore.
+        # Buffer, not a parameter: closed-form estimated, never optimised.
+        # Registered so it survives a checkpoint restore.
         self.register_buffer("mu", torch.zeros(self.num_classes, self.embedding_dim))
 
-        # Per-class, not a single flag. A class absent from the first batch
-        # (easy with two thin leaflets and a 1-2 case labeled pool) would
-        # otherwise have its centroid marked "initialised" at the zero
-        # vector and then EMA-crawl toward the truth for hundreds of steps,
-        # dragging every voxel of that class toward the origin meanwhile.
+        # Per-class: a class missing from the first batch must not be
+        # marked initialised at the zero vector and then EMA-crawl up.
         self.register_buffer("mu_initialized", torch.zeros(self.num_classes, dtype=torch.bool))
 
     # -------------------------------------------------------------------------
@@ -256,27 +233,12 @@ class ClusteringCMLoss(nn.Module):
 
     def weight_at(self, epoch: float) -> float:
         """
-        Off until start_epoch, then constant at self.weight. A step, not a ramp.
+        Off until start_epoch, then constant. A step, not a ramp, so any
+        difference against the cm_weight=0 arm is attributable to the term
+        rather than to the schedule.
 
-        epoch is FRACTIONAL epochs elapsed -- the caller divides Lightning's
-        global_step by the batches per epoch (see the LightningModule's
-        _cm_epoch) -- so the term switches on exactly at start_epoch rather
-        than at an epoch boundary one way or the other.
-
-        Replaces a linear ramp across the whole run. The ramp meant the
-        weight averaged half its nominal value and only reached it on the
-        final step, which makes "cm_weight = 1.0" hard to interpret and
-        confounds schedule with strength. A delayed constant separates them:
-        the term is either absent or at full strength, so a difference
-        against the cm_weight=0 arm is attributable to the term itself.
-
-        start_epoch exists because mu is meaningless before it has seen
-        data, and because the supervised loss needs a head start -- applying
-        a clustering constraint to an embedding that does not yet separate
-        the classes just fights the thing that would make it separate.
-        Centroids ARE still estimated during those first epochs (that
-        happens in forward, independent of this weight), so mu is already
-        warm when the term switches on.
+        epoch is fractional (global_step / batches per epoch). Centroids are
+        still estimated during the delay, so mu is warm when it switches on.
         """
 
         return self.weight if float(epoch) >= self.start_epoch else 0.0
@@ -291,11 +253,8 @@ class ClusteringCMLoss(nn.Module):
 
     def _valid_mask(self, labels: Tensor) -> Tensor:
         """
-        (B, P) bool of voxels that may contribute, from the ignore label.
-
-        nnU-Net's RemoveLabelTansform maps the -1 padding to 0 before the
-        loss sees it, so this is only about a genuine configured
-        ignore_label; without one, everything is valid.
+        (B, P) bool of voxels that may contribute. Only a configured
+        ignore_label excludes anything -- nnU-Net maps -1 padding to 0.
         """
 
         if self.ignore_label is None:
@@ -305,23 +264,17 @@ class ClusteringCMLoss(nn.Module):
 
     def _gt_assignments(self, target: Tensor):
         """
-        Ground-truth one-hot assignments from an integer label map.
+        Ground-truth one-hot from the integer label map -> (y, valid).
 
-        Returns (y, valid) with y (B, C, P) float and valid (B, P) bool.
-
-        NOTE this is where a verbatim port of the 2D supercm project breaks:
-        its _gt_onehot branches on the target's CHANNEL count, and an
-        nnU-Net target is (B, 1, *spatial), so it would take the binary
-        path and read the integer id 2 ("anterior_leaflet") as a
-        foreground probability of 2.0. The label map has to be expanded
-        against num_classes, not against its own channel dim.
+        Expand against num_classes, never the target's own channel dim: an
+        nnU-Net target is (B, 1, *spatial), so the latter would read class
+        id 2 as a probability of 2.0.
         """
 
         labels = target[:, 0].reshape(target.shape[0], -1).long()
         valid = self._valid_mask(labels)
 
-        # Ignored voxels are clamped into range purely so one_hot cannot
-        # fault on them; `valid` is what actually excludes them.
+        # Clamp only so one_hot cannot fault; `valid` does the excluding.
         safe = labels.clamp(0, self.num_classes - 1)
         y = nn.functional.one_hot(safe, num_classes=self.num_classes)
         y = y.permute(0, 2, 1).to(torch.float32)
@@ -330,10 +283,8 @@ class ClusteringCMLoss(nn.Module):
 
     def _probabilities(self, logits: Tensor) -> Tensor:
         """
-        (B, C, P) softmax over classes.
-
-        float32 regardless of autocast: these feed a centroid estimate that
-        is accumulated over ~10^6 voxels, where fp16 summation drifts.
+        (B, C, P) softmax over classes, float32 regardless of autocast --
+        it feeds a sum over ~10^6 voxels, where fp16 drifts.
         """
         return torch.softmax(self._flatten_spatial(logits).float(), dim=1)
 
@@ -343,34 +294,19 @@ class ClusteringCMLoss(nn.Module):
     @torch.no_grad()
     def _confident_assignments(self, probs: Tensor):
         """
-        Pseudo-label assignments restricted to confident voxels.
+        Pseudo-labels restricted to confident voxels -> (y, keep).
 
-        Selection is PER PREDICTED CLASS, not over the patch as a whole.
-        A global top-k would be dominated by background: the leaflets are a
-        couple of percent of a crop, so topk_frac of all voxels is tens of
-        thousands of background voxels and possibly no leaflet voxel at
-        all, leaving the foreground centroids estimated from nothing.
+        Top-k is PER PREDICTED CLASS, not over the patch: the leaflets are a
+        couple of percent of a crop, so a global top-k would be all
+        background and the foreground centroids would come from nothing.
 
-        use_soft_pseudo picks what the kept voxels contribute:
+        use_soft_pseudo=True uses raw probabilities instead of argmax
+        one-hot. Degenerate early on, where p ~ 1/C everywhere drives all
+        centroids onto the global mean -- do not pair it with a loosened
+        conf_thr.
 
-          False (default) -- argmax one-hot. A voxel counts toward exactly
-            the centroid of the class it was assigned.
-
-          True -- the raw probabilities. Every voxel contributes to EVERY
-            centroid, weighted by p_c. Smoother, but it has a degenerate
-            regime: early in training p ~ 1/C everywhere, so all C centroids
-            converge on the global mean of the features and collapse onto
-            each other. The energy then reduces to ||x - mu_bar||^2, which
-            pulls every embedding toward one point regardless of class --
-            actively destroying the structure this loss exists to sharpen.
-            The confidence filter is what keeps that in check, so if you
-            turn this on, do not also loosen conf_thr.
-
-        Either way the result is zeroed outside the confident set, so
-        excluded voxels contribute to neither the numerator nor the
-        denominator of the centroid estimate.
-
-        Returns (y, keep) with y (B, C, P) float and keep (B, P) bool.
+        Zeroed outside the kept set, so excluded voxels reach neither the
+        numerator nor the denominator of the centroid estimate.
         """
 
         confidence, predicted = probs.max(dim=1)
@@ -423,42 +359,23 @@ class ClusteringCMLoss(nn.Module):
     @torch.no_grad()
     def update_centroids(self, streams):
         """
-        Re-estimate mu from (embeddings_flat, assignments) pairs and EMA it in.
+        Re-estimate mu from (x, y) streams and EMA it in. Under no_grad, so
+        the einsum keeps nothing for backward.
 
-        streams: list of (x, y) with x (B, D, P) and y (B, C, P) already
-        zeroed at excluded voxels, so no separate mask is needed here.
-
-        Under no_grad, so the einsum keeps nothing for backward -- the cost
-        is pure compute (B*D*C*P multiply-accumulates, ~2 GFLOP at a
-        112x96x128 patch) with no activation footprint at all.
-
-        Under DDP the numerator and denominator are all-reduced before the
-        division, so every rank ends up with the SAME centroids. Estimating
-        them per rank would make the loss a different function on each rank
-        -- gradients would still sync, but they would be gradients of eight
-        different objectives.
+        Numerator and denominator are all-reduced BEFORE the division, so
+        every rank gets the same mu. Dividing per rank would make the loss a
+        different function on each one.
         """
 
         numerator = torch.zeros_like(self.mu)
         denominator = torch.zeros(self.num_classes, device=self.mu.device, dtype=self.mu.dtype)
 
         for x, y in streams:
-            # autocast explicitly OFF, and fp32 forced on the operands.
-            #
-            # `x.to(self.mu.dtype)` on its own is NOT enough and silently did
-            # nothing useful: torch.einsum is on autocast's fp16 list, so
-            # inside an autocast region autocast casts both operands straight
-            # back to fp16 and accumulates there, overriding the cast. This
-            # einsum reduces over EVERY voxel in the batch -- 1.38M at a
-            # 112x96x128 patch -- and fp16 tops out at 65504, so the running
-            # total saturates to inf almost immediately.
-            #
-            # That is exactly how mu became inf in the first sweep. The forward
-            # then clipped the energy to LOSS_CLIP_VALUE, but d(energy)/d(g)
-            # carried mu_squared = inf, so the backward produced 0 * inf = NaN
-            # in 102 of 110 parameter tensors -- at cm_weight=0 as well, since
-            # 0.0 * inf is also NaN. AMP's GradScaler then skipped every
-            # optimizer step and no run learned anything.
+            # Autocast OFF, fp32 forced. A plain .float() is NOT enough:
+            # torch.einsum is on autocast's fp16 list, so autocast casts both
+            # operands straight back and accumulates in fp16. This reduces
+            # over 1.38M voxels against an fp16 ceiling of 65504, which is
+            # how mu became inf and every gradient NaN.
             with torch.autocast(device_type=x.device.type, enabled=False):
                 x32 = x.float()
                 y32 = y.float()
@@ -476,13 +393,9 @@ class ClusteringCMLoss(nn.Module):
 
         estimate = numerator[present] / denominator[present].unsqueeze(1)
 
-        # Fail loudly rather than poison the run. A non-finite centroid makes
-        # the forward energy clip to LOSS_CLIP_VALUE -- which looks like a
-        # merely large number in the logs -- while the backward carries
-        # 0 * inf = NaN into every parameter, so AMP's GradScaler skips every
-        # optimizer step and the model silently never trains. That cost a
-        # 10-run sweep ~5 h each before anyone noticed the Dice was frozen at
-        # its initialisation value. An unrecoverable loss is worth a crash.
+        # Crash rather than poison the run: a non-finite mu clips the
+        # forward to a merely-large number while the backward carries NaN
+        # into every parameter, so training silently stops.
         if not torch.isfinite(estimate).all():
             raise RuntimeError(
                 "ClusteringCMLoss: non-finite centroid estimate. The reduction over voxels "
@@ -494,9 +407,8 @@ class ClusteringCMLoss(nn.Module):
         rows = present.nonzero(as_tuple=True)[0]
         fresh = ~self.mu_initialized[rows]
 
-        # First sight of a class: take the estimate outright. An EMA from
-        # the zero vector would need ~100 steps at ema_weight=0.95 to get
-        # anywhere near the true mean.
+        # First sight of a class: take the estimate outright -- an EMA from
+        # zero needs ~100 steps at 0.95 to approach the true mean.
         blended = torch.where(
             fresh.unsqueeze(1),
             estimate,
@@ -511,50 +423,34 @@ class ClusteringCMLoss(nn.Module):
     # -------------------------------------------------------------------------
     def _energy(self, x: Tensor, g: Tensor, y: Tensor, valid: Tensor) -> Tensor:
         """
-        Squared distances to every centroid, turned into a loss two ways.
+        Squared distance to every centroid, turned into a loss two ways.
 
-        form="contrastive" (default):
+        contrastive (default)   -log softmax_k(-||x - mu_k||^2 / tau)[y]
 
-            -log softmax_k(-||x - mu_k||^2 / tau)[y]
+            Soft-target cross-entropy over the negative distances: "would a
+            nearest-centroid classifier get this voxel right?". Attraction
+            and repulsion both fall out, since the true class's distance has
+            to be smallest RELATIVE to the others. Bounded in [0, log C],
+            and log C is exactly the collapse value -- parallel centroids
+            make every distance equal and the posterior uniform. Collapse is
+            the worst state available rather than the best.
 
-        a soft-target cross-entropy over the negative squared distances, i.e.
-        "would a nearest-centroid classifier get this voxel right?". Both
-        attraction and repulsion come out of the one expression: the correct
-        class's distance has to be smallest RELATIVE to the others, so the
-        voxel must approach its own centroid AND recede from the rest.
-
-        Bounded below by 0 and above by log(C) = 1.0986 for C=3, and that
-        upper bound is exactly what total collapse produces: parallel
-        centroids make every distance equal, the posterior uniform, and the
-        loss maximal. Collapse is the worst state available rather than the
-        best, which is the property the attract form lacks.
-
-        form="attract" (the old behaviour, kept so the earlier sweeps stay
-        reproducible):
+        attract (old behaviour, kept so earlier sweeps reproduce)
 
             sum_k g_k ||x - mu_k||^2
 
-        Attraction only. Measured on synthetic scenes at centroid
-        separations of 120/90/60/20/5/1 degrees it reads
-        0.6719/0.6657/0.6655/0.6623/0.6613/0.6633 -- flat to three decimals,
-        with its MINIMUM at 5 degrees. It cannot see between-class
-        separation, and marginally prefers collapse. Sweep 7yu5e5o5 duly
-        collapsed: within-class angle 1.0-1.3 deg (from 24-27), but
-        between-class centroid angle 12 deg (from 113), and Dice 0.002-0.021
-        WORSE than the cm_weight=0 control.
+            Attraction only, blind to between-class separation: measured at
+            centroid separations of 120/90/60/20/5/1 deg it is flat to three
+            decimals with its MINIMUM at 5 deg. Sweep 7yu5e5o5 duly
+            collapsed 113 -> 12 deg, Dice 0.002-0.021 worse than control.
 
-        Shared machinery either way. Every voxel contributes -- no
-        subsampling -- so at a 112x96x128 patch and batch 2 that is 2.75M
-        voxels per step. The distance matrix is (B, C, P) with C=3, about
-        33 MB, and x.pow(2) is transiently (B, D, P) but freed by the sum;
-        backward needs x itself, which exists anyway as the adapter's
-        output. The 2D supercm project instead did permute(...).reshape(-1,
-        D), materialising a (B*P, D) copy that IS held for backward.
+        Every voxel contributes -- 2.75M per step at batch 2. The distance
+        matrix is (B, C, P), ~33 MB; x.pow(2) is transiently (B, D, P) but
+        freed by the sum.
 
-        autocast is explicitly OFF and everything is fp32: a loss term gains
-        nothing from fp16 next to the network, and leaning on autocast's
-        per-op dtype policy is what silently broke the centroid einsum
-        before. _clip_loss also cannot clamp a Half tensor to +/-1e6 at all.
+        autocast OFF and fp32 throughout: leaning on autocast's per-op policy
+        is what broke the centroid einsum, and _clip_loss cannot clamp a Half
+        tensor to +/-1e6 at all.
         """
 
         with torch.autocast(device_type=x.device.type, enabled=False):
@@ -592,15 +488,12 @@ class ClusteringCMLoss(nn.Module):
     # -------------------------------------------------------------------------
     def forward(self, embeddings: Tensor, logits: Tensor, target: Tensor, u_embeddings=None, u_logits=None):
         """
-        Returns (energy, stats).
+        Returns (energy, stats). energy is UNWEIGHTED -- the caller scales
+        it by weight_at(step).
 
-        energy is UNWEIGHTED -- the caller scales it by weight_at(step).
-        stats holds detached scalars for logging.
-
-        The centroid update happens here, before the energy, so the energy
-        is measured against centroids that have seen this batch. That
-        ordering matches the 2D supercm project and matters most on the
-        very first steps, where an un-updated mu is still the zero vector.
+        Centroids are updated here BEFORE the energy, so it is measured
+        against mu that has seen this batch. Matters most at step 0, where
+        an un-updated mu is still the zero vector.
         """
 
         if self.needs_unlabeled and (u_embeddings is None or u_logits is None):
@@ -629,22 +522,14 @@ class ClusteringCMLoss(nn.Module):
 
         self.update_centroids(streams)
 
-        # The energy is applied to every stream that was forwarded, not
-        # just the ones feeding the centroids: an unlabeled crop's voxels
-        # are exactly the ones with no supervision, so pulling them toward
-        # a cluster is the whole point. With cm_mode="l" there is no
-        # unlabeled forward at all and this reduces to the labeled crops.
-        # y is the target the contrastive form is trained against, and the
-        # same assignment the centroids were estimated from: ground truth on
-        # the labeled stream, confident pseudo-labels on the unlabeled one.
-        # The attract form ignores it and uses g instead.
+        # Energy covers every stream that was forwarded, not only those
+        # feeding the centroids. y is the contrastive target and the same
+        # assignment mu came from; the attract form ignores it, using g.
         energy_terms = [(x_labeled, g_labeled, y_labeled, valid_labeled)]
 
         if x_unlabeled is not None:
-            # y_unlabeled is None unless cm_mode sourced pseudo-labels; fall
-            # back to the soft posterior so the contrastive form still has a
-            # target when the unlabeled stream is forwarded but not used for
-            # centroids.
+            # No pseudo-labels sourced -> fall back to the soft posterior
+            # so the contrastive form still has a target.
             ones = torch.ones_like(g_unlabeled[:, 0], dtype=torch.bool)
             y_u = y_unlabeled if y_unlabeled is not None else g_unlabeled
             energy_terms.append((x_unlabeled, g_unlabeled, y_u, ones))
