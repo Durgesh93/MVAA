@@ -291,6 +291,51 @@ litmodule:
   # scale to the Euclidean runs.
   cm_normalize: true
 
+  # ---------------------------------------------------------------------------
+  # Per-epoch t-SNE of the embedding (module/embedding_tsne.py).
+  #
+  # Ported from the fewshot_tee_inspect branch, which ran it with the
+  # clustering term REMOVED. That control is already measured: with Dice+CE
+  # alone the centroids sit 81-146 deg apart, within-class spread is 18-35
+  # deg, and a nearest-centroid rule matches the learned linear head to
+  # within 1 percent. Supervision alone already produces everything the
+  # clustering energy is designed to produce.
+  #
+  # So the question here is not whether the term builds structure, but
+  # whether it damages structure that already existed. The panels show the
+  # live centroids (mu) as stars embedded alongside the voxels, and
+  # train_cm_centroid_angle logs the mean pairwise centroid angle every
+  # epoch -- the number that would have caught sweep 7yu5e5o5's collapse
+  # (113 -> 12 deg) while it was still running instead of afterwards.
+  # ---------------------------------------------------------------------------
+
+  # 3 columns, labeled cases first: 1 + 8 lands as a 3x3 grid. The held-out
+  # panels are coloured by ground truth the network never trained on --
+  # MVSeg2023 ships fully labeled, so a case is "unlabeled" only because the
+  # datamodule routes it away from the supervised loss.
+  #
+  # NOTE the held-out pool is RANK-LOCAL. At num_labeled=90 only 15 cases
+  # are unlabeled, so rank 0 holds ~2 and you get a 1x3 strip, not a 3x3.
+  # num_labeled<=30 keeps all eight panels populated.
+  tsne_num_labeled_cases: 1
+  tsne_num_unlabeled_cases: 8
+
+  tsne_every_n_epochs: 1
+  tsne_max_per_class: 500
+  tsne_perplexity: 30.0
+
+  # Do NOT drop below ~300: sklearn's first 250 iterations are early
+  # exaggeration, so max_iter=250 returns a degenerate straight line that
+  # reads as a collapsed embedding but is pure artefact. 500/1000/2000 give
+  # identical structure at 3.1/6.9/14.2 s per panel.
+  tsne_max_iter: 500
+
+  # cosine, matching cm_normalize: the energy measures L2-normalised
+  # distance, where d^2 = 2 - 2cos, so the angle is the quantity that
+  # matters.
+  tsne_metric: cosine
+  tsne_seed: 0
+
   foreground_weight: 10.0
   tracked_labels: ["posterior_leaflet", "anterior_leaflet"]
   postprocess_keep_largest_component: true

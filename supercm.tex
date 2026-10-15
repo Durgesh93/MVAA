@@ -1,0 +1,728 @@
+% ---------------------------------------------------------------------------
+% supercm.tex -- The 3D SuperCM clustering loss: math + implementation
+%
+% Compile with:   pdflatex supercm.tex   (twice, for the frame numbers)
+% Only standard packages: beamer, amsmath, amssymb, listings, xcolor, booktabs.
+% ---------------------------------------------------------------------------
+\documentclass[10pt,aspectratio=169]{beamer}
+
+\usetheme{Madrid}
+\usecolortheme{seahorse}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+\setbeamerfont{frametitle}{size=\large}
+
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\definecolor{codebg}{RGB}{245,245,245}
+\definecolor{codekw}{RGB}{0,90,160}
+\definecolor{codestr}{RGB}{160,60,0}
+\definecolor{codecom}{RGB}{110,110,110}
+\definecolor{hl}{RGB}{170,0,0}
+
+\lstdefinestyle{py}{
+  language=Python,
+  basicstyle=\ttfamily\scriptsize,
+  keywordstyle=\color{codekw}\bfseries,
+  stringstyle=\color{codestr},
+  commentstyle=\color{codecom}\itshape,
+  backgroundcolor=\color{codebg},
+  columns=flexible,
+  keepspaces=true,
+  showstringspaces=false,
+  breaklines=true,
+  frame=single,
+  framesep=3pt,
+  rulecolor=\color{gray},
+  aboveskip=2pt,
+  belowskip=2pt,
+  numbers=none,
+  escapeinside={(*@}{@*)},
+}
+\lstset{style=py}
+
+\newcommand{\xv}{\mathbf{x}}
+\newcommand{\muv}{\boldsymbol{\mu}}
+\newcommand{\zv}{\mathbf{z}}
+\newcommand{\Rb}{\mathbb{R}}
+\newcommand{\degs}{^{\circ}}
+
+\title[SuperCM 3D]{The SuperCM Clustering Loss in 3D}
+\subtitle{From per-voxel embeddings to the contrastive CM energy\\
+\small Math and implementation, side by side}
+\author{MVSeg2023 / TEE few-shot segmentation}
+\date{\today}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+% ===========================================================================
+\begin{frame}{Notation and shapes}
+\small
+Everything below is for one training step of the actual configuration.
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+Symbol & Meaning & Shape & Value here \\
+\midrule
+$B$                & batch (crops per rank)        & --                  & $2$ \\
+$(H,W,D)$          & patch size                    & --                  & $112\times96\times128$ \\
+$P$                & voxels per crop               & --                  & $1{,}376{,}256$ \\
+$C$                & classes                       & --                  & $3$ \\
+$d$                & embedding dim                 & --                  & $128$ \\
+$\xv_p$            & voxel embedding               & $\Rb^{d}$           & \texttt{embedding\_dim} \\
+$\zv_p$            & voxel logits                  & $\Rb^{C}$           & \\
+$g_{pk}$           & softmax assignment            & $(B,C,P)$           & from $W$ \\
+$y_{pk}$           & ground-truth one-hot          & $(B,C,P)$           & \texttt{cm\_mode='l'} \\
+$\muv_k$           & class centroid                & $(C,d)=(3,128)$     & buffer, EMA \\
+$\hat g_{pk}$      & distance-based posterior      & $(B,C,P)$           & \emph{the reconstruction} \\
+$v_p$              & valid mask                    & $(B,P)$             & all ones (no ignore label) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.4em}
+Per optimizer step the loss therefore touches $B\cdot P = 2{,}752{,}512$ voxels, each a point in $\Rb^{128}$.
+\end{frame}
+
+% ===========================================================================
+\section{1. The embedding}
+
+\begin{frame}[fragile]{1. Where the 128-dimensional per-voxel feature comes from}
+\begin{columns}[t]
+\begin{column}{0.52\textwidth}
+\footnotesize
+The encoder--decoder emits \emph{stage features} at five scales. At stage $s$, voxel $p$ carries
+\[
+  \mathbf{f}^{(s)}_p \in \Rb^{C_s},\qquad C_s \in \{320,256,128,64,32\}.
+\]
+Each stage's \texttt{seg\_layer} is a $1{\times}1{\times}1$ convolution, i.e.\ a \emph{per-voxel linear map}:
+\[
+  \boxed{\;\xv^{(s)}_p = W^{(s)}_{\mathrm{seg}}\,\mathbf{f}^{(s)}_p + \mathbf{b}^{(s)}_{\mathrm{seg}}\;}
+\]
+with $W^{(s)}_{\mathrm{seg}} \in \Rb^{128 \times C_s}$.
+
+\vspace{0.4em}
+Stock nnU-Net sets the output width to $C=3$. We pass \texttt{embedding\_dim}$=128$ in its place --- that single
+substituted argument is the whole architectural change.
+
+\vspace{0.4em}
+The CM loss uses \textbf{stage $0$ only} (full resolution), so from here on
+$\xv_p \equiv \xv^{(0)}_p \in \Rb^{128}$.
+\end{column}
+
+\begin{column}{0.46\textwidth}
+\begin{lstlisting}
+# module/nnunet.py -- build_network
+backbone = nnUNetTrainer.build_network_architecture(
+    self.pm, self.cm,
+    self.num_input_channels,
+    embedding_dim,          # 128, not num_classes
+    self.enable_deep_supervision,
+)
+network = EmbeddingAdapter(
+    backbone,
+    embedding_dim=embedding_dim,   # 128
+    num_classes=self.num_classes,  # 3
+    conv_op=conv_op,
+)
+\end{lstlisting}
+\begin{lstlisting}
+# module/adapter.py
+def forward(self, x):
+    embeddings = self.backbone(x)   # list, 5 stages
+    logits = self._classify(embeddings)
+    if self.return_embeddings:
+        return embeddings, logits
+    return logits
+\end{lstlisting}
+\footnotesize
+Stage 0 embedding: \texttt{(2, 128, 112, 96, 128)}.
+\end{column}
+\end{columns}
+\end{frame}
+
+% ===========================================================================
+\section{2. Assignments}
+
+\begin{frame}[fragile]{2. Logits and the softmax assignment $g$}
+\begin{columns}[t]
+\begin{column}{0.52\textwidth}
+\footnotesize
+One \textbf{shared} classifier $W \in \Rb^{3\times128}$, $\mathbf{b}\in\Rb^{3}$, applied at every stage:
+\[
+  \zv_p = W\xv_p + \mathbf{b} \in \Rb^{3},
+\]
+\[
+  \boxed{\;g_{pk} = \frac{\exp(z_{pk})}{\sum_{j=1}^{3}\exp(z_{pj})}\;}
+\]
+
+\vspace{0.3em}
+Ground-truth one-hot targets from the integer label map $\ell_p$:
+\[
+  y_{pk} = \mathbf{1}[\ell_p = k]\,v_p,
+  \qquad
+  v_p = \mathbf{1}[\ell_p \neq \text{ignore}].
+\]
+
+\vspace{0.5em}
+\textcolor{hl}{Key observation.} $g$ depends on the embedding \emph{only through} $W$. The clustering
+geometry and the decision function are therefore two separate objects --- this is the seed of every
+failure mode on slide~\ref{frame:collapse}.
+\end{column}
+
+\begin{column}{0.46\textwidth}
+\begin{lstlisting}
+@staticmethod
+def _flatten_spatial(tensor):
+    """(B, C, *spatial) -> (B, C, P)."""
+    return tensor.flatten(2)
+
+def _probabilities(self, logits):
+    # float32 regardless of autocast: these feed
+    # a reduction over ~1e6 voxels, where fp16
+    # summation drifts.
+    return torch.softmax(
+        self._flatten_spatial(logits).float(),
+        dim=1,
+    )
+
+def _gt_assignments(self, target):
+    labels = target[:, 0].reshape(
+        target.shape[0], -1).long()
+    valid = self._valid_mask(labels)
+    safe = labels.clamp(0, self.num_classes - 1)
+    y = nn.functional.one_hot(
+        safe, num_classes=self.num_classes)
+    y = y.permute(0, 2, 1).to(torch.float32)
+    return y * valid.unsqueeze(1), valid
+\end{lstlisting}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ===========================================================================
+\section{3. Centroids}
+
+\begin{frame}[fragile]{3. Centroid estimation --- the first einsum}
+\begin{columns}[t]
+\begin{column}{0.50\textwidth}
+\footnotesize
+The assignment-weighted mean, summed over all DDP ranks $r$ \emph{before} dividing:
+\[
+  N_k = \sum_{r}\sum_{p} y^{(r)}_{pk}\,\xv^{(r)}_p \in \Rb^{128},
+  \qquad
+  D_k = \sum_{r}\sum_{p} y^{(r)}_{pk}
+\]
+\[
+  \boxed{\;\hat\muv_k = \frac{N_k}{\max(D_k,\;\varepsilon)}\;}
+\]
+
+The numerator is exactly the contraction
+\[
+  N_{kd} \;=\; \sum_{b}\sum_{p} x_{bdp}\, y_{bkp}
+  \;\;\equiv\;\;
+  \texttt{"bdp,bcp->cd"} .
+\]
+
+\vspace{0.4em}
+Cost: $B\,d\,C\,P \approx 2$ GFLOP, and under \texttt{no\_grad} it keeps \emph{no} activations ---
+the entire centroid estimate is one einsum with zero memory footprint.
+\end{column}
+
+\begin{column}{0.48\textwidth}
+\begin{lstlisting}
+@torch.no_grad()
+def update_centroids(self, streams):
+    numerator = torch.zeros_like(self.mu)
+    denominator = torch.zeros(
+        self.num_classes,
+        device=self.mu.device,
+        dtype=self.mu.dtype)
+
+    for x, y in streams:
+        # autocast OFF, fp32 forced. torch.einsum is
+        # on autocast's fp16 list, so an explicit
+        # .float() alone is SILENTLY OVERRIDDEN.
+        with torch.autocast(
+                device_type=x.device.type,
+                enabled=False):
+            x32 = x.float()
+            y32 = y.float()
+            numerator += torch.einsum(
+                (*@\textcolor{hl}{\texttt{"bdp,bcp->cd"}}@*), x32, y32)
+            denominator += y32.sum(dim=(0, 2))
+
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(numerator)
+        torch.distributed.all_reduce(denominator)
+\end{lstlisting}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ===========================================================================
+\begin{frame}[fragile]{3b. Why fp32 and why all-reduce before the division}
+\begin{columns}[t]
+\begin{column}{0.50\textwidth}
+\footnotesize
+\textbf{fp16 overflow.} The reduction runs over $2{,}752{,}512$ voxels; fp16 saturates at $65504$, so the
+running total hits $\infty$ almost immediately. Then
+\[
+  \muv_k = \infty
+  \;\Longrightarrow\;
+  \frac{\partial E}{\partial g} \ni \lVert\muv_k\rVert^2 = \infty
+  \;\Longrightarrow\;
+  0 \cdot \infty = \mathrm{NaN}
+\]
+in the backward pass --- in 102 of 110 parameter tensors, \emph{even at} $\lambda=0$, because
+$0.0\cdot\infty$ is also NaN. AMP's \texttt{GradScaler} then skips every optimizer step and nothing trains.
+
+\vspace{0.5em}
+\textbf{All-reduce placement.} Reducing $N_k$ and $D_k$ separately and dividing afterwards gives every rank the
+\emph{same} $\muv$. Dividing per rank first would make the loss a different function on each rank: gradients
+would still synchronise, but they would be gradients of eight different objectives.
+
+\vspace{0.5em}
+\textbf{EMA}, with $\alpha = 0.95$:
+\[
+  \muv_k \leftarrow
+  \begin{cases}
+    \hat\muv_k, & \text{first batch containing class } k,\\[2pt]
+    \alpha\muv_k + (1-\alpha)\hat\muv_k, & \text{thereafter.}
+  \end{cases}
+\]
+A cold EMA from $\mathbf{0}$ would need ${\sim}100$ steps to approach the true mean.
+\end{column}
+
+\begin{column}{0.48\textwidth}
+\begin{lstlisting}
+present = denominator > self.eps
+if not bool(present.any()):
+    return
+
+estimate = (numerator[present]
+            / denominator[present].unsqueeze(1))
+
+# Fail loudly rather than poison the run: a
+# non-finite centroid clips the forward energy to
+# LOSS_CLIP_VALUE (looks merely large in the logs)
+# while the backward carries 0 * inf = NaN into
+# every parameter.
+if not torch.isfinite(estimate).all():
+    raise RuntimeError(
+        "ClusteringCMLoss: non-finite centroid "
+        "estimate. ...")
+
+rows = present.nonzero(as_tuple=True)[0]
+fresh = ~self.mu_initialized[rows]
+blended = torch.where(
+    fresh.unsqueeze(1),
+    estimate,
+    self.ema_weight * self.mu[rows]
+    + (1.0 - self.ema_weight) * estimate,
+)
+\end{lstlisting}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ===========================================================================
+\section{4. Distances and $\hat g$}
+
+\begin{frame}[fragile]{4. Distances and the reconstructed posterior $\hat g$ --- the second einsum}
+\begin{columns}[t]
+\begin{column}{0.50\textwidth}
+\footnotesize
+With \texttt{cm\_normalize=true}, project both onto the unit sphere:
+\[
+  \tilde\xv_p = \frac{\xv_p}{\lVert\xv_p\rVert_2},
+  \qquad
+  \tilde\muv_k = \frac{\muv_k}{\lVert\muv_k\rVert_2}.
+\]
+Then
+\[
+  d^2_{pk}
+  = \lVert\tilde\xv_p - \tilde\muv_k\rVert_2^2
+  = \underbrace{\lVert\tilde\xv_p\rVert^2}_{=1}
+    - 2\,\tilde\xv_p^{\!\top}\tilde\muv_k
+    + \underbrace{\lVert\tilde\muv_k\rVert^2}_{=1}
+\]
+\[
+  \boxed{\;d^2_{pk} = 2 - 2\cos\angle(\xv_p,\muv_k)\;}
+\]
+The code evaluates the \emph{expanded} middle form, never the explicit difference: the largest retained
+tensor is then $(B,C,P)$ rather than $(B,d,P)$ --- a $128/3 \approx 43\times$ saving. The cross term is
+\[
+  \texttt{"bdp,cd->bcp"} :\quad
+  \sum_{d} x_{bdp}\,\mu_{cd}.
+\]
+
+\vspace{0.3em}
+The \textbf{reconstructed posterior} --- nearest-centroid assignment, built from geometry alone:
+\[
+  \boxed{\;\hat g_{pk} = \frac{\exp(-d^2_{pk}/\tau)}{\sum_{j}\exp(-d^2_{pj}/\tau)}\;}
+\]
+\end{column}
+
+\begin{column}{0.48\textwidth}
+\begin{lstlisting}
+def _energy(self, x, g, y, valid):
+    with torch.autocast(
+            device_type=x.device.type,
+            enabled=False):
+        x = x.float()
+        g = g.float()
+        y = y.float()
+        mu = self.mu.float()
+
+        if self.normalize:
+            x = nn.functional.normalize(x, dim=1)
+            mu = nn.functional.normalize(mu, dim=1)
+
+        x_squared = x.pow(2).sum(dim=1).unsqueeze(1)
+        x_dot_mu = torch.einsum(
+            (*@\textcolor{hl}{\texttt{"bdp,cd->bcp"}}@*), x, mu)
+        mu_squared = mu.pow(2).sum(dim=1).view(1,-1,1)
+
+        # (B, C, P) squared distance, every voxel
+        # to every centroid
+        dist_sq = (x_squared
+                   - 2.0 * x_dot_mu
+                   + mu_squared).clamp_min(0.0)
+\end{lstlisting}
+\footnotesize
+$\tau$ is \texttt{cm\_tau}$=1.0$. Note $\hat g$ never sees $W$, and $g$ never sees $\muv$.
+\end{column}
+\end{columns}
+\end{frame}
+
+% ===========================================================================
+\section{5. The energy}
+
+\begin{frame}[fragile]{5. The CM energy: two forms}
+\begin{columns}[t]
+\begin{column}{0.50\textwidth}
+\footnotesize
+\textbf{Contrastive} (\texttt{cm\_form=contrastive}, current) --- cross-entropy between the target and the
+\emph{distance} posterior:
+\[
+  \boxed{\;
+  E_{\mathrm{con}}
+  = \frac{\sum_p v_p\Bigl(-\sum_k y_{pk}\log\hat g_{pk}\Bigr)}{\sum_p v_p}
+  \;}
+\]
+bounded: $0 \le E_{\mathrm{con}} \le \log 3 \approx 1.0986$.
+
+\vspace{0.8em}
+\textbf{Attract} (\texttt{cm\_form=attract}, the original SuperCM soft $k$-means energy) --- $g$-weighted
+squared distance:
+\[
+  \boxed{\;
+  E_{\mathrm{att}}
+  = \frac{\sum_p v_p \sum_k g_{pk}\,d^2_{pk}}{\sum_p v_p}
+  \;}
+\]
+unbounded above; divided by $d$ when \texttt{normalize} is off, purely to keep the scale comparable.
+
+\vspace{0.6em}
+Both are means over \emph{valid} voxels, which is why the denominator is $\sum_p v_p$ and not $BP$.
+\end{column}
+
+\begin{column}{0.48\textwidth}
+\begin{lstlisting}
+        if self.form == "contrastive":
+            log_posterior = nn.functional.log_softmax(
+                -dist_sq / self.tau, dim=1)
+            per_voxel = -(y * log_posterior).sum(dim=1)
+        else:
+            per_voxel = (g * dist_sq).sum(dim=1)
+            if not self.normalize:
+                per_voxel = (per_voxel
+                             / float(self.embedding_dim))
+
+        weights = valid.to(per_voxel.dtype)
+        return ((per_voxel * weights).sum()
+                / weights.sum().clamp_min(1.0))
+\end{lstlisting}
+
+\vspace{0.3em}
+\begin{lstlisting}
+# forward(): labeled term always, unlabeled when present
+energy_terms = [(x_l, g_l, y_l, valid_l)]
+if x_u is not None:
+    ones = torch.ones_like(g_u[:, 0], dtype=torch.bool)
+    y_u = y_u if y_u is not None else g_u
+    energy_terms.append((x_u, g_u, y_u, ones))
+
+for x, g, y, valid in energy_terms:
+    term = self._energy(x, g, y, valid)
+    total = term if total is None else total + term
+total = _clip_loss(total / float(len(energy_terms)))
+\end{lstlisting}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ===========================================================================
+\begin{frame}{6. The full training objective}
+\small
+\[
+  \mathcal{L}
+  = \underbrace{\sum_{s=0}^{4} w_s\,
+      \mathcal{L}_{\mathrm{Dice{+}CE}}\!\bigl(\zv^{(s)},\,\ell^{(s)}\bigr)}
+    _{\text{supervised, all five deep-supervision stages}}
+  \;+\;
+  \underbrace{\lambda(t)\,E}_{\text{CM, stage 0 only}}
+\]
+
+\vspace{0.6em}
+Deep-supervision weights, $w_s \propto 2^{-s}$ and normalised to sum to one:
+\[
+  w \propto \bigl[1,\tfrac12,\tfrac14,\tfrac18,10^{-6}\bigr]
+  \;\Longrightarrow\;
+  w = [0.533,\;0.267,\;0.133,\;0.067,\;{\approx}5\!\times\!10^{-7}].
+\]
+The last stage carries $10^{-6}$ rather than $0$ under DDP: a weight of exactly zero leaves the deepest
+\texttt{seg\_layer} without a gradient, and DDP aborts on an unused parameter.
+
+\vspace{0.8em}
+The CM weight is a \emph{delayed constant}, not a ramp:
+\[
+  \lambda(t) =
+  \begin{cases}
+    0, & t < 5,\\
+    \lambda_0 = 1.0, & t \ge 5,
+  \end{cases}
+  \qquad
+  t = \frac{\texttt{global\_step}}{\texttt{num\_training\_batches}} .
+\]
+The five-epoch delay exists because $\muv$ is meaningless until the embedding has structure --- it is a
+warm-up for the \emph{centroids}, not a curriculum for the loss.
+\end{frame}
+
+% ===========================================================================
+\section{6. Why the form matters}
+
+\begin{frame}{7. Take the gradient --- this is the whole story}
+\label{frame:collapse}
+\small
+Let $u_{pk} = -d^2_{pk}/\tau$, so $\hat g_p = \mathrm{softmax}(u_p)$. For a softmax cross-entropy,
+\[
+  \frac{\partial E_{\mathrm{con}}}{\partial u_{pk}} = \hat g_{pk} - y_{pk},
+  \qquad
+  \frac{\partial u_{pk}}{\partial \tilde\xv_p} = -\frac{2}{\tau}\bigl(\tilde\xv_p - \tilde\muv_k\bigr).
+\]
+Chaining, the \textbf{descent} direction is
+\[
+  \boxed{\;
+  -\frac{\partial E_{\mathrm{con}}}{\partial \tilde\xv_p}
+  = -\frac{2}{\tau}\sum_k \bigl(y_{pk} - \hat g_{pk}\bigr)\bigl(\tilde\xv_p - \tilde\muv_k\bigr)
+  \;}
+\]
+
+\vspace{0.4em}
+Read the two cases off the sign of the residual $(y_{pk}-\hat g_{pk})$:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+$k$ & residual & effect on $\tilde\xv_p$ \\
+\midrule
+true class $k^\star$ & $1 - \hat g_{pk^\star} > 0$ & moves \textbf{toward} $\tilde\muv_{k^\star}$ --- attraction \\
+any $k \neq k^\star$ & $-\hat g_{pk} < 0$          & moves \textbf{away from} $\tilde\muv_{k}$ --- repulsion \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.4em}
+Repulsion appears \emph{automatically}, weighted by exactly how much probability mass the wrong centroid
+currently claims. No extra term, no extra hyper-parameter.
+\end{frame}
+
+% ===========================================================================
+\begin{frame}{8. The same calculation for the attract form}
+\small
+\[
+  E_{\mathrm{att}} = \sum_k g_{pk}\, d^2_{pk}
+  \qquad\Longrightarrow\qquad
+  -\frac{\partial E_{\mathrm{att}}}{\partial \tilde\xv_p}
+  = -2\sum_k g_{pk}\bigl(\tilde\xv_p - \tilde\muv_k\bigr)
+\]
+
+\vspace{0.3em}
+Every coefficient $g_{pk} \ge 0$. \textcolor{hl}{\textbf{Every term is attraction.}} There is no $k$ for which
+this pushes the embedding away from a centroid.
+
+\vspace{0.6em}
+Measured energy as the three centroids are rotated together (synthetic, unit-norm, $\tau=1$):
+
+\begin{center}
+\begin{tabular}{lcccccc}
+\toprule
+pairwise centroid angle & $120\degs$ & $90\degs$ & $60\degs$ & $20\degs$ & $5\degs$ & $1\degs$ \\
+\midrule
+$E_{\mathrm{att}}$  & 0.6719 & 0.6697 & 0.6650 & 0.6618 & 0.6625 & 0.6629 \\
+$E_{\mathrm{con}}$  & \textbf{0.2475} & 0.3432 & 0.5794 & 0.9992 & 1.0890 & \textbf{1.0955} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.5em}
+$E_{\mathrm{att}}$ is \emph{flat} --- and in fact slightly \emph{minimised} near $20\degs$. Collapse is a
+descent direction. $E_{\mathrm{con}}$ is monotone in the separation, so collapse is an ascent direction.
+
+\vspace{0.5em}
+\textbf{What was actually observed} in sweep \texttt{7yu5e5o5} with the attract form: mean pairwise centroid
+angle fell $113\degs \to 12\degs$, within-class spread $25\degs \to 1\degs$, Dice $0.002$--$0.021$ \emph{worse}
+than the supervised baseline.
+\end{frame}
+
+% ===========================================================================
+\begin{frame}{9. Why labels do not prevent centroid collapse}
+\small
+The objection is natural: \emph{$\muv$ is computed from ground-truth labels, so how can it collapse?}
+
+\vspace{0.6em}
+Look again at the estimator:
+\[
+  \muv_k = \frac{\sum_p y_{pk}\,\xv_p}{\sum_p y_{pk}}.
+\]
+$\muv_k$ is a \textbf{function of} $\xv$. The labels $y$ decide \emph{which} embeddings get averaged
+together; they say nothing about \emph{where} those averages sit in $\Rb^{128}$. Gradient descent is free to
+move all three groups to the same place --- the partition stays correct and the energy goes down.
+
+\vspace{0.8em}
+Two failure modes followed from exactly this, both now fixed:
+
+\begin{enumerate}
+\item \textbf{Scale degeneracy.} $\xv \mapsto \xv/s$, $W \mapsto sW$ leaves every logit \emph{identical}.
+      $E_{\mathrm{att}}$ falls as $1/s^2$. Observed: embedding norm shrank $1.9\times$ while $\lVert W\rVert$
+      grew $1.37\times$. \;Fix: \texttt{cm\_normalize=true}, which quotients out the scale.
+\item \textbf{Angular collapse.} Once scale is fixed, the remaining gauge freedom is rotation; the attract
+      energy is flat in the separation. \;Fix: \texttt{cm\_form=contrastive}, which makes separation strictly
+      preferred.
+\end{enumerate}
+
+\vspace{0.6em}
+The 2D SuperCM project was immune to both because its head was
+\texttt{pred = torch.mean(pre\_heatmaps, dim=1)} --- \emph{parameterless}. Introducing a learnable $W$ is what
+opened the gauge.
+\end{frame}
+
+% ===========================================================================
+\begin{frame}[fragile]{10. One step, end to end}
+\begin{columns}[t]
+\begin{column}{0.46\textwidth}
+\footnotesize
+\begin{enumerate}\itemsep0.25em
+\item Forward once with embeddings on $\rightarrow$ 5 stage embeddings $+$ 5 stage logit maps.
+\item Supervised loss over \emph{all} stages, via \texttt{DeepSupervisionWrapper}.
+\item Stage-0 embedding and logits only $\rightarrow$ CM loss.
+\item Inside CM: $g$ from logits, $y$ from labels, $\muv$ re-estimated and EMA'd (\texttt{no\_grad}),
+      $d^2$ and $\hat g$ built, energy reduced.
+\item $\mathcal{L} = \mathcal{L}_{\mathrm{sup}} + \lambda(t)\,E$.
+\end{enumerate}
+
+\vspace{0.5em}
+The centroid update sits \emph{inside} the loss forward, under \texttt{no\_grad}, so $\muv$ is a constant with
+respect to the backward pass --- the gradient flows only through $\xv_p$ in $d^2_{pk}$, exactly as the
+derivation on slide~\ref{frame:collapse} assumes.
+\end{column}
+
+\begin{column}{0.52\textwidth}
+\begin{lstlisting}
+# module/lightning_module.py -- training_step
+embeddings, logits = self.forward_embeddings(batch["data"])
+
+supervised_loss = self.loss(logits, target)       # all 5 stages
+
+cm_energy, cm_stats = self.cm_loss(
+    self._highest_resolution(embeddings),         # stage 0
+    self._highest_resolution(logits),             # stage 0
+    self._highest_resolution(target),
+)
+
+cm_weight = self.cm_loss.weight_at(self._cm_epoch())
+total_loss = supervised_loss + cm_weight * cm_energy
+\end{lstlisting}
+
+\begin{lstlisting}
+def weight_at(self, epoch: float) -> float:
+    return (self.weight
+            if float(epoch) >= self.start_epoch
+            else 0.0)
+
+def _cm_epoch(self):
+    n = self.trainer.num_training_batches
+    if n and math.isfinite(n):
+        return self.global_step / float(n)
+    return float(self.current_epoch)
+\end{lstlisting}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ===========================================================================
+\begin{frame}{11. Configuration map}
+\small
+\begin{center}
+\begin{tabular}{llp{6.2cm}}
+\toprule
+Config key & Value & Role in the math \\
+\midrule
+\texttt{embedding\_dim}   & 128              & $d$; width of the \texttt{seg\_layer} output \\
+\texttt{cm\_mode}         & \texttt{'l'}     & $y_{pk}$ from ground-truth labels \\
+\texttt{cm\_form}         & \texttt{contrastive} & $E_{\mathrm{con}}$ instead of $E_{\mathrm{att}}$ \\
+\texttt{cm\_tau}          & 1.0              & $\tau$ in $\hat g = \mathrm{softmax}(-d^2/\tau)$ \\
+\texttt{cm\_weight}       & 1.0              & $\lambda_0$ \\
+\texttt{cm\_start\_epoch} & 5                & the step in $\lambda(t)$ \\
+\texttt{cm\_normalize}    & \texttt{true}    & $\tilde\xv, \tilde\muv$ on the unit sphere \\
+\texttt{cm\_ema\_weight}  & 0.95             & $\alpha$ in the centroid EMA \\
+\texttt{patch\_size\_override} & [112, 96, 128] & fixes $P = 1{,}376{,}256$ \\
+\texttt{precision}        & \texttt{16-mixed} & why every CM block disables autocast explicitly \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.6em}
+\footnotesize
+Three keys exist purely for the unlabeled branch and are inert while it is off:
+\texttt{cm\_conf\_thr}$=0.90$, \texttt{cm\_topk\_frac}$=0.15$, \texttt{cm\_min\_keep}$=64$,
+\texttt{cm\_use\_soft\_pseudo}$=$\texttt{false}.
+\end{frame}
+
+% ===========================================================================
+\begin{frame}{12. Check yourself}
+\small
+At \texttt{cm\_mode='l'}, the energy trains $\hat g$ --- the \emph{distance} posterior --- toward the
+ground-truth $y$. But the network's actual prediction is
+\[
+  g = \mathrm{softmax}(W\xv + \mathbf{b}),
+\]
+and the CM loss never touches $W$ or $\mathbf{b}$.
+
+\vspace{1.2em}
+\begin{center}
+\textbf{Through what path, then, does minimising $E$ change the segmentation at all?}
+\end{center}
+
+\vspace{1.2em}
+There is a path. Naming it tells you precisely what this regulariser can be expected to do --- and what it
+cannot.
+
+\vspace{1.5em}
+\footnotesize
+\textcolor{gray}{Follow-up worth deriving: what does $\tau \to 0$ do to the gradient on slide
+\ref{frame:collapse}, and why is $\tau = 1$ with unit-norm vectors ($d^2 \in [0,4]$) a reasonable default?}
+\end{frame}
+
+\end{document}

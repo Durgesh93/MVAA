@@ -41,3 +41,7 @@ task3/data/
 scripts/transform_check/
 
 dirs/
+
+# Core dumps. One (36 MB) was committed by accident in 6d13484.
+core
+core.*

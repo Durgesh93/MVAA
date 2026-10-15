@@ -76,13 +76,24 @@ NUM_LABELED=""
 for arg in "$@"; do
   case "$arg" in
     datamodule.num_labeled=*) NUM_LABELED="${arg#*=}" ;;
+    litmodule.cm_weight=*)    CM_WEIGHT="${arg#*=}" ;;
+    litmodule.cm_mode=*)      CM_MODE="${arg#*=}" ;;
   esac
 done
 
+# The swept clustering settings go into the folder name, not just
+# num_labeled. A sweep over cm_weight/cm_mode at a FIXED num_labeled would
+# otherwise produce four folders differing only by W&B run id, which makes
+# the results directory unreadable without cross-referencing the web UI.
+# Slashes and plus signs are not path-safe, so l+u becomes lu.
+SUFFIX=""
+[ -n "${CM_WEIGHT:-}" ] && SUFFIX="${SUFFIX}_w${CM_WEIGHT}"
+[ -n "${CM_MODE:-}" ]   && SUFFIX="${SUFFIX}_$(printf '%s' "$CM_MODE" | tr -d '+/')"
+
 if [ -n "$NUM_LABELED" ]; then
-  EXP_NAME="$(printf 'fewshot_n%03d_%s' "$NUM_LABELED" "$RUN_TAG")"
+  EXP_NAME="$(printf 'fewshot_n%03d%s_%s' "$NUM_LABELED" "$SUFFIX" "$RUN_TAG")"
 else
-  EXP_NAME="fewshot_${RUN_TAG}"
+  EXP_NAME="fewshot${SUFFIX}_${RUN_TAG}"
 fi
 
 echo "============================================================"

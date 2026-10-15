@@ -7,6 +7,7 @@ import torch
 import lightning as L
 
 from .adapter import embeddings_enabled
+from .embedding_tsne import EmbeddingTSNE, centroid_angle
 from .metrics import MetricsTracker
 from .ddp import DDPHelper
 from .nnunet import NNUnetSetup
@@ -61,6 +62,19 @@ class SSLnnUNetLightningModule(L.LightningModule):
         # happens. Created later, the buffers would not exist yet and the
         # saved centroids would be silently dropped on resume.
         self.cm_loss = self.nnunet.build_cm_loss()
+
+        # Diagnostics only -- no parameters, no buffers, nothing to restore.
+        self.embedding_tsne = EmbeddingTSNE(
+            output_folder=self.output_folder,
+            num_labeled_cases=int(self.cfg.tsne_num_labeled_cases),
+            num_unlabeled_cases=int(self.cfg.tsne_num_unlabeled_cases),
+            every_n_epochs=int(self.cfg.tsne_every_n_epochs),
+            max_per_class=int(self.cfg.tsne_max_per_class),
+            perplexity=float(self.cfg.tsne_perplexity),
+            max_iter=int(self.cfg.tsne_max_iter),
+            metric=str(self.cfg.tsne_metric),
+            seed=int(self.cfg.tsne_seed),
+        )
 
         self.loss = None
 
@@ -221,6 +235,46 @@ class SSLnnUNetLightningModule(L.LightningModule):
         )
 
         return total_loss
+
+    def on_train_epoch_end(self):
+        """
+        Log the centroid geometry, and plot the embedding it came from.
+
+        Two different costs, so two different cadences. The ANGLE is one
+        3x128 matmul and is logged every epoch on every rank -- mu is
+        identical across ranks because update_centroids all-reduces before
+        dividing, so no gather is needed. It is the number that would have
+        caught sweep 7yu5e5o5 while it was running: the attract form drove it
+        from 113 to 12 degrees with Dice quietly degrading, and because
+        nothing logged it, the collapse was only found by reading mu out of
+        checkpoints after the fact.
+
+        The FIGURE costs ~20 s, so it is rank 0 and on tsne_every_n_epochs.
+        Never fatal: a diagnostic that can kill a 200-epoch run is worse than
+        no diagnostic.
+        """
+
+        self.log(
+            "train_cm_centroid_angle",
+            centroid_angle(self.cm_loss.mu),
+            on_step=False, on_epoch=True, prog_bar=False, logger=True,
+            sync_dist=False, batch_size=1,
+        )
+
+        if not self.trainer.is_global_zero:
+            return
+
+        if not self.embedding_tsne.due(self.current_epoch):
+            return
+
+        try:
+            path = self.embedding_tsne.plot(self, epoch=self.current_epoch)
+        except Exception as error:  # noqa: BLE001 -- see docstring
+            print(f"[embedding_tsne] skipped at epoch {self.current_epoch}: {error!r}", flush=True)
+            return
+
+        if path is not None:
+            print(f"[embedding_tsne] wrote {path}", flush=True)
 
     def _eval_step(self, batch, batch_idx, subfolder, use_tta, write_case_zip):
         """
