@@ -269,6 +269,31 @@ class SSLnnUNetDataModule(TransformBuilderMixin, L.LightningDataModule):
 
         num_cached = max(8, min(16, workers_per_augmenter * 2))
 
+        # Explicit overrides, because the CPU-derived value says nothing about
+        # HOST MEMORY, and host memory is what actually killed a run.
+        #
+        # Array task 22864726_3 was SIGKILLed by the OOM killer mid-epoch 0
+        # (step 399/500) at a sampled MaxRSS of 202 GB on a 480 G node. The
+        # augmentation QUEUES are not the problem -- at batch=2, a 112x96x128
+        # crop plus its five deep-supervision targets is ~15 MB, so even a
+        # full queue on every augmenter is ~18 GB across the node. The cost is
+        # PROCESS COUNT: world_size * 2 augmenters * workers_per_augmenter is
+        # 80 worker processes at 8 ranks and 5 workers, each a full Python
+        # interpreter with torch resident, and that multiplies out to most of
+        # the 202 GB.
+        #
+        # 112 visible CPUs therefore yields 5 workers per augmenter, which is
+        # right for throughput and wrong for memory. These let a run trade the
+        # former for the latter without editing code.
+        override_workers = getattr(self.cfg, "aug_workers_per_augmenter", None)
+        override_cached = getattr(self.cfg, "num_cached", None)
+
+        if override_workers is not None:
+            workers_per_augmenter = max(1, int(override_workers))
+
+        if override_cached is not None:
+            num_cached = max(1, int(override_cached))
+
         return workers_per_augmenter, num_cached
 
     def _make_augmenter(self, loader):

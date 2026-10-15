@@ -88,6 +88,23 @@ datamodule:
   # the labeled/unlabeled pool sizes so that "epoch" means the same amount
   # of training at every num_labeled -- see the datamodule's setup().
   # Total updates for a run are limit_train_batches * trainer.max_epochs.
+  # Augmentation workers per augmenter per rank, and the queue depth, as
+  # explicit overrides. null = derive from visible CPUs (the old behaviour).
+  #
+  # Why these exist: the derived value optimises for CPU throughput and is
+  # blind to host memory. Each rank builds TWO augmenters (labeled and
+  # unlabeled -- both are built regardless of cm_mode, only whether the
+  # unlabeled batch is READ depends on it), so the node runs
+  # world_size * 2 * workers processes, each a full Python interpreter with
+  # torch resident. At 8 ranks and the CPU-derived 5 workers that is 80
+  # processes, and array task 22864726_3 was OOM-killed mid-epoch 0 at a
+  # sampled 202 GB on a 480 G node.
+  #
+  # 3 workers takes that to 48 processes. Lower it further if a run is still
+  # killed; raise it if epochs become input-bound.
+  aug_workers_per_augmenter: 3
+  num_cached: 6
+
   limit_train_batches: 500
   oversample_fg: 0.65
   patch_size_override: ${patch_size_override}
