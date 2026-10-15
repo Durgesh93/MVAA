@@ -78,6 +78,7 @@ for arg in "$@"; do
     datamodule.num_labeled=*) NUM_LABELED="${arg#*=}" ;;
     litmodule.cm_weight=*)    CM_WEIGHT="${arg#*=}" ;;
     litmodule.cm_mode=*)      CM_MODE="${arg#*=}" ;;
+    litmodule.cm_form=*)      CM_FORM="${arg#*=}" ;;
   esac
 done
 
@@ -89,6 +90,7 @@ done
 SUFFIX=""
 [ -n "${CM_WEIGHT:-}" ] && SUFFIX="${SUFFIX}_w${CM_WEIGHT}"
 [ -n "${CM_MODE:-}" ]   && SUFFIX="${SUFFIX}_$(printf '%s' "$CM_MODE" | tr -d '+/')"
+[ -n "${CM_FORM:-}" ]   && SUFFIX="${SUFFIX}_${CM_FORM}"
 
 if [ -n "$NUM_LABELED" ]; then
   EXP_NAME="$(printf 'fewshot_n%03d%s_%s' "$NUM_LABELED" "$SUFFIX" "$RUN_TAG")"

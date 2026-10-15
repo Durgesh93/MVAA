@@ -1,0 +1,69 @@
+# Every clustering strategy at num_labeled=10, on the fewshot_tee branch.
+#
+# 2 weights x 2 modes x 2 forms = 8 runs. What each axis isolates:
+#
+#   cm_weight 0 vs 0.5   is the term doing anything at all
+#   cm_mode   l vs l+u   does touching the 95 unlabeled cases matter
+#   cm_form   attract vs contrastive
+#
+# The form axis is not a minor variant. At cm_form=attract the energy is
+# sum_k g_k ||x-mu_k||^2, which never reads y -- so at attract+l+u the
+# confidence filtering shapes only the centroids and NO pseudo-label ever
+# becomes a training target. Self-training exists solely in the contrastive
+# arms. attract+l is the configuration that collapsed in sweep 7yu5e5o5
+# (centroid angle 113 -> 12 deg, Dice 0.002-0.021 below control); it is here
+# to reproduce that with the t-SNE and train_cm_centroid_angle now watching.
+#
+# The four cm_weight=0 runs are gradient-identical -- the energy is computed
+# and multiplied by zero -- so they are not waste: they are a four-run noise
+# floor, which is the number needed to say whether any gap between the active
+# arms is real. Every CM effect measured so far has been 0.002-0.021 Dice,
+# and a single n=10 run already spread 0.014 between its best and final
+# checkpoint. Without that floor the other four arms are uninterpretable.
+#
+# They do differ in cost: at l+u the unlabeled forward still runs, so those
+# two control for compute and memory as well as for the gradient.
+#
+# Deliberately NOT included:
+#   cm_mode=u    centroids from pseudo-labels alone, so early training builds
+#                mu from noise while the labeled energy pulls ground-truth
+#                voxels toward it. Add it only after l+u shows something.
+#   cm_form=pseudo  not implemented yet -- it is the ablation that separates
+#                self-training from the centroid mechanism.
+#
+# Watch train_cm_centroid_angle (collapse) and train_cm_confident_frac, which
+# stops being NaN only in the l+u arms.
+#
+#   wandb sweep scripts/sweep_strategies_n010.yaml
+#   ws conf standard 8
+#   ws sweep wandb echo_vi/mvaa/<sweep_id>
+program: scripts/sweep_run.sh
+method: grid
+
+metric:
+  name: dice
+  goal: maximize
+
+parameters:
+  # Fixed: 95 unlabeled cases for l+u to work with, and enough held-out
+  # cases on rank 0 to fill all eight t-SNE panels.
+  datamodule.num_labeled:
+    value: 10
+
+  litmodule.cm_weight:
+    values: [0, 0.5]
+
+  litmodule.cm_mode:
+    values: ["l", "l+u"]
+
+  litmodule.cm_form:
+    values: ["contrastive", "attract"]
+
+  devices:
+    value: 8
+  training_strategy:
+    value: ddp
+
+command:
+  - ${program}
+  - ${args_no_hyphens}
