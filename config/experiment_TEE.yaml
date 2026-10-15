@@ -315,6 +315,18 @@ litmodule:
   # scale to the Euclidean runs.
   cm_normalize: true
 
+  # One-shot trace of ClusteringCMLoss.forward: every intermediate, its
+  # shape and its range, printed on rank 0, then the process exits.
+  #
+  # This is for READING the module, not for instrumenting a run -- it exits
+  # via os._exit at the first forward, so a training job with it on dies at
+  # step 0 by design. Use devices=1 so the trace is not racing anything:
+  #
+  #   py engine.py train experiment_name=cm_debug devices=1 \
+  #     training_strategy=auto litmodule.cm_debug=true \
+  #     litmodule.cm_start_epoch=0 wandb=null
+  cm_debug: false
+
   # ---------------------------------------------------------------------------
   # Per-epoch t-SNE of the embedding (module/embedding_tsne.py).
   #

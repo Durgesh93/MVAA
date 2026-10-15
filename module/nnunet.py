@@ -371,6 +371,7 @@ class NNUnetSetup:
             use_soft_pseudo=bool(getattr(self.cfg, "cm_use_soft_pseudo", False)),
             normalize=bool(getattr(self.cfg, "cm_normalize", False)),
             ignore_label=self.lm.ignore_label,
+            debug=bool(getattr(self.cfg, "cm_debug", False)),
         )
 
 
