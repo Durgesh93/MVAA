@@ -26,6 +26,16 @@ def build_config(
     if overrides is None:
         overrides = []
 
+    # Drop blank entries before Hydra sees them.
+    #
+    # A multi-line command whose backslash-continuations arrive as
+    # "backslash space" rather than a newline -- which is what pasting one
+    # into a terminal often produces -- hands an empty string through argv.
+    # Hydra's lexer has no rule that matches it and raises
+    # LexerNoViableAltException with the caret pointing at nothing, which
+    # reads like a config error and is not one.
+    overrides = [o for o in overrides if str(o).strip()]
+
     with initialize_config_dir(version_base=None, config_dir=str(CONFIG_DIR)):
         cfg = compose(config_name=config_name, overrides=overrides)
 
