@@ -32,9 +32,6 @@ wrapped here, because CompoundLoss is already inside nnU-Net's
 DeepSupervisionWrapper by the time training_step sees it.
 """
 
-import os
-import sys
-
 import torch
 from torch import nn, Tensor
 
@@ -132,49 +129,20 @@ class CompoundLoss(nn.Module):
 
         dc_loss = self.dc(net_output, target_dice, loss_mask=mask)
         ce_loss = _foreground_weighted_ce(net_output, target, loss_mask=mask, foreground_weight=self.foreground_weight)
+
         return dc_loss + ce_loss
 
     def forward(self, net_output: Tensor, target: Tensor) -> Tensor:
         """
         target must be b, c, x, y(, z) with c=1
         """
+
         return _clip_loss(self._dice_ce(net_output, target))
 
 
 # =============================================================================
 # SuperCM-style clustering regularizer
 # =============================================================================
-
-
-def _dbg(step: str, tensor=None, note: str = "") -> None:
-    """
-    One line per intermediate: what it is, its shape, and its range.
-
-    Rank 0 only. Under DDP every rank runs the identical forward, so eight
-    copies of the same trace would just be harder to read.
-    """
-
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        if torch.distributed.get_rank() != 0:
-            return
-
-    if tensor is None:
-        print(f"[cm] {step}", flush=True)
-        return
-
-    shape = "x".join(str(d) for d in tensor.shape) if tensor.ndim else "scalar"
-    line = f"[cm] {step:<34} {shape:<22} {str(tensor.dtype).replace('torch.',''):<8}"
-
-    if tensor.is_floating_point() and tensor.numel():
-        values = tensor.detach().float()
-        line += f" min {values.min():+.4f}  max {values.max():+.4f}  mean {values.mean():+.4f}"
-    elif tensor.numel():
-        line += f" min {int(tensor.min())}  max {int(tensor.max())}"
-
-    if note:
-        line += f"   {note}"
-
-    print(line, flush=True)
 
 
 class ClusteringCMLoss(nn.Module):
@@ -236,7 +204,6 @@ class ClusteringCMLoss(nn.Module):
         normalize: bool = False,
         ignore_label=None,
         eps: float = 1e-6,
-        debug: bool = False,
     ):
         super().__init__()
 
@@ -265,12 +232,6 @@ class ClusteringCMLoss(nn.Module):
         self.normalize = bool(normalize)
         self.ignore_label = ignore_label
         self.eps = float(eps)
-
-        # One-shot trace of the forward, then stop the process. For reading
-        # the module, not for instrumenting a real run -- the prints are per
-        # step and the dump ends in os._exit, so a training run with this on
-        # dies at the first optimizer step by design.
-        self.debug = bool(debug)
 
         # Buffers, not parameters: closed-form estimated, never optimised.
         # Registered so they ride along in the checkpoint -- a resumed run
@@ -602,59 +563,29 @@ class ClusteringCMLoss(nn.Module):
             y = y.float()
             mu = self.mu.float()
 
-            if self.debug:
-                _dbg("  _energy in: x (B,D,P)", x)
-                _dbg("  _energy in: g (B,C,P)", g)
-                _dbg("  _energy in: y (B,C,P)", y)
-                _dbg("  _energy in: mu (C,D)", mu)
-
             if self.normalize:
                 x = nn.functional.normalize(x, dim=1)
                 mu = nn.functional.normalize(mu, dim=1)
-
-                if self.debug:
-                    _dbg("  normalized x", x, "unit sphere: d^2 = 2-2cos")
-                    _dbg("  normalized mu", mu)
 
             x_squared = x.pow(2).sum(dim=1).unsqueeze(1)
             x_dot_mu = torch.einsum("bdp,cd->bcp", x, mu)
             mu_squared = mu.pow(2).sum(dim=1).view(1, -1, 1)
 
-            if self.debug:
-                _dbg("  x_squared", x_squared, "||x||^2, broadcast over C")
-                _dbg("  x_dot_mu", x_dot_mu, 'einsum "bdp,cd->bcp"  <- D contracted away')
-                _dbg("  mu_squared", mu_squared, "||mu||^2, broadcast over B and P")
-
             # (B, C, P): squared distance from every voxel to every centroid
             dist_sq = (x_squared - 2.0 * x_dot_mu + mu_squared).clamp_min(0.0)
-
-            if self.debug:
-                _dbg("  dist_sq (B,C,P)", dist_sq, "every voxel to every centroid")
 
             if self.form == "contrastive":
                 log_posterior = nn.functional.log_softmax(-dist_sq / self.tau, dim=1)
                 per_voxel = -(y * log_posterior).sum(dim=1)
-
-                if self.debug:
-                    _dbg("  log g_hat", log_posterior, f"log softmax(-d^2/tau), tau={self.tau}")
-                    _dbg("  per_voxel = -sum y*log g_hat", per_voxel)
             else:
                 per_voxel = (g * dist_sq).sum(dim=1)
 
                 if not self.normalize:
                     per_voxel = per_voxel / float(self.embedding_dim)
 
-            if self.debug and self.form != "contrastive":
-                _dbg("  per_voxel = sum g*d^2", per_voxel)
-
             weights = valid.to(per_voxel.dtype)
-            energy = (per_voxel * weights).sum() / weights.sum().clamp_min(1.0)
 
-            if self.debug:
-                _dbg("  valid weights", weights, f"{int(weights.sum())} voxels counted")
-                _dbg("  -> energy (scalar)", energy)
-
-            return energy
+            return (per_voxel * weights).sum() / weights.sum().clamp_min(1.0)
 
     # -------------------------------------------------------------------------
     # Forward
@@ -675,24 +606,9 @@ class ClusteringCMLoss(nn.Module):
         if self.needs_unlabeled and (u_embeddings is None or u_logits is None):
             raise ValueError(f"cm_mode={self.cm_mode!r} needs the unlabeled stream, but none was passed.")
 
-        if self.debug:
-            _dbg("=" * 72)
-            _dbg(f"ClusteringCMLoss.forward  cm_mode={self.cm_mode}  form={self.form}  "
-                 f"normalize={self.normalize}  tau={self.tau}")
-            _dbg("=" * 72)
-            _dbg("INPUT embeddings[0]", embeddings, "(B, D, *patch) from the adapter")
-            _dbg("INPUT logits[0]", logits, "(B, C, *patch) from the shared classifier")
-            _dbg("INPUT target", target, "(B, 1, *patch) integer label map")
-
         x_labeled = self._flatten_spatial(embeddings)
         g_labeled = self._probabilities(logits)
         y_labeled, valid_labeled = self._gt_assignments(target)
-
-        if self.debug:
-            _dbg("x  labeled = flatten(emb)", x_labeled, "spatial dims collapsed to P")
-            _dbg("g  labeled = softmax(logits)", g_labeled, "the model's own opinion")
-            _dbg("y  labeled = onehot(target)", y_labeled, "ground truth")
-            _dbg("valid labeled", valid_labeled)
 
         streams = []
         stats = {}
@@ -711,21 +627,7 @@ class ClusteringCMLoss(nn.Module):
                 streams.append((x_unlabeled, y_unlabeled))
                 stats["cm_confident_frac"] = keep.to(torch.float32).mean().detach()
 
-        if self.debug:
-            _dbg(f"centroid streams: {len(streams)} "
-                 f"({'labeled ' if self.cm_mode in ('l', 'l+u') else ''}"
-                 f"{'unlabeled' if self.cm_mode in ('u', 'l+u') else ''})")
-            _dbg("mu BEFORE update", self.mu, f"initialized={self.mu_initialized.tolist()}")
-
         self.update_centroids(streams)
-
-        if self.debug:
-            _dbg("mu AFTER update", self.mu, f"initialized={self.mu_initialized.tolist()}")
-            unit = nn.functional.normalize(self.mu.float(), dim=1)
-            cos = (unit @ unit.T).clamp(-1, 1)
-            pair = torch.triu_indices(self.num_classes, self.num_classes, offset=1)
-            angles = torch.rad2deg(torch.acos(cos[pair[0], pair[1]]))
-            _dbg(f"pairwise centroid angles: {[round(float(a), 1) for a in angles]} deg")
 
         # The energy is applied to every stream that was forwarded, not
         # just the ones feeding the centroids: an unlabeled crop's voxels
@@ -756,18 +658,5 @@ class ClusteringCMLoss(nn.Module):
         total = _clip_loss(total / float(len(energy_terms)))
 
         stats["cm_loss"] = total.detach()
-
-        if self.debug:
-            _dbg(f"energy terms averaged: {len(energy_terms)}")
-            _dbg("TOTAL cm energy", total)
-            _dbg("=" * 72)
-            _dbg("cm_debug=true -> stopping after one forward. Set it false to train.")
-            sys.stdout.flush()
-            sys.stderr.flush()
-            # os._exit, not sys.exit: under DDP a SystemExit in one rank
-            # leaves the others blocked in a collective and the job hangs
-            # until the wall clock. This is a debug dump, so take the whole
-            # process group down immediately and deterministically.
-            os._exit(0)
 
         return total, stats
