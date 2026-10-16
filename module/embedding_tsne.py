@@ -63,6 +63,19 @@ from .adapter import embeddings_enabled  # noqa: E402
 # epoch 199. Index = class id, matching dataset_json["labels"].
 CLASS_COLOURS = ["#b0b0b0", "#0072b2", "#d55e00", "#009e73", "#cc79a7"]
 
+# Fixed, not configurable -- both were measured rather than chosen.
+#
+# PERPLEXITY is sklearn's default and the usual choice for point clouds of
+# this size; it is clamped down in _fit_tsne when a panel has too few voxels.
+#
+# MAX_ITER 500 against real embeddings is visually identical to 1000 and
+# 2000 (3.1 / 6.9 / 14.2 s per panel). Do NOT lower it toward 250: sklearn
+# spends its first 250 iterations in early exaggeration, so a fit stopping
+# there never runs a normal-phase step and returns a degenerate straight
+# line that reads as a collapsed embedding but is pure artefact.
+PERPLEXITY = 30.0
+MAX_ITER = 500
+
 
 def _foreground_patch(data, seg, patch_size):
     """
@@ -146,7 +159,7 @@ def _stratified_sample(embeddings, labels, num_classes, max_per_class, rng):
     return np.concatenate(keep_embeddings), np.concatenate(keep_labels)
 
 
-def _fit_tsne(points, perplexity, metric, seed, max_iter):
+def _fit_tsne(points, metric, seed):
     """
     2-D t-SNE of one point cloud, or None when there is too little to fit.
 
@@ -160,13 +173,8 @@ def _fit_tsne(points, perplexity, metric, seed, max_iter):
     at n=1500) -- so letting t-SNE grab cores would cost the data pipeline
     real throughput to buy nothing.
 
-    max_iter is floored at 300. sklearn spends its first 250 iterations in
-    EARLY EXAGGERATION, so a fit that stops at exactly 250 never runs a
-    single normal-phase step and returns a degenerate straight line -- it
-    looks like a catastrophically collapsed embedding and is purely an
-    artefact. Verified against real embeddings: 250 is a line, while 500,
-    1000 and 2000 are visually identical (3.1 / 6.9 / 14.2 s per panel),
-    which is why the default is 500.
+    Perplexity and iteration count are module constants -- see their
+    definitions for the measurements behind them.
     """
 
     if points is None or len(points) < 10:
@@ -174,12 +182,12 @@ def _fit_tsne(points, perplexity, metric, seed, max_iter):
 
     tsne = TSNE(
         n_components=2,
-        perplexity=float(min(perplexity, max(5.0, (len(points) - 1) / 3.0))),
+        perplexity=float(min(PERPLEXITY, max(5.0, (len(points) - 1) / 3.0))),
         metric=metric,
         init="pca",
         learning_rate="auto",
         random_state=int(seed),
-        max_iter=max(300, int(max_iter)),
+        max_iter=MAX_ITER,
         n_jobs=1,
     )
 
@@ -292,8 +300,6 @@ class EmbeddingTSNE:
         num_unlabeled_cases=8,
         every_n_epochs=1,
         max_per_class=500,
-        perplexity=30.0,
-        max_iter=500,
         metric="cosine",
         seed=0,
     ):
@@ -302,8 +308,6 @@ class EmbeddingTSNE:
         self.num_unlabeled_cases = int(num_unlabeled_cases)
         self.every_n_epochs = int(every_n_epochs)
         self.max_per_class = int(max_per_class)
-        self.perplexity = float(perplexity)
-        self.max_iter = int(max_iter)
         self.metric = str(metric)
         self.seed = int(seed)
 
@@ -478,7 +482,7 @@ class EmbeddingTSNE:
             # projecting them afterwards, would put them on an unrelated map --
             # t-SNE has no out-of-sample transform.
             stacked = points if centroids is None else np.vstack([points, centroids])
-            coords = _fit_tsne(stacked, self.perplexity, self.metric, self.seed, self.max_iter)
+            coords = _fit_tsne(stacked, self.metric, self.seed)
 
             if coords is None:
                 flat_axes[index].text(

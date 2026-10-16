@@ -70,8 +70,6 @@ class SSLnnUNetLightningModule(L.LightningModule):
             num_unlabeled_cases=int(self.cfg.tsne_num_unlabeled_cases),
             every_n_epochs=int(self.cfg.tsne_every_n_epochs),
             max_per_class=int(self.cfg.tsne_max_per_class),
-            perplexity=float(self.cfg.tsne_perplexity),
-            max_iter=int(self.cfg.tsne_max_iter),
             metric=str(self.cfg.tsne_metric),
             seed=int(self.cfg.tsne_seed),
         )

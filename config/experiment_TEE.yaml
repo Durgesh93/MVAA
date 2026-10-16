@@ -224,7 +224,7 @@ litmodule:
   # energy's functional form differs.
   cm_form: contrastive
 
-  # Temperature on the distance logits. With cm_normalize the squared
+  # Temperature on the distance logits. The embeddings are normalised, so
   # distances live in [0, 4], so tau=1 gives logits spanning 4 -- a
   # reasonable default. Smaller sharpens the posterior. Better behaved than
   # a beta balancing two separate terms, since it only sharpens one
@@ -313,17 +313,6 @@ litmodule:
   # so 4000/class = 12k/panel is ~5.5 min for all nine panels. ALL voxels is
   # not an option: 1,376,256 per panel extrapolates to ~19 h for the figure.
   tsne_max_per_class: 4000
-  tsne_perplexity: 30.0
-
-  # Do NOT drop below ~300: sklearn's first 250 iterations are early
-  # exaggeration, so max_iter=250 returns a degenerate straight line that
-  # reads as a collapsed embedding but is pure artefact. 500/1000/2000 give
-  # identical structure at 3.1/6.9/14.2 s per panel.
-  tsne_max_iter: 500
-
-  # cosine, matching cm_normalize: the energy measures L2-normalised
-  # distance, where d^2 = 2 - 2cos, so the angle is the quantity that
-  # matters.
   tsne_metric: cosine
   tsne_seed: 0
 
