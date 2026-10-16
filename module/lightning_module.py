@@ -296,13 +296,11 @@ class SSLnnUNetLightningModule(L.LightningModule):
         no diagnostic.
         """
 
-        # Centred is the real one. The origin-referenced angle is kept
-        # because it is what the in-flight sweep logged, and the offset is the
-        # gauge coordinate itself -- an arm whose offset climbs while its
-        # centred angle holds is cheating, not clustering.
+        # The angle is centred; the offset is the gauge coordinate it used to
+        # be confounded with. An arm whose offset climbs while its centred
+        # angle holds is cheating, not clustering.
         for key, value in (
             ("train_cm_centroid_angle", centroid_angle(self.cm_loss.mu)),
-            ("train_cm_centroid_angle_origin", centroid_angle(self.cm_loss.mu, center=False)),
             ("train_cm_embed_offset", embedding_offset(self.cm_loss.mu)),
         ):
             self.log(

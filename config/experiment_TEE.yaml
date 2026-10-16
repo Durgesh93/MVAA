@@ -182,13 +182,16 @@ litmodule:
   # ---------------------------------------------------------------------------
 
   # Where the centroid assignments come from:
-  #   l    ground-truth one-hot on the labeled crops. No pseudo-labelling
-  #        anywhere, and no unlabeled forward pass at all -- the cheapest
-  #        and most honest first question: does tightening clusters around
-  #        TRUE class means help?
-  #   u    confident pseudo-labels on the unlabeled crops.
-  #   l+u  both. The actual semi-supervised claim.
-  cm_mode: 'l'
+  #   l    ground-truth only. No pseudo-labelling and no unlabeled forward
+  #        pass. Kept as the control arm -- it is a re-encoding of labels
+  #        Dice+CE already consumes, so it cannot add information.
+  #   l+u  plus confident pseudo-labels on the unlabeled crops. The only
+  #        mode with a mechanism, hence the default.
+  #
+  #   'u' was removed: centroids from pseudo-labels alone meant early
+  #   training built mu out of noise while the labeled energy pulled
+  #   ground-truth voxels toward it.
+  cm_mode: 'l+u'
 
   # Functional form of the energy.
   #
@@ -269,65 +272,6 @@ litmodule:
   cm_conf_thr: 0.90
   cm_topk_frac: 0.15
   cm_min_keep: 64
-
-  # What a kept unlabeled voxel contributes to the centroid estimate.
-  #
-  # false (default) -- argmax one-hot: a voxel counts toward exactly one
-  # centroid. true -- the raw class probabilities: every voxel contributes
-  # to every centroid, weighted by p_c.
-  #
-  # Soft has a degenerate regime worth understanding before switching it on.
-  # Early in training p ~ 1/3 everywhere, so all three centroids converge on
-  # the global mean of the features and collapse onto each other; the energy
-  # then reduces to ||x - mu_bar||^2 and pulls every embedding toward a
-  # single point regardless of class. The confidence filter is what holds
-  # that back, so do not pair this with a loosened cm_conf_thr.
-  #
-  # Ignored at cm_mode=l, which uses ground-truth one-hot and never calls
-  # the pseudo-label path at all.
-  cm_use_soft_pseudo: false
-
-  # TRUE, and this is not optional any more -- the Euclidean form is
-  # vacuous on this architecture.
-  #
-  # Measured on sweep yvw1emxi (22 runs, 200 epochs): with the Euclidean
-  # energy, train_cm_loss fell from ~0.02 to ~0.001 while train_sup_loss and
-  # Dice did not move at all (mean dDice over 11 label counts: -0.0004). The
-  # checkpoints show why -- the embedding shrank ~1.9x and the classifier
-  # grew 1.37x. Since logits = W*x, scaling x by 1/s and W by s leaves the
-  # logits bit-identical, so Dice+CE cannot see it, while ||x - mu||^2 falls
-  # as s^2. The network satisfied the regulariser by changing its own units.
-  #
-  # The 2D supercm project was immune because its head is
-  # torch.mean(pre_heatmaps, dim=1) -- no parameters, so no W to grow, so
-  # shrinking x shrinks the logit and BCE objects immediately. Introducing a
-  # learnable 128->3 classifier is what opened the degeneracy.
-  #
-  # Normalising both x and mu makes the energy 2 - 2cos(x, mu), bounded in
-  # [0, 4] and invariant to scale: measured on the real network it reads
-  # 0.94354 at scale 1.0, 0.5 and 0.1 alike, where the Euclidean form reads
-  # 0.679 / 0.170 / 0.007. Collinear collapse is not an escape either --
-  # identical directions give every voxel the same argmax, which Dice
-  # punishes hard.
-  #
-  # Note the /embedding_dim division is skipped when this is on (the energy
-  # is already O(1)), so cm_weight is on a comparable but not identical
-  # scale to the Euclidean runs.
-  cm_normalize: true
-
-  # Kill the TRANSLATION gauge as well as the scale one.
-  #
-  # x -> x + t with b -> b - W t leaves every logit identical, but drives
-  # every cosine toward 1 and so d^2 = 2-2cos toward 0. The attract arm of
-  # the n=10 strategy sweep did exactly that: ||mean(x)|| went 2.0 -> 15.8,
-  # the origin-referenced centroid angle fell 94 -> 12 deg, and the CENTRED
-  # angle stayed at 113-129. Nothing had collapsed; the energy was being
-  # minimised by drifting away from the origin for free.
-  #
-  # cm_normalize alone cannot see this. Note the in-flight sweep ran with
-  # this false, so its cm_weight is not on the same footing as a run with it
-  # true.
-  cm_center: true
 
   # ---------------------------------------------------------------------------
   # Per-epoch t-SNE of the embedding (module/embedding_tsne.py).

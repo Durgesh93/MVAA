@@ -157,9 +157,14 @@ class ClusteringCMLoss(nn.Module):
         attract      sum_k g_k ||x - mu_k||^2     g = softmax(Wx + b)
         contrastive  -sum_k y_k log g_hat_k       g_hat = softmax(-d^2/tau)
 
-    cm_mode says where the assignments y come from: "l" ground truth on
-    labeled crops, "u" confident pseudo-labels on unlabeled ones, "l+u"
-    both. Only u/l+u need an unlabeled forward pass.
+    x and mu are always centred on mu.mean(0) and then L2-normalised, so
+    d^2 = 2 - 2cos: the energy sees direction only. Both are gauge fixes, not
+    preferences -- the classifier is invariant under x -> x/s and x -> x + t,
+    and without them the energy falls with no change to any prediction.
+
+    cm_mode says where the assignments y come from: "l" ground truth on the
+    labeled crops, "l+u" that plus confident pseudo-labels on the unlabeled
+    ones. Only l+u needs an unlabeled forward pass.
 
     No cross-entropy here -- the LightningModule owns
     DeepSupervisionWrapper(CompoundLoss) and forms
@@ -173,7 +178,7 @@ class ClusteringCMLoss(nn.Module):
         self,
         embedding_dim: int,
         num_classes: int,
-        cm_mode: str = "l",
+        cm_mode: str = "l+u",
         form: str = "contrastive",
         tau: float = 1.0,
         weight: float = 0.1,
@@ -182,16 +187,13 @@ class ClusteringCMLoss(nn.Module):
         conf_thr: float = 0.9,
         topk_frac: float = 0.15,
         min_keep: int = 64,
-        use_soft_pseudo: bool = False,
-        normalize: bool = False,
-        center: bool = False,
         ignore_label=None,
         eps: float = 1e-6,
     ):
         super().__init__()
 
-        if cm_mode not in ("l", "u", "l+u"):
-            raise ValueError(f"cm_mode must be one of 'l', 'u', 'l+u', got {cm_mode!r}")
+        if cm_mode not in ("l", "l+u"):
+            raise ValueError(f"cm_mode must be 'l' or 'l+u', got {cm_mode!r}")
 
         if num_classes < 2:
             raise ValueError(f"num_classes must be >= 2, got {num_classes}")
@@ -211,9 +213,6 @@ class ClusteringCMLoss(nn.Module):
         self.conf_thr = float(conf_thr)
         self.topk_frac = float(topk_frac)
         self.min_keep = int(min_keep)
-        self.use_soft_pseudo = bool(use_soft_pseudo)
-        self.normalize = bool(normalize)
-        self.center = bool(center)
         self.ignore_label = ignore_label
         self.eps = float(eps)
 
@@ -231,7 +230,7 @@ class ClusteringCMLoss(nn.Module):
     @property
     def needs_unlabeled(self) -> bool:
         """True when cm_mode sources centroids from the unlabeled stream."""
-        return self.cm_mode in ("u", "l+u")
+        return self.cm_mode == "l+u"
 
     def weight_at(self, epoch: float) -> float:
         """
@@ -302,10 +301,9 @@ class ClusteringCMLoss(nn.Module):
         couple of percent of a crop, so a global top-k would be all
         background and the foreground centroids would come from nothing.
 
-        use_soft_pseudo=True uses raw probabilities instead of argmax
-        one-hot. Degenerate early on, where p ~ 1/C everywhere drives all
-        centroids onto the global mean -- do not pair it with a loosened
-        conf_thr.
+        Always argmax one-hot. Raw probabilities were an option and are not
+        any more: early on p ~ 1/C everywhere, which drives every centroid
+        onto the global mean.
 
         Zeroed outside the kept set, so excluded voxels reach neither the
         numerator nor the denominator of the centroid estimate.
@@ -313,11 +311,8 @@ class ClusteringCMLoss(nn.Module):
 
         confidence, predicted = probs.max(dim=1)
 
-        if self.use_soft_pseudo:
-            y = probs
-        else:
-            y = nn.functional.one_hot(predicted, num_classes=self.num_classes)
-            y = y.permute(0, 2, 1).to(torch.float32)
+        y = nn.functional.one_hot(predicted, num_classes=self.num_classes)
+        y = y.permute(0, 2, 1).to(torch.float32)
 
         flat_keep = torch.zeros(confidence.numel(), dtype=torch.bool, device=confidence.device)
 
@@ -461,27 +456,23 @@ class ClusteringCMLoss(nn.Module):
             y = y.float()
             mu = self.mu.float()
 
-            # Translation is a gauge freedom of the classifier: x -> x + t with
-            # b -> b - W t leaves every logit identical, but it drives every
-            # cosine toward 1 and so d^2 = 2-2cos toward 0. The attract arm
-            # exploited exactly this, moving ||mean(x)|| from 2.0 to 15.8 and
-            # taking the origin-referenced centroid angles from 94 to 12 deg
-            # while the centred angles stayed at 113-129. normalize() fixes
-            # the SCALE gauge; this fixes the translation one.
+            # Both gauge fixes, unconditional. The classifier is invariant
+            # under x -> x/s (with W -> sW) and under x -> x + t (with
+            # b -> b - W t), so without these the energy can be driven down
+            # without changing a single prediction. Both were observed:
+            # a 1.9x shrink in sweep yvw1emxi, and ||mean(x)|| 2.0 -> 15.8 in
+            # the n=10 strategy sweep.
             #
-            # Centred on mu.mean(0), not the batch mean: mu is already
+            # Centred on mu.mean(0) rather than the batch mean: mu is already
             # all-reduced, so every rank subtracts the same vector with no
             # extra collective, and it is equivariant under x -> x + t, which
-            # is all that is needed to cancel the gauge. Verified to match
-            # data-mean centring to 0.1 deg.
-            if self.center:
-                offset = mu.mean(dim=0)
-                x = x - offset.view(1, -1, 1)
-                mu = mu - offset.view(1, -1)
+            # is all that is needed. Matches data-mean centring to 0.1 deg.
+            offset = mu.mean(dim=0)
+            x = x - offset.view(1, -1, 1)
+            mu = mu - offset.view(1, -1)
 
-            if self.normalize:
-                x = nn.functional.normalize(x, dim=1)
-                mu = nn.functional.normalize(mu, dim=1)
+            x = nn.functional.normalize(x, dim=1)
+            mu = nn.functional.normalize(mu, dim=1)
 
             x_squared = x.pow(2).sum(dim=1).unsqueeze(1)
             x_dot_mu = torch.einsum("bdp,cd->bcp", x, mu)
@@ -495,9 +486,6 @@ class ClusteringCMLoss(nn.Module):
                 per_voxel = -(y * log_posterior).sum(dim=1)
             else:
                 per_voxel = (g * dist_sq).sum(dim=1)
-
-                if not self.normalize:
-                    per_voxel = per_voxel / float(self.embedding_dim)
 
             weights = valid.to(per_voxel.dtype)
 
@@ -523,11 +511,10 @@ class ClusteringCMLoss(nn.Module):
         g_labeled = self._probabilities(logits)
         y_labeled, valid_labeled = self._gt_assignments(target)
 
-        streams = []
         stats = {}
 
-        if self.cm_mode in ("l", "l+u"):
-            streams.append((x_labeled, y_labeled))
+        # Ground truth always feeds the centroids; l+u adds pseudo-labels.
+        streams = [(x_labeled, y_labeled)]
 
         x_unlabeled = g_unlabeled = y_unlabeled = None
 
@@ -535,7 +522,7 @@ class ClusteringCMLoss(nn.Module):
             x_unlabeled = self._flatten_spatial(u_embeddings)
             g_unlabeled = self._probabilities(u_logits)
 
-            if self.cm_mode in ("u", "l+u"):
+            if self.cm_mode == "l+u":
                 y_unlabeled, keep = self._confident_assignments(g_unlabeled)
                 streams.append((x_unlabeled, y_unlabeled))
                 stats["cm_confident_frac"] = keep.to(torch.float32).mean().detach()

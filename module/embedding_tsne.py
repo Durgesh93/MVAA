@@ -238,25 +238,22 @@ def _panel(axis, coords, labels, title, class_names, is_labeled, centroid_coords
         )
 
 
-def centroid_angle(mu, center: bool = True) -> float:
+def centroid_angle(mu) -> float:
     """
-    Mean pairwise angle between class centroids, in degrees.
+    Mean pairwise angle between class centroids, measured at their own mean.
 
-    center=True measures the angle at the centroids' OWN mean rather than at
-    the origin, which is the only version that means anything. x -> x + t
-    (with b -> b - W t) leaves every logit identical but swings the
-    origin-referenced angle freely: the attract arm read 12 deg at the origin
-    and 113-129 deg centred, having simply moved the cloud from ||mean|| 2.0
-    to 15.8. The origin is not a property of the data.
+    Centred, not origin-referenced: x -> x + t (with b -> b - W t) leaves
+    every logit identical but swings an origin-referenced angle freely. The
+    attract arm read 12 deg at the origin and 113-129 deg centred, having
+    simply moved the cloud from ||mean|| 2.0 to 15.8. The origin is not a
+    property of the data; embedding_offset tracks that drift instead.
 
     mu is identical on every rank (update_centroids all-reduces before
     dividing), so no gather is needed.
     """
 
     mu = mu.detach().float()
-
-    if center:
-        mu = mu - mu.mean(dim=0, keepdim=True)
+    mu = mu - mu.mean(dim=0, keepdim=True)
 
     unit = nn.functional.normalize(mu, dim=1)
     cosines = (unit @ unit.T).clamp(-1.0, 1.0)
@@ -526,8 +523,7 @@ class EmbeddingTSNE:
             f"stage-0 embedding t-SNE ({self.metric}) | epoch {int(epoch)} | "
             f"{labeled_count} labeled + {panels - labeled_count} held-out cases | "
             f"{self.max_per_class} voxels/class | "
-            f"centroid angle {centroid_angle(module.cm_loss.mu):.1f} deg centred / "
-            f"{centroid_angle(module.cm_loss.mu, center=False):.1f} at origin, "
+            f"centroid angle {centroid_angle(module.cm_loss.mu):.1f} deg, "
             f"offset {embedding_offset(module.cm_loss.mu):.2f}\n"
             "held-out panels coloured by ground truth the network never trained on; "
             "stars are the clustering loss's live centroids",
