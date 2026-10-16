@@ -34,6 +34,7 @@
 #   wandb sweep scripts/sweep_cm_tsne.yaml
 #   ws conf standard 4
 #   ws sweep wandb echoml/mvaa/<sweep_id>
+name: "cm+tsne n=10 · weight x mode"
 program: scripts/sweep_run.sh
 method: grid
 

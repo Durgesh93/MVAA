@@ -35,6 +35,7 @@
 #     n=105 ->  0 unlabeled, a labeled case is RECYCLED, so the "held-out"
 #               panel is a copy of the labeled one. _select_cases prints a
 #               warning. Dice is unaffected; only the figure degrades.
+name: "attract-l · few-shot curve n=10/40/80/105 · w=0/0.5"
 program: scripts/sweep_run.sh
 method: grid
 
