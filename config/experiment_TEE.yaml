@@ -175,16 +175,17 @@ litmodule:
   # ---------------------------------------------------------------------------
 
   # Where the centroid assignments come from:
-  #   l    ground-truth only. No pseudo-labelling and no unlabeled forward
-  #        pass. Kept as the control arm -- it is a re-encoding of labels
-  #        Dice+CE already consumes, so it cannot add information.
+  #   l    ground-truth only, the default. No pseudo-labelling and no
+  #        unlabeled forward pass, so the term is a pure regulariser on
+  #        supervision already in hand.
   #   l+u  plus confident pseudo-labels on the unlabeled crops. The only
-  #        mode with a mechanism, hence the default.
+  #        mode that can add information, but it also turns on the unlabeled
+  #        forward pass and pseudo-labelling at once.
   #
   #   'u' was removed: centroids from pseudo-labels alone meant early
   #   training built mu out of noise while the labeled energy pulled
   #   ground-truth voxels toward it.
-  cm_mode: 'l+u'
+  cm_mode: 'l'
 
   # Functional form of the energy.
   #
@@ -361,7 +362,11 @@ wandb:
   enabled: true
   entity: echoml
   project: mvaa
-  tags: ["ssl_mvseg"]
+  # One tag per sweep, matching the sweep's display name, so runs stay
+  # findable by experiment line rather than only by sweep id. Update this
+  # whenever a new sweep is created -- for jc02tlaf,
+  # "attract-l · few-shot curve n=10/40/80/105 · w=0/0.5".
+  tags: ["attract-l-curve"]
   mode: online
   # Optional run grouping in the W&B UI; null leaves runs ungrouped.
   group: null

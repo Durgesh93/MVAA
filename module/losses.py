@@ -178,7 +178,7 @@ class ClusteringCMLoss(nn.Module):
         self,
         embedding_dim: int,
         num_classes: int,
-        cm_mode: str = "l+u",
+        cm_mode: str = "l",
         form: str = "attract",
         tau: float = 1.0,
         weight: float = 0.1,
