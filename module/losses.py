@@ -184,6 +184,7 @@ class ClusteringCMLoss(nn.Module):
         min_keep: int = 64,
         use_soft_pseudo: bool = False,
         normalize: bool = False,
+        center: bool = False,
         ignore_label=None,
         eps: float = 1e-6,
     ):
@@ -212,6 +213,7 @@ class ClusteringCMLoss(nn.Module):
         self.min_keep = int(min_keep)
         self.use_soft_pseudo = bool(use_soft_pseudo)
         self.normalize = bool(normalize)
+        self.center = bool(center)
         self.ignore_label = ignore_label
         self.eps = float(eps)
 
@@ -458,6 +460,24 @@ class ClusteringCMLoss(nn.Module):
             g = g.float()
             y = y.float()
             mu = self.mu.float()
+
+            # Translation is a gauge freedom of the classifier: x -> x + t with
+            # b -> b - W t leaves every logit identical, but it drives every
+            # cosine toward 1 and so d^2 = 2-2cos toward 0. The attract arm
+            # exploited exactly this, moving ||mean(x)|| from 2.0 to 15.8 and
+            # taking the origin-referenced centroid angles from 94 to 12 deg
+            # while the centred angles stayed at 113-129. normalize() fixes
+            # the SCALE gauge; this fixes the translation one.
+            #
+            # Centred on mu.mean(0), not the batch mean: mu is already
+            # all-reduced, so every rank subtracts the same vector with no
+            # extra collective, and it is equivariant under x -> x + t, which
+            # is all that is needed to cancel the gauge. Verified to match
+            # data-mean centring to 0.1 deg.
+            if self.center:
+                offset = mu.mean(dim=0)
+                x = x - offset.view(1, -1, 1)
+                mu = mu - offset.view(1, -1)
 
             if self.normalize:
                 x = nn.functional.normalize(x, dim=1)

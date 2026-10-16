@@ -315,6 +315,20 @@ litmodule:
   # scale to the Euclidean runs.
   cm_normalize: true
 
+  # Kill the TRANSLATION gauge as well as the scale one.
+  #
+  # x -> x + t with b -> b - W t leaves every logit identical, but drives
+  # every cosine toward 1 and so d^2 = 2-2cos toward 0. The attract arm of
+  # the n=10 strategy sweep did exactly that: ||mean(x)|| went 2.0 -> 15.8,
+  # the origin-referenced centroid angle fell 94 -> 12 deg, and the CENTRED
+  # angle stayed at 113-129. Nothing had collapsed; the energy was being
+  # minimised by drifting away from the origin for free.
+  #
+  # cm_normalize alone cannot see this. Note the in-flight sweep ran with
+  # this false, so its cm_weight is not on the same footing as a run with it
+  # true.
+  cm_center: true
+
   # ---------------------------------------------------------------------------
   # Per-epoch t-SNE of the embedding (module/embedding_tsne.py).
   #
@@ -344,8 +358,17 @@ litmodule:
   tsne_num_labeled_cases: 1
   tsne_num_unlabeled_cases: 8
 
-  tsne_every_n_epochs: 1
-  tsne_max_per_class: 500
+  # 0 = only on the final epoch, which is the default: t-SNE is the
+  # expensive part (minutes) while the forwards are ~1.5 s, and the useful
+  # picture is of the finished model. Set to N to also plot every N epochs.
+  tsne_every_n_epochs: 0
+
+  # Voxels per class per panel. Raised 8x now that this runs once per run.
+  # Measured sklearn Barnes-Hut timings per panel at 128-d, max_iter=500:
+  #   1.5k 2.5s | 3k 4.9s | 6k 18.3s | 12k 36.6s | 24k 93.4s
+  # so 4000/class = 12k/panel is ~5.5 min for all nine panels. ALL voxels is
+  # not an option: 1,376,256 per panel extrapolates to ~19 h for the figure.
+  tsne_max_per_class: 4000
   tsne_perplexity: 30.0
 
   # Do NOT drop below ~300: sklearn's first 250 iterations are early
@@ -449,7 +472,10 @@ trainer:
   # is AFTER the clustering term switches on at cm_start_epoch=5, so there is
   # no pre-switch validation point within a run. The cm_weight=0 arm is the
   # control for that comparison, not an earlier epoch of the same run.
-  check_val_every_n_epoch: 10
+  # Plus the first and last epochs, forced in the LightningModule -- the
+  # first is a baseline before the clustering term switches on, the last is
+  # the number actually reported.
+  check_val_every_n_epoch: 50
   enable_progress_bar: true
   enable_checkpointing: true
   deterministic: false

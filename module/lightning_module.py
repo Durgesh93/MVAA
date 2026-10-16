@@ -7,7 +7,7 @@ import torch
 import lightning as L
 
 from .adapter import embeddings_enabled
-from .embedding_tsne import EmbeddingTSNE, centroid_angle
+from .embedding_tsne import EmbeddingTSNE, centroid_angle, embedding_offset
 from .metrics import MetricsTracker
 from .ddp import DDPHelper
 from .nnunet import NNUnetSetup
@@ -77,6 +77,10 @@ class SSLnnUNetLightningModule(L.LightningModule):
         )
 
         self.loss = None
+
+        # Captured on the first train epoch, before on_train_epoch_start
+        # starts mutating trainer.check_val_every_n_epoch.
+        self._val_every = None
 
     def setup(self, stage=None):
         # "Are DDP collectives live", not "is world_size > 1". The two differ
@@ -236,6 +240,44 @@ class SSLnnUNetLightningModule(L.LightningModule):
 
         return total_loss
 
+    def _validates_this_epoch(self) -> bool:
+        """
+        Every check_val_every_n_epoch, plus the FIRST and LAST epochs.
+
+        The first gives a baseline before the clustering term switches on at
+        cm_start_epoch; the last is the number actually reported, and a
+        max_epochs that is not a multiple of the interval would otherwise
+        never validate the finished model.
+        """
+
+        epoch = int(self.current_epoch)
+        last = int(self.trainer.max_epochs) - 1
+        every = int(self._val_every or 0)
+
+        return epoch in (0, last) or (every > 0 and (epoch + 1) % every == 0)
+
+    def on_train_epoch_start(self):
+        """
+        Force validation on the first and last epochs.
+
+        Lightning only validates when (epoch + 1) % check_val_every_n_epoch
+        == 0 and offers no hook for "also these epochs". It re-reads the
+        attribute each epoch, so setting it to 1 on the epochs we want and
+        restoring it otherwise is how to express that.
+
+        The configured interval is captured on the first call, BEFORE any
+        mutation -- reading it back later would return whatever the previous
+        epoch set it to. It is a trainer argument, not a litmodule one, so it
+        is not on self.cfg.
+        """
+
+        if getattr(self, "_val_every", None) is None:
+            self._val_every = int(self.trainer.check_val_every_n_epoch or 0)
+
+        self.trainer.check_val_every_n_epoch = (
+            1 if self._validates_this_epoch() else self._val_every
+        )
+
     def on_train_epoch_end(self):
         """
         Log the centroid geometry, and plot the embedding it came from.
@@ -254,17 +296,27 @@ class SSLnnUNetLightningModule(L.LightningModule):
         no diagnostic.
         """
 
-        self.log(
-            "train_cm_centroid_angle",
-            centroid_angle(self.cm_loss.mu),
-            on_step=False, on_epoch=True, prog_bar=False, logger=True,
-            sync_dist=False, batch_size=1,
-        )
+        # Centred is the real one. The origin-referenced angle is kept
+        # because it is what the in-flight sweep logged, and the offset is the
+        # gauge coordinate itself -- an arm whose offset climbs while its
+        # centred angle holds is cheating, not clustering.
+        for key, value in (
+            ("train_cm_centroid_angle", centroid_angle(self.cm_loss.mu)),
+            ("train_cm_centroid_angle_origin", centroid_angle(self.cm_loss.mu, center=False)),
+            ("train_cm_embed_offset", embedding_offset(self.cm_loss.mu)),
+        ):
+            self.log(
+                key, value,
+                on_step=False, on_epoch=True, prog_bar=False, logger=True,
+                sync_dist=False, batch_size=1,
+            )
 
         if not self.trainer.is_global_zero:
             return
 
-        if not self.embedding_tsne.due(self.current_epoch):
+        is_last = int(self.current_epoch) == int(self.trainer.max_epochs) - 1
+
+        if not self.embedding_tsne.due(self.current_epoch, is_last=is_last):
             return
 
         try:

@@ -238,26 +238,43 @@ def _panel(axis, coords, labels, title, class_names, is_labeled, centroid_coords
         )
 
 
-def centroid_angle(mu):
+def centroid_angle(mu, center: bool = True) -> float:
     """
     Mean pairwise angle between class centroids, in degrees.
 
-    The single number that tracks collapse. In sweep 7yu5e5o5 the attract
-    form drove this from 113 to 12 degrees while Dice quietly got worse, and
-    nothing logged it -- the failure was only visible by reading mu out of
-    checkpoints afterwards. It costs one 3x128 matmul, so it is logged every
-    epoch here.
+    center=True measures the angle at the centroids' OWN mean rather than at
+    the origin, which is the only version that means anything. x -> x + t
+    (with b -> b - W t) leaves every logit identical but swings the
+    origin-referenced angle freely: the attract arm read 12 deg at the origin
+    and 113-129 deg centred, having simply moved the cloud from ||mean|| 2.0
+    to 15.8. The origin is not a property of the data.
 
     mu is identical on every rank (update_centroids all-reduces before
-    dividing), so this is safe to compute and log everywhere without a
-    gather.
+    dividing), so no gather is needed.
     """
 
-    unit = nn.functional.normalize(mu.detach().float(), dim=1)
+    mu = mu.detach().float()
+
+    if center:
+        mu = mu - mu.mean(dim=0, keepdim=True)
+
+    unit = nn.functional.normalize(mu, dim=1)
     cosines = (unit @ unit.T).clamp(-1.0, 1.0)
     pairs = torch.triu_indices(unit.shape[0], unit.shape[0], offset=1)
 
     return float(torch.rad2deg(torch.acos(cosines[pairs[0], pairs[1]])).mean())
+
+
+def embedding_offset(mu) -> float:
+    """
+    ||mean(mu)|| -- the translation gauge coordinate itself.
+
+    Pure gauge: it can move without changing a single logit. Watching it rise
+    is what identifies an arm minimising the energy by drifting away from the
+    origin rather than by separating the classes.
+    """
+
+    return float(mu.detach().float().mean(dim=0).norm())
 
 
 class EmbeddingTSNE:
@@ -286,7 +303,7 @@ class EmbeddingTSNE:
         self.output_folder = Path(output_folder) / "embedding_tsne"
         self.num_labeled_cases = int(num_labeled_cases)
         self.num_unlabeled_cases = int(num_unlabeled_cases)
-        self.every_n_epochs = max(1, int(every_n_epochs))
+        self.every_n_epochs = int(every_n_epochs)
         self.max_per_class = int(max_per_class)
         self.perplexity = float(perplexity)
         self.max_iter = int(max_iter)
@@ -295,7 +312,21 @@ class EmbeddingTSNE:
 
         self._cases = None
 
-    def due(self, epoch):
+    def due(self, epoch, is_last: bool = False):
+        """
+        The final epoch always plots; every_n_epochs=0 means only then.
+
+        t-SNE is the expensive part of this diagnostic (minutes, against
+        ~1.5 s for the forwards), so by default it runs once on the finished
+        model rather than every epoch.
+        """
+
+        if is_last:
+            return True
+
+        if self.every_n_epochs <= 0:
+            return False
+
         return (int(epoch) + 1) % self.every_n_epochs == 0
 
     def _select_cases(self, datamodule):
@@ -495,7 +526,9 @@ class EmbeddingTSNE:
             f"stage-0 embedding t-SNE ({self.metric}) | epoch {int(epoch)} | "
             f"{labeled_count} labeled + {panels - labeled_count} held-out cases | "
             f"{self.max_per_class} voxels/class | "
-            f"mean pairwise centroid angle {centroid_angle(module.cm_loss.mu):.1f} deg\n"
+            f"centroid angle {centroid_angle(module.cm_loss.mu):.1f} deg centred / "
+            f"{centroid_angle(module.cm_loss.mu, center=False):.1f} at origin, "
+            f"offset {embedding_offset(module.cm_loss.mu):.2f}\n"
             "held-out panels coloured by ground truth the network never trained on; "
             "stars are the clustering loss's live centroids",
             fontsize=11,
