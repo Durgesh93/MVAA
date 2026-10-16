@@ -197,25 +197,27 @@ litmodule:
   #                and log C = 1.0986 is exactly what total collapse gives,
   #                so collapse is the WORST state rather than the best.
   #
-  #   attract      sum_k g_k ||x - mu_k||^2, the original SuperCM energy.
-  #                Attraction only. Kept so sweeps yvw1emxi and 7yu5e5o5
-  #                remain reproducible, not because it works.
+  #   attract      sum_k g_k ||x - mu_k||^2, the original SuperCM energy and
+  #                the default. Attraction only -- it never reads y, so at
+  #                cm_mode=l+u the pseudo-labels shape the centroids but
+  #                never become a training target.
   #
-  # Why the default changed. On synthetic scenes with centroid separation
-  # 120/90/60/20/5/1 deg the attract form reads
-  # 0.6719/0.6657/0.6655/0.6623/0.6613/0.6633 -- flat to three decimals,
-  # minimum at 5 deg. It cannot see between-class separation and marginally
-  # prefers collapse. Sweep 7yu5e5o5 collapsed accordingly: within-class
-  # angle 1.0-1.3 deg (from 24-27) but between-class centroid angle 12 deg
-  # (from 113), and Dice 0.002-0.021 WORSE than the cm_weight=0 control.
-  # The contrastive form on the same scenes reads
-  # 0.2475/0.3386/0.5740/0.9970/1.0870/1.0956 -- monotone, minimised at
-  # maximum separation.
+  # Read the old evidence against attract with care. Sweep 7yu5e5o5 showed
+  # its centroid angle falling 113 -> 12 deg and that was called a collapse;
+  # it was not. Measured from the centroids' own mean the angles had stayed
+  # at 113-129 deg the whole time, while ||mean(x)|| drifted 2.0 -> 15.8.
+  # attract was minimising its energy along the TRANSLATION gauge, which the
+  # loss now fixes unconditionally. Those runs cannot be compared to a run
+  # today; the escape route they used is closed.
   #
-  # The centroids are unchanged: still the closed-form assignment-weighted
-  # mean of labeled voxels, still a buffer, still EMA-blended. Only the
-  # energy's functional form differs.
-  cm_form: contrastive
+  # What is still true of attract on synthetic scenes is that its energy is
+  # nearly flat in the true separation, so it carries little signal about
+  # where the centroids sit relative to each other. Whether that matters once
+  # the gauges are fixed is exactly what a sweep should answer.
+  #
+  # The centroids are the same either way: closed-form assignment-weighted
+  # mean, a buffer, EMA-blended. Only the energy's functional form differs.
+  cm_form: attract
 
   # Temperature on the distance logits. The embeddings are normalised, so
   # distances live in [0, 4], so tau=1 gives logits spanning 4 -- a

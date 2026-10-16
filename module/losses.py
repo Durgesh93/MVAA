@@ -179,7 +179,7 @@ class ClusteringCMLoss(nn.Module):
         embedding_dim: int,
         num_classes: int,
         cm_mode: str = "l+u",
-        form: str = "contrastive",
+        form: str = "attract",
         tau: float = 1.0,
         weight: float = 0.1,
         start_epoch: float = 5.0,
