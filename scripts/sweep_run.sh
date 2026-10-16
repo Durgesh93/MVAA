@@ -109,5 +109,23 @@ echo "============================================================"
 
 # Not `exec`: `py` is a shell function, and exec can only replace the
 # shell with an external executable ("exec: py: not found").
-py engine.py train "experiment_name=$EXP_NAME" "$@"
+# Tag the run with the sweep it came from.
+#
+# wandb.tags in the config is a single hardcoded string, so the moment a
+# second sweep exists it is wrong for one of them. The sweep's own display
+# name is the thing worth tagging by, and WANDB_SWEEP_ID is exported by the
+# agent, so derive it here rather than asking anyone to keep a yaml in sync.
+#
+# sweep_tag.py prints nothing when this is not a sweep run, in which case the
+# config value stands; it falls back to the bare sweep id if the API is
+# unreachable. Either way it cannot fail the run.
+TAG_OVERRIDE=()
+SWEEP_TAG="$(py scripts/sweep_tag.py 2>/dev/null || true)"
+
+if [ -n "$SWEEP_TAG" ]; then
+  TAG_OVERRIDE=("wandb.tags=[$SWEEP_TAG]")
+  echo "  wandb tag       : $SWEEP_TAG"
+fi
+
+py engine.py train "experiment_name=$EXP_NAME" "${TAG_OVERRIDE[@]}" "$@"
 exit $?

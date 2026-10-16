@@ -362,11 +362,11 @@ wandb:
   enabled: true
   entity: echoml
   project: mvaa
-  # One tag per sweep, matching the sweep's display name, so runs stay
-  # findable by experiment line rather than only by sweep id. Update this
-  # whenever a new sweep is created -- for jc02tlaf,
-  # "attract-l · few-shot curve n=10/40/80/105 · w=0/0.5".
-  tags: ["attract-l-curve"]
+  # Fallback only. Sweep runs OVERRIDE this: scripts/sweep_run.sh derives
+  # the tag from the sweep's display name via WANDB_SWEEP_ID, so it cannot
+  # go stale when a new sweep is created. This value applies to manual
+  # single runs, which belong to no sweep.
+  tags: ["manual"]
   mode: online
   # Optional run grouping in the W&B UI; null leaves runs ungrouped.
   group: null
