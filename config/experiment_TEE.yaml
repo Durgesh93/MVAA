@@ -359,7 +359,7 @@ litmodule:
 
 wandb:
   enabled: true
-  entity: dsb_uio
+  entity: echoml
   project: mvaa
   tags: ["ssl_mvseg"]
   mode: online

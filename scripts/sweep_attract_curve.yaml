@@ -25,7 +25,7 @@
 #
 #   wandb sweep scripts/sweep_attract_curve.yaml
 #   ws conf standard 8
-#   ws sweep wandb dsb_uio/mvaa/<sweep_id>
+#   ws sweep wandb echoml/mvaa/<sweep_id>
 #
 # NOTE the t-SNE grid thins out as the budget grows, because the held-out
 # pool is rank-local:

@@ -36,7 +36,7 @@
 #
 #   wandb sweep scripts/sweep_strategies_n010.yaml
 #   ws conf standard 8
-#   ws sweep wandb dsb_uio/mvaa/<sweep_id>
+#   ws sweep wandb echoml/mvaa/<sweep_id>
 program: scripts/sweep_run.sh
 method: grid
 
