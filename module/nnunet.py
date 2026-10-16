@@ -41,8 +41,8 @@ from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.inference.export_prediction import convert_predicted_logits_to_segmentation_with_correct_shape
 
-from .adapter import EmbeddingAdapter
-from .losses import ClusteringCMLoss, CompoundLoss
+from .adapter import stage_dims
+from .losses import ClusteringCMLoss, CompoundLoss, DeepSupervisionCM
 
 from utils import (
     write_prediction_case_zip as _write_prediction_case_zip,
@@ -259,56 +259,37 @@ class NNUnetSetup:
 
     def build_network(self):
         """
-        The nnU-Net trunk, ending in an embedding adapter.
+        The stock nnU-Net trunk. Nothing is added to it.
 
-        Stock nnU-Net's decoder seg_layers map straight to
-        num_segmentation_heads logits. Here the SAME trunk is built with
-        embedding_dim output channels and a shared 1x1 classifier bolted on
-        top, so every voxel carries an explicit embedding_dim-dimensional
-        feature vector the clustering loss can reach (see
-        module/adapter.py). The returned module still emits class logits
-        from forward(), so the loss, the deep-supervision wrapper and
-        nnUNetPredictor are unaffected.
-
-        This is unconditional. There is no nonlinearity between the trunk
-        and the classifier, so their composition is still a linear map to
-        logits and embedding_dim (128) >> num_classes (3) keeps it full
-        rank: the adapter buys an embedding space to put a loss on, not
-        expressiveness, and a purely supervised run is free to ignore it
-        (cm_weight=0). Keeping it always on means one architecture and one
-        code path, so a supervised baseline and a SuperCM run differ only in
-        the clustering weight.
-
-        Checkpoints are NOT compatible with stock nnU-Net -- the adapter
-        renames every trunk parameter under "backbone." and adds
-        "classifier." -- so pretrained stock weights need remapping, not
-        just loading.
+        An earlier version built the trunk with embedding_dim output channels
+        and bolted a shared 1x1 classifier on top. That is gone: the decoder's
+        own seg_layers already map each stage's features to class logits, so
+        those features ARE the per-voxel embedding and module/adapter.py
+        reaches them with a forward hook. The architecture, the parameter
+        names and stock-checkpoint compatibility are all preserved.
         """
 
-        embedding_dim = int(self.cfg.embedding_dim)
-
-        if embedding_dim < self.lm.num_segmentation_heads:
-            raise ValueError(
-                f"embedding_dim={embedding_dim} is below num_segmentation_heads="
-                f"{self.lm.num_segmentation_heads}. The classifier is a linear map off the "
-                "embedding, so a narrower embedding would bottleneck the logits."
-            )
-
-        backbone = nnUNetTrainer.build_network_architecture(
-            self.pm, self.cm, self.num_input_channels, embedding_dim, self.enable_deep_supervision
+        return nnUNetTrainer.build_network_architecture(
+            self.pm,
+            self.cm,
+            self.num_input_channels,
+            self.lm.num_segmentation_heads,
+            self.enable_deep_supervision,
         )
-        
 
-        # Conv class read off the trunk's own seg_layers rather than
-        # hardcoded to Conv3d, so a 2d configuration needs no special case.
-        conv_op = type(backbone.decoder.seg_layers[0])
+    def _deep_supervision_weights(self, is_ddp):
+        """
+        nnU-Net's 1/2^i weights, normalised. The deepest stage gets 1e-6
+        rather than 0 under DDP: an exactly-zero weight leaves that
+        seg_layer without a gradient and DDP aborts on an unused parameter.
+        """
 
-        return EmbeddingAdapter(
-            backbone=backbone,
-            embedding_dim=embedding_dim,
-            num_classes=self.lm.num_segmentation_heads,
-            conv_op=conv_op,
-        )
+        shim = self._make_trainer_shim(is_ddp)
+        scales = shim._get_deep_supervision_scales()
+        weights = np.array([1 / (2**i) for i in range(len(scales))])
+        weights[-1] = 1e-6 if is_ddp else 0
+
+        return weights / weights.sum()
 
     def build_loss(self, is_ddp):
         shim = self._make_trainer_shim(is_ddp)
@@ -325,52 +306,43 @@ class NNUnetSetup:
             foreground_weight=getattr(self.cfg, "foreground_weight", 1.0),
         )
 
-        deep_supervision_scales = shim._get_deep_supervision_scales()
+        return DeepSupervisionWrapper(loss, self._deep_supervision_weights(is_ddp))
 
-        weights = np.array([1 / (2**i) for i in range(len(deep_supervision_scales))])
-
-        if is_ddp:
-            weights[-1] = 1e-6
-        else:
-            weights[-1] = 0
-
-        weights = weights / weights.sum()
-
-        return DeepSupervisionWrapper(loss, weights)
-
-    def build_cm_loss(self):
+    def build_cm_loss(self, network, is_ddp):
         """
-        The SuperCM-style clustering regularizer.
+        One ClusteringCMLoss per decoder stage, weighted like deep supervision.
 
-        Always built, like the adapter it depends on. Disable its effect
-        with cm_weight=0, which is what the supervised baseline sweep does:
-        the centroids are still tracked and the energy still logged, but it
-        contributes no gradient, so the baseline and a SuperCM run take the
-        identical code path and differ only in that weight.
+        Each stage is its own feature space -- widths 32/64/128/256/320,
+        highest resolution first -- so each gets its own centroids rather than
+        sharing a set across incompatible spaces. The widths are read off the
+        trunk's seg_layers, so they cannot drift from the architecture.
 
-        num_classes and ignore_label are read off the label manager rather
-        than the yaml so they cannot drift from what the supervised loss and
-        the predictor use. embedding_dim comes from the config because it is
-        the same value build_network() hands the trunk -- the two have to
-        agree, and a mismatch surfaces immediately as a shape error in the
-        centroid einsum.
+        Always built; cm_weight=0 is how a run turns it off, which keeps the
+        baseline and a SuperCM run on one code path.
         """
 
-        return ClusteringCMLoss(
-            embedding_dim=int(self.cfg.embedding_dim),
-            num_classes=self.lm.num_segmentation_heads,
-            cm_mode=str(self.cfg.cm_mode),
-            form=str(self.cfg.cm_form),
-            tau=float(self.cfg.cm_tau),
-            weight=float(self.cfg.cm_weight),
-            start_epoch=float(self.cfg.cm_start_epoch),
-            ema_weight=float(self.cfg.cm_ema_weight),
-            conf_thr=float(self.cfg.cm_conf_thr),
-            topk_frac=float(self.cfg.cm_topk_frac),
-            min_keep=int(self.cfg.cm_min_keep),
-            ignore_label=self.lm.ignore_label,
-        )
+        dims = stage_dims(network)
+        weights = self._deep_supervision_weights(is_ddp)
 
+        losses = [
+            ClusteringCMLoss(
+                embedding_dim=int(dim),
+                num_classes=self.lm.num_segmentation_heads,
+                cm_mode=str(self.cfg.cm_mode),
+                form=str(self.cfg.cm_form),
+                tau=float(self.cfg.cm_tau),
+                weight=float(self.cfg.cm_weight),
+                start_epoch=float(self.cfg.cm_start_epoch),
+                ema_weight=float(self.cfg.cm_ema_weight),
+                conf_thr=float(self.cfg.cm_conf_thr),
+                topk_frac=float(self.cfg.cm_topk_frac),
+                min_keep=int(self.cfg.cm_min_keep),
+                ignore_label=self.lm.ignore_label,
+            )
+            for dim in dims
+        ]
+
+        return DeepSupervisionCM(losses, weights)
 
     def build_optimizer_and_scheduler(self, network):
         shim = type("S", (), {})()

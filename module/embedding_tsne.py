@@ -14,7 +14,7 @@ not whether the term creates structure, but whether it damages structure
 that was already there. Every centroid/prototype method assumes it
 does. Nothing in the segmentation loss asks for it: Dice+CE constrains
 W*x + b, not x, so the embedding is free to be any full-rank
-reparameterization of a 3-logit space (see EmbeddingAdapter's docstring).
+reparameterization of a 3-logit space.
 
 So the plot is the experiment. If the classes already separate, prototypes
 are reading real structure. If they do not, a clustering loss is not
@@ -56,7 +56,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402  (must follow matplotlib.use)
 from sklearn.manifold import TSNE  # noqa: E402
 
-from .adapter import embeddings_enabled  # noqa: E402
+from .adapter import order_stages, stage_features, unwrap  # noqa: E402
 
 
 # Fixed per-class colours so a panel means the same thing at epoch 0 and
@@ -396,21 +396,20 @@ class EmbeddingTSNE:
         previous = network.decoder.deep_supervision
 
         # Deep supervision off: only stage 0 is plotted, so the four coarser
-        # embedding maps would be pure compute. With it off the adapter
-        # returns bare tensors rather than per-stage lists.
-        #
-        # return_embeddings goes through embeddings_enabled rather than being
-        # assigned directly, per EmbeddingAdapter's docstring -- it restores
-        # the previous value even if the forward raises, so a failure here
-        # cannot leave the predictor receiving tuples.
+        # stages would be pure compute. With it off the decoder runs one
+        # seg_layer and order_stages returns a bare tensor.
         network.decoder.deep_supervision = False
 
         try:
-            with embeddings_enabled(network):
-                embeddings, _ = network(tensor)
+            with stage_features(network) as captured:
+                logits = network(tensor)
+            embeddings = order_stages(captured, logits)
         finally:
             network.decoder.deep_supervision = previous
 
+        # [0] indexes the BATCH, not a stage -- deep supervision is off, so
+        # `embeddings` is the single stage-0 tensor (1, D, *patch) and this
+        # takes its only sample. (D, *patch) -> (D, P) -> (P, D).
         flat = embeddings[0].flatten(1).T.float().cpu().numpy()
 
         return flat, seg.reshape(-1)
@@ -427,7 +426,7 @@ class EmbeddingTSNE:
         if datamodule.dataset_train_labeled is None or datamodule.dataset_train_unlabeled is None:
             return None
 
-        network = module.network.module if hasattr(module.network, "module") else module.network
+        network = unwrap(module.network)
         was_training = network.training
         network.eval()
 

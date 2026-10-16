@@ -6,7 +6,7 @@ from typing import Any, Dict
 import torch
 import lightning as L
 
-from .adapter import embeddings_enabled
+from .adapter import order_stages, stage_features, unwrap
 from .embedding_tsne import EmbeddingTSNE, centroid_angle, embedding_offset
 from .metrics import MetricsTracker
 from .ddp import DDPHelper
@@ -61,7 +61,6 @@ class SSLnnUNetLightningModule(L.LightningModule):
         # checkpoint onto whatever modules are registered when the restore
         # happens. Created later, the buffers would not exist yet and the
         # saved centroids would be silently dropped on resume.
-        self.cm_loss = self.nnunet.build_cm_loss()
 
         # Diagnostics only -- no parameters, no buffers, nothing to restore.
         self.embedding_tsne = EmbeddingTSNE(
@@ -75,6 +74,7 @@ class SSLnnUNetLightningModule(L.LightningModule):
         )
 
         self.loss = None
+        self.cm_loss = None
 
         # Captured on the first train epoch, before on_train_epoch_start
         # starts mutating trainer.check_val_every_n_epoch.
@@ -92,83 +92,57 @@ class SSLnnUNetLightningModule(L.LightningModule):
         is_ddp = torch.distributed.is_available() and torch.distributed.is_initialized()
         self.loss = self.nnunet.build_loss(is_ddp=is_ddp)
 
+        # Built here, not in __init__: it needs the deep-supervision weights,
+        # which depend on is_ddp, and the per-stage feature widths, which it
+        # reads off the network. setup() runs before any checkpoint restore,
+        # so its centroid buffers are registered in time to be filled.
+        self.cm_loss = self.nnunet.build_cm_loss(network=self.network, is_ddp=is_ddp)
+
     def forward(self, x):
         return self.network(x)
 
     def forward_embeddings(self, x):
         """
-        (embeddings, logits) for one batch of crops.
+        (per-stage embeddings, per-stage logits) for one batch of crops.
 
-        The network is always an EmbeddingAdapter, so this always works. Nothing
-        in this branch's training_step calls it yet -- it is the hook a
-        clustering-style loss attaches to, in the role pre_heatmaps plays in
-        the supercm project.
-
-        Under deep supervision `embeddings` is one tensor per decoder stage,
-        highest resolution first; a prototype loss almost certainly wants
-        embeddings[0] on its own rather than all five pooled together.
+        The embeddings are the features feeding each seg_layer, captured by a
+        forward hook -- see module/adapter.py. The network itself is stock
+        nnU-Net and is unaware of this.
 
         Goes through self.network, never the unwrapped module, so DDP
-        gradient sync survives -- see embeddings_enabled's docstring.
-        """
-        with embeddings_enabled(self.network):
-            return self.network(x)
-
-    @staticmethod
-    def _highest_resolution(value):
-        """
-        The full-resolution element of a deep-supervision list.
-
-        With deep supervision on, the network returns one tensor per decoder
-        stage (highest resolution first) and the datamodule returns one
-        target per stage to match; with it off, both are bare tensors. None
-        passes through so an absent unlabeled stream needs no special case.
-
-        The clustering loss wants stage 0 alone. The coarser stages are
-        downsampled views of the same embedding space, so pooling them into
-        one set of centroids would weight a 7x6x8 map as heavily as the
-        full-resolution one.
+        gradient sync survives.
         """
 
-        return value[0] if isinstance(value, (list, tuple)) else value
+        with stage_features(self.network) as captured:
+            logits = self.network(x)
+
+        return order_stages(captured, logits), logits
 
     def _unlabeled_embeddings(self, batch: Dict[str, Any]):
         """
-        (embeddings, logits) for one weak view of the unlabeled crops.
+        (per-stage embeddings, per-stage logits) for one weak view of the
+        unlabeled crops.
 
-        data_views[0] is the geometric-only view. The clustering loss is not
-        a consistency loss -- it needs one view of a crop, not a weak/strong
-        pair -- so the K-1 strong views go unread and datamodule.K can sit
-        at the loader's minimum of 2.
+        data_views[0] is the geometric-only view. The clustering loss is not a
+        consistency loss -- it needs one view of a crop, not a weak/strong
+        pair -- so the K-1 strong views go unread.
 
-        Deep supervision is switched off around this pass since only stage 0
-        feeds the loss, so the coarser embedding maps would be pure waste.
-        Safe under DDP because the labeled pass already ran with deep
-        supervision on, so every seg_layer still receives a gradient within
-        the step. The forward itself goes through self.network, never the
-        unwrapped module, or DDP gradient sync breaks -- see
-        embeddings_enabled's docstring.
+        Deep supervision stays ON here. It used to be switched off because
+        only stage 0 fed the loss; now every stage does, and turning it off
+        would leave four of the five with no unlabeled term.
         """
 
         data = to_tensor(batch["data_views"][0], device=self.device, dtype=torch.float32)
 
-        network = self.network.module if hasattr(self.network, "module") else self.network
-        previous = network.decoder.deep_supervision
-        network.decoder.deep_supervision = False
-
-        try:
-            return self.forward_embeddings(data)
-        finally:
-            network.decoder.deep_supervision = previous
+        return self.forward_embeddings(data)
 
     def _cm_epoch(self) -> float:
         """
         Fractional epochs elapsed, for the clustering weight's start_epoch.
 
         global_step / batches-per-epoch, so the term switches on exactly at
-        cm_start_epoch rather than at whichever epoch boundary happens to
-        follow. Read off Lightning's own counter so it survives a resume and
-        cannot drift from the optimiser's view of progress.
+        cm_start_epoch rather than at an epoch boundary. Read off Lightning's
+        own counter so it survives a resume.
 
         num_training_batches is inf for an unbounded iterable dataloader;
         datamodule.limit_train_batches makes it finite here, but fall back to
@@ -185,24 +159,20 @@ class SSLnnUNetLightningModule(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """
-        Supervised Dice+CE over the labeled crops plus the SuperCM-style
-        clustering regularizer on the per-voxel embeddings.
+        Supervised Dice+CE plus the clustering regularizer, both over EVERY
+        deep-supervision stage.
 
-        One code path, always. A purely supervised run is cm_weight=0, not a
-        different branch: the centroids are still tracked and the energy
-        still logged, it just contributes no gradient. That keeps a baseline
-        and a SuperCM run byte-identical in everything but the weight.
+        One code path, always: a purely supervised run is cm_weight=0, not a
+        different branch, so the baseline and a SuperCM run differ in nothing
+        but that weight.
 
-        Both terms share ONE forward pass -- forward_embeddings returns the
-        embeddings and the logits together -- so the clustering term costs no
-        extra trunk evaluation on the labeled crops. A second pass is added
-        only when cm_mode asks for unlabeled centroids (u / l+u); at
-        cm_mode=l there is none, which makes the whole regularizer about one
-        einsum per step.
+        Both terms share one forward pass -- forward_embeddings returns the
+        per-stage features and logits together -- so the clustering term
+        costs no extra trunk evaluation on the labeled crops. A second pass
+        is added only at cm_mode=l+u.
 
-        batch["unlabeled"] is always present even when unread -- the
-        datamodule floors the unlabeled pool at one case so the
-        CombinedLoader never drops the key.
+        batch["unlabeled"] is always present even when unread; the datamodule
+        floors that pool at one case so the CombinedLoader never drops it.
         """
 
         data, target = get_train_batch_data_target(batch["labeled"], device=self.device)
@@ -217,11 +187,11 @@ class SSLnnUNetLightningModule(L.LightningModule):
             unlabeled_embeddings, unlabeled_logits = self._unlabeled_embeddings(batch["unlabeled"])
 
         cm_energy, cm_stats = self.cm_loss(
-            embeddings=self._highest_resolution(embeddings),
-            logits=self._highest_resolution(logits),
-            target=self._highest_resolution(target),
-            u_embeddings=self._highest_resolution(unlabeled_embeddings),
-            u_logits=self._highest_resolution(unlabeled_logits),
+            embeddings=embeddings,
+            logits=logits,
+            target=target,
+            u_embeddings=unlabeled_embeddings,
+            u_logits=unlabeled_logits,
         )
 
         cm_weight = self.cm_loss.weight_at(self._cm_epoch())

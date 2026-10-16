@@ -552,3 +552,85 @@ class ClusteringCMLoss(nn.Module):
         stats["cm_loss"] = total.detach()
 
         return total, stats
+
+
+# =============================================================================
+# Per-stage clustering, mirroring deep supervision
+# =============================================================================
+
+
+class DeepSupervisionCM(nn.Module):
+    """
+    One ClusteringCMLoss per decoder stage, combined with the DS weights.
+
+    nnU-Net's own DeepSupervisionWrapper cannot be reused here, and not for a
+    cosmetic reason: it applies ONE shared loss module to every stage. These
+    stages are different feature spaces -- 32, 64, 128, 256 and 320 channels,
+    each produced by its own seg_layer -- so they need their own centroids,
+    their own EMA state, and mu buffers of five different shapes. Sharing one
+    set would average incompatible spaces. The weighted sum below is the same
+    expression as the wrapper's; only the module lookup differs.
+
+    Weighting follows deep supervision, which puts ~88% of the effective
+    signal on stage 0 and ~0.7% on stages 2-4 combined. The coarse stages are
+    therefore close to decorative; they are included because the cost is
+    small (+29% voxels) and their absence would be the untested assumption.
+    """
+
+    def __init__(self, losses, weights):
+        super().__init__()
+
+        if len(losses) != len(weights):
+            raise ValueError(f"{len(losses)} stage losses but {len(weights)} weights")
+
+        self.losses = nn.ModuleList(losses)
+        self.weights = tuple(float(w) for w in weights)
+
+    @property
+    def needs_unlabeled(self) -> bool:
+        return self.losses[0].needs_unlabeled
+
+    def weight_at(self, epoch: float) -> float:
+        return self.losses[0].weight_at(epoch)
+
+    @property
+    def mu(self) -> Tensor:
+        """Stage 0's centroids -- what the diagnostics plot and measure."""
+        return self.losses[0].mu
+
+    @property
+    def mu_initialized(self) -> Tensor:
+        return self.losses[0].mu_initialized
+
+    def forward(self, embeddings, logits, target, u_embeddings=None, u_logits=None):
+        """
+        embeddings/logits/target are per-stage lists, as deep supervision
+        returns them. Stages whose weight is zero are skipped entirely rather
+        than computed and multiplied out.
+
+        stats are reported for stage 0 only; the coarse stages carry <1% of
+        the signal and five copies of every scalar would bury the one that
+        matters.
+        """
+
+        total = None
+        stats = {}
+
+        for index, (loss, weight) in enumerate(zip(self.losses, self.weights)):
+            if weight == 0.0:
+                continue
+
+            energy, stage_stats = loss(
+                embeddings[index],
+                logits[index],
+                target[index],
+                u_embeddings=None if u_embeddings is None else u_embeddings[index],
+                u_logits=None if u_logits is None else u_logits[index],
+            )
+
+            total = weight * energy if total is None else total + weight * energy
+
+            if index == 0:
+                stats = stage_stats
+
+        return total, stats

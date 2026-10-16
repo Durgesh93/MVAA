@@ -148,24 +148,17 @@ litmodule:
   num_epochs: ${trainer.max_epochs}
 
 
-  # Width of the per-voxel embedding the decoder emits (module/adapter.py).
-  # Stock nnU-Net maps decoder features straight to the 3 class logits; the
-  # adapter emits embedding_dim channels instead and a shared 1x1 classifier
-  # maps those to the logits, so every voxel carries an explicit 128-d
-  # feature vector for the clustering loss to work on, reachable via the
-  # LightningModule's forward_embeddings().
+  # The embedding the clustering loss reads is NOT configurable any more.
+  # It is whatever each decoder stage already feeds its seg_layer -- widths
+  # 32/64/128/256/320, highest resolution first -- captured by a forward hook
+  # (module/adapter.py). The trunk is stock nnU-Net.
   #
-  # The adapter is unconditional -- there is no flag. There is no
-  # nonlinearity between the trunk and the classifier, so the composition is
-  # still a linear map to logits and 128 >> 3 keeps it full rank: it buys an
-  # embedding space to put a loss on, not expressiveness. A purely
-  # supervised run simply sets cm_weight: 0. One architecture, one code
-  # path, and a baseline that differs from a SuperCM run by nothing but that
-  # weight.
-  #
-  # Consequence: parameter names are "backbone.*" and "classifier.*", so
-  # stock nnU-Net checkpoints need remapping rather than loading.
-  embedding_dim: 128
+  # embedding_dim used to build the trunk with 128 output channels and bolt a
+  # shared 1x1 classifier on top. That changed the architecture, broke stock
+  # checkpoint compatibility, and inserted a second linear map with no
+  # nonlinearity between the two -- extra reparameterisation freedom whose
+  # only effect was to give the clustering loss another gauge to be defended
+  # against.
 
   # ---------------------------------------------------------------------------
   # SuperCM-style clustering regularizer (module/losses.py ClusteringCMLoss).
