@@ -33,7 +33,7 @@
 # Create and launch from the fewshot_tee worktree:
 #   wandb sweep scripts/sweep_cm_tsne.yaml
 #   ws conf standard 4
-#   ws sweep wandb echo_vi/mvaa/<sweep_id>
+#   ws sweep wandb dsb_uio/mvaa/<sweep_id>
 program: scripts/sweep_run.sh
 method: grid
 
